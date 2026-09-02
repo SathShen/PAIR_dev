@@ -1,2 +1,0 @@
-pointops2
-pointops2_cuda
