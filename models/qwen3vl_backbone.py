@@ -1,33 +1,28 @@
 """
 Qwen3-VL backbone wrapper for PAIR.
 
-This module is a cleaned, reusable version of the Qwen logic already
-validated in the smoke tests:
+This module ONLY owns the Qwen3-VL side:
 
-    - native Qwen3-VL image path
-    - <POINT> placeholder tokens
-    - external point-token embedding injection
-    - <TASK> token
-    - contextualized image / point / task hidden extraction
-    - native text generation
+    - processor / tokenizer
+    - <POINT> and <TASK> registration
+    - Qwen3-VL model loading
+    - native image preprocessing
+    - chat-template / placeholder construction
+    - image / point / task masks
 
-V1 intentionally keeps the same embedding-hook injection strategy that
-already passed the joint PTv3-Qwen smoke test.
+It does NOT own:
+    - PTv3
+    - PointAdapter
+    - <POINT> embedding injection
+    - hidden-state extraction
+    - PAIR task routing
+    - top-level generate orchestration
 
-Current limitation:
-    - batch size = 1 for external point-token injection
-
-Later work can add:
-    - multi-sample batches with variable point-token counts
-    - T1/T2 multimodal packing
-    - LoRA helpers
-    - gradient checkpointing helpers
-    - richer task-token routing
+Those operations are handled by PAIR.py.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -38,49 +33,8 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
 
 
-@dataclass
-class Qwen3VLBackboneOutput:
-    image_hidden: Optional[torch.Tensor] = None
-    point_hidden: Optional[torch.Tensor] = None
-    task_hidden: Optional[torch.Tensor] = None
-
-    logits: Optional[torch.Tensor] = None
-
-    generated_ids: Optional[torch.Tensor] = None
-    generated_text: Optional[Any] = None
-
-    aux: Optional[Dict[str, Any]] = None
-
-
 class Qwen3VLBackbone(nn.Module):
-    """
-    Qwen3-VL wrapper used by PAIR.
-
-    Parameters
-    ----------
-    model_dir:
-        Local Qwen3-VL checkpoint directory.
-
-    dtype:
-        Qwen model dtype. BF16 matches the validated smoke-test setup.
-
-    device:
-        Device used when device_map is None.
-
-    device_map:
-        Passed to Hugging Face from_pretrained().
-        The validated setup uses "cuda".
-
-    local_files_only:
-        Keep True for the current local-checkpoint workflow.
-
-    point_token:
-        Placeholder token replaced by external point embeddings.
-
-    task_token:
-        Special token whose contextualized hidden state represents the
-        current task / multimodal instruction.
-    """
+    """Thin Qwen3-VL wrapper used by PAIR."""
 
     def __init__(
         self,
@@ -106,10 +60,12 @@ class Qwen3VLBackbone(nn.Module):
         # --------------------------------------------------------------
         # Processor / tokenizer
         # --------------------------------------------------------------
+
         self.processor = AutoProcessor.from_pretrained(
             model_dir,
             local_files_only=local_files_only,
         )
+
         self.tokenizer = self.processor.tokenizer
 
         self.tokenizer.add_special_tokens(
@@ -124,6 +80,7 @@ class Qwen3VLBackbone(nn.Module):
         self.point_token_id = self.tokenizer.convert_tokens_to_ids(
             self.point_token
         )
+
         self.task_token_id = self.tokenizer.convert_tokens_to_ids(
             self.task_token
         )
@@ -131,6 +88,7 @@ class Qwen3VLBackbone(nn.Module):
         # --------------------------------------------------------------
         # Qwen3-VL
         # --------------------------------------------------------------
+
         load_kwargs = {
             "dtype": dtype,
             "local_files_only": local_files_only,
@@ -144,20 +102,27 @@ class Qwen3VLBackbone(nn.Module):
             **load_kwargs,
         )
 
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        self.model.resize_token_embeddings(
+            len(self.tokenizer)
+        )
 
         if device_map is None:
             self.model.to(device)
 
-        self.hidden_size = self.model.config.text_config.hidden_size
-        self.image_token_id = self.model.config.image_token_id
+        self.hidden_size = (
+            self.model.config.text_config.hidden_size
+        )
+
+        self.image_token_id = (
+            self.model.config.image_token_id
+        )
 
         self.vision_spatial_merge_size = (
             self.model.config.vision_config.spatial_merge_size
         )
 
     # ------------------------------------------------------------------
-    # Basic properties
+    # Properties
     # ------------------------------------------------------------------
 
     @property
@@ -172,20 +137,12 @@ class Qwen3VLBackbone(nn.Module):
     # Prompt construction
     # ------------------------------------------------------------------
 
-    def _normalize_point_tokens(
+    def _get_num_point_tokens(
         self,
         point_tokens: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """
-        Normalize external point tokens to [1, N, D].
-
-        V1 deliberately supports batch size 1 only. This matches all
-        validated smoke tests and avoids introducing untested variable-length
-        batching logic before the base PAIR model is stable.
-        """
-
+    ) -> int:
         if point_tokens is None:
-            return None
+            return 0
 
         if not torch.is_tensor(point_tokens):
             raise TypeError(
@@ -193,27 +150,35 @@ class Qwen3VLBackbone(nn.Module):
             )
 
         if point_tokens.ndim == 2:
-            point_tokens = point_tokens.unsqueeze(0)
+            num_tokens, hidden_dim = point_tokens.shape
 
-        if point_tokens.ndim != 3:
+        elif point_tokens.ndim == 3:
+            if point_tokens.shape[0] != 1:
+                raise NotImplementedError(
+                    "PAIR V1 currently supports batch size 1 "
+                    "for external point tokens."
+                )
+
+            _, num_tokens, hidden_dim = point_tokens.shape
+
+        else:
             raise ValueError(
-                "point_tokens must have shape [N, D] or [1, N, D]. "
-                f"Got {tuple(point_tokens.shape)}."
+                "point_tokens must have shape [N, D] or [1, N, D], "
+                f"got {tuple(point_tokens.shape)}."
             )
 
-        if point_tokens.shape[0] != 1:
-            raise NotImplementedError(
-                "Qwen3VLBackbone V1 currently supports batch size 1 "
-                "for external point-token injection."
-            )
-
-        if point_tokens.shape[-1] != self.hidden_size:
+        if hidden_dim != self.hidden_size:
             raise ValueError(
-                f"point_tokens hidden dim must equal Qwen hidden size "
-                f"{self.hidden_size}, got {point_tokens.shape[-1]}."
+                f"point token dim must equal Qwen hidden size "
+                f"{self.hidden_size}, got {hidden_dim}."
             )
 
-        return point_tokens
+        if num_tokens <= 0:
+            raise ValueError(
+                "point_tokens contains zero tokens."
+            )
+
+        return int(num_tokens)
 
     def _build_user_text(
         self,
@@ -227,23 +192,24 @@ class Qwen3VLBackbone(nn.Module):
 
         if self.point_token in prompt:
             raise ValueError(
-                f"Do not manually place {self.point_token} in prompt. "
-                "PAIR inserts point placeholders automatically."
+                f"Do not manually include {self.point_token}; "
+                "PAIR inserts placeholders automatically."
             )
 
         task_count = prompt.count(self.task_token)
 
         if task_count > 1:
             raise ValueError(
-                f"Prompt contains {task_count} copies of {self.task_token}; "
-                "exactly one task token is allowed."
+                f"Prompt contains {task_count} copies of "
+                f"{self.task_token}; at most one is allowed."
             )
 
         chunks = [prompt.rstrip()]
 
         if num_point_tokens > 0:
-            placeholders = self.point_token * num_point_tokens
-            chunks.append(placeholders)
+            chunks.append(
+                self.point_token * num_point_tokens
+            )
 
         if task_count == 0:
             chunks.append(self.task_token)
@@ -252,6 +218,7 @@ class Qwen3VLBackbone(nn.Module):
 
     def _build_messages(
         self,
+        *,
         prompt: str,
         images: Optional[Any],
         num_point_tokens: int,
@@ -264,7 +231,6 @@ class Qwen3VLBackbone(nn.Module):
         content = []
 
         if images is not None:
-            # V1: one image, same path used in the successful smoke tests.
             content.append(
                 {
                     "type": "image",
@@ -286,6 +252,10 @@ class Qwen3VLBackbone(nn.Module):
             }
         ]
 
+    # ------------------------------------------------------------------
+    # Input preparation only
+    # ------------------------------------------------------------------
+
     def prepare_inputs(
         self,
         *,
@@ -294,13 +264,15 @@ class Qwen3VLBackbone(nn.Module):
         point_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
-        Build Qwen chat input and masks for image / point / task tokens.
+        Build native Qwen inputs and modality masks.
+
+        IMPORTANT:
+        This function does NOT inject point embeddings.
+        PAIR.py performs the actual <POINT> replacement.
         """
 
-        point_tokens = self._normalize_point_tokens(point_tokens)
-
-        num_point_tokens = (
-            0 if point_tokens is None else point_tokens.shape[1]
+        num_point_tokens = self._get_num_point_tokens(
+            point_tokens
         )
 
         messages = self._build_messages(
@@ -341,35 +313,35 @@ class Qwen3VLBackbone(nn.Module):
 
         if point_count != num_point_tokens:
             raise RuntimeError(
-                f"Expected {num_point_tokens} {self.point_token} tokens, "
-                f"but tokenizer produced {point_count}."
+                f"Expected {num_point_tokens} {self.point_token} "
+                f"tokens, tokenizer produced {point_count}."
             )
 
         if task_count != 1:
             raise RuntimeError(
                 f"Expected exactly one {self.task_token}, "
-                f"but tokenizer produced {task_count}."
+                f"tokenizer produced {task_count}."
             )
 
         if images is None and image_count != 0:
             raise RuntimeError(
-                "No image was provided but image tokens were produced."
+                "No image was supplied but image tokens were produced."
             )
 
-        # Ensure point placeholders are contiguous.
         if point_count > 0:
-            point_positions = torch.nonzero(
+            positions = torch.nonzero(
                 point_mask[0],
                 as_tuple=False,
             ).flatten()
 
             expected = torch.arange(
-                point_positions[0],
-                point_positions[0] + point_count,
-                dtype=point_positions.dtype,
+                positions[0],
+                positions[0] + point_count,
+                dtype=positions.dtype,
+                device=positions.device,
             )
 
-            if not torch.equal(point_positions.cpu(), expected.cpu()):
+            if not torch.equal(positions, expected):
                 raise RuntimeError(
                     f"{self.point_token} placeholders are not contiguous."
                 )
@@ -377,7 +349,6 @@ class Qwen3VLBackbone(nn.Module):
         return {
             "prompt_text": prompt_text,
             "inputs": inputs,
-            "point_tokens": point_tokens,
             "image_mask": image_mask,
             "point_mask": point_mask,
             "task_mask": task_mask,
@@ -387,384 +358,29 @@ class Qwen3VLBackbone(nn.Module):
         }
 
     # ------------------------------------------------------------------
-    # Device transfer
+    # Trainability helpers
     # ------------------------------------------------------------------
 
-    def _move_inputs_to_model_device(
-        self,
-        inputs: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        device = self.model_device
+    def freeze(self) -> None:
+        self.model.requires_grad_(False)
 
-        return {
-            key: (
-                value.to(device)
-                if torch.is_tensor(value)
-                else value
-            )
-            for key, value in inputs.items()
-        }
+    def unfreeze(self) -> None:
+        self.model.requires_grad_(True)
 
-    # ------------------------------------------------------------------
-    # Point-token injection
-    # ------------------------------------------------------------------
-
-    def _make_point_injection_hook(
-        self,
-        *,
-        point_tokens: Optional[torch.Tensor],
-        point_mask: torch.Tensor,
-        full_seq_len: int,
-        stats: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Build the same forward-hook injection mechanism validated in the
-        joint smoke test.
-
-        It only modifies the full prompt embedding pass. During generate(),
-        later autoregressive steps have shorter sequence lengths and are
-        therefore left untouched.
-        """
-
-        if point_tokens is None:
-            return None
-
-        if stats is None:
-            stats = {}
-
-        stats.setdefault("calls", 0)
-        stats.setdefault("replaced", False)
-
-        hidden_size = self.hidden_size
-
-        def hook(module, args, output):
-            stats["calls"] += 1
-
-            if (
-                torch.is_tensor(output)
-                and output.ndim == 3
-                and output.shape[0] == 1
-                and output.shape[1] == full_seq_len
-                and output.shape[2] == hidden_size
-            ):
-                out = output.clone()
-
-                injected = point_tokens[0].to(
-                    device=out.device,
-                    dtype=out.dtype,
-                )
-
-                out[0, point_mask[0]] = injected
-
-                stats["replaced"] = True
-                return out
-
-            return output
-
-        return hook
-
-    # ------------------------------------------------------------------
-    # Hidden-state extraction
-    # ------------------------------------------------------------------
-
-    def _extract_hidden_states(
-        self,
-        *,
-        last_hidden: torch.Tensor,
-        image_mask: torch.Tensor,
-        point_mask: torch.Tensor,
-        task_mask: torch.Tensor,
-        inputs: Dict[str, Any],
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        image_hidden = None
-        point_hidden = None
-
-        if int(image_mask.sum().item()) > 0:
-            image_hidden = last_hidden[0][image_mask[0]]
-
-        if int(point_mask.sum().item()) > 0:
-            point_hidden = last_hidden[0][point_mask[0]]
-
-        task_hidden = last_hidden[0][task_mask[0]]
-
-        # Keep task hidden in [B, D] form for the top-level PAIR model.
-        if task_hidden.ndim == 2 and task_hidden.shape[0] == 1:
-            task_hidden_out = task_hidden
-        else:
-            task_hidden_out = task_hidden.reshape(1, -1)
-
-        aux = {}
-
-        # Recover 2D spatial image feature layout when possible.
-        if (
-            image_hidden is not None
-            and "image_grid_thw" in inputs
-        ):
-            grid = inputs["image_grid_thw"][0]
-            t, h_patch, w_patch = [
-                int(x) for x in grid.tolist()
-            ]
-
-            merge = int(self.vision_spatial_merge_size)
-
-            h_token = h_patch // merge
-            w_token = w_patch // merge
-
-            expected = t * h_token * w_token
-
-            if image_hidden.shape[0] == expected:
-                aux["image_hidden_2d"] = image_hidden.reshape(
-                    t,
-                    h_token,
-                    w_token,
-                    self.hidden_size,
-                )
-
-            aux["image_grid_thw"] = (
-                t,
-                h_patch,
-                w_patch,
-            )
-            aux["image_token_grid_thw"] = (
-                t,
-                h_token,
-                w_token,
-            )
-
-        return {
-            "image_hidden": image_hidden,
-            "point_hidden": point_hidden,
-            "task_hidden": task_hidden_out,
-            "aux": aux,
-        }
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
-    def forward(
-        self,
-        *,
-        prompt: str,
-        images: Optional[Any] = None,
-        point_tokens: Optional[torch.Tensor] = None,
-        return_logits: bool = True,
-        return_hidden_states: bool = True,
-        use_cache: bool = False,
-        **model_kwargs,
-    ) -> Qwen3VLBackboneOutput:
-        """
-        Run Qwen3-VL with optional external point-token injection.
-
-        This method keeps gradients enabled. It can therefore later be used
-        for training the PointAdapter / LoRA / task head.
-        """
-
-        prepared = self.prepare_inputs(
-            prompt=prompt,
-            images=images,
-            point_tokens=point_tokens,
+    def parameter_count(self) -> int:
+        return sum(
+            p.numel()
+            for p in self.model.parameters()
         )
 
-        inputs = self._move_inputs_to_model_device(
-            prepared["inputs"]
-        )
-
-        image_mask = prepared["image_mask"].to(
-            self.model_device
-        )
-        point_mask = prepared["point_mask"].to(
-            self.model_device
-        )
-        task_mask = prepared["task_mask"].to(
-            self.model_device
-        )
-
-        point_tokens = prepared["point_tokens"]
-
-        full_seq_len = inputs["input_ids"].shape[1]
-
-        hook_stats = {
-            "calls": 0,
-            "replaced": False,
-        }
-
-        hook = self._make_point_injection_hook(
-            point_tokens=point_tokens,
-            point_mask=point_mask,
-            full_seq_len=full_seq_len,
-            stats=hook_stats,
-        )
-
-        handle = None
-
-        if hook is not None:
-            handle = self.model.get_input_embeddings().register_forward_hook(
-                hook
-            )
-
-        try:
-            outputs = self.model(
-                **inputs,
-                output_hidden_states=return_hidden_states,
-                return_dict=True,
-                use_cache=use_cache,
-                **model_kwargs,
-            )
-        finally:
-            if handle is not None:
-                handle.remove()
-
-        if point_tokens is not None and not hook_stats["replaced"]:
-            raise RuntimeError(
-                "External point tokens were provided, but the Qwen "
-                "embedding hook did not replace the <POINT> embeddings."
-            )
-
-        image_hidden = None
-        point_hidden = None
-        task_hidden = None
-        hidden_aux = {}
-
-        if return_hidden_states:
-            last_hidden = outputs.hidden_states[-1]
-
-            extracted = self._extract_hidden_states(
-                last_hidden=last_hidden,
-                image_mask=image_mask,
-                point_mask=point_mask,
-                task_mask=task_mask,
-                inputs=inputs,
-            )
-
-            image_hidden = extracted["image_hidden"]
-            point_hidden = extracted["point_hidden"]
-            task_hidden = extracted["task_hidden"]
-            hidden_aux = extracted["aux"]
-
-        aux = {
-            "prompt_text": prepared["prompt_text"],
-            "image_count": prepared["image_count"],
-            "point_count": prepared["point_count"],
-            "task_count": prepared["task_count"],
-            "point_injection_calls": hook_stats["calls"],
-            "point_injection_replaced": hook_stats["replaced"],
-            **hidden_aux,
-        }
-
-        return Qwen3VLBackboneOutput(
-            image_hidden=image_hidden,
-            point_hidden=point_hidden,
-            task_hidden=task_hidden,
-            logits=outputs.logits if return_logits else None,
-            aux=aux,
-        )
-
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def generate(
-        self,
-        *,
-        prompt: str,
-        images: Optional[Any] = None,
-        point_tokens: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 64,
-        do_sample: bool = False,
-        **generate_kwargs,
-    ) -> Qwen3VLBackboneOutput:
-        """
-        Native Qwen generation while injecting external point embeddings
-        during the prompt/prefill pass.
-        """
-
-        prepared = self.prepare_inputs(
-            prompt=prompt,
-            images=images,
-            point_tokens=point_tokens,
-        )
-
-        inputs = self._move_inputs_to_model_device(
-            prepared["inputs"]
-        )
-
-        point_mask = prepared["point_mask"].to(
-            self.model_device
-        )
-
-        point_tokens = prepared["point_tokens"]
-
-        full_seq_len = inputs["input_ids"].shape[1]
-
-        hook_stats = {
-            "calls": 0,
-            "replaced": False,
-        }
-
-        hook = self._make_point_injection_hook(
-            point_tokens=point_tokens,
-            point_mask=point_mask,
-            full_seq_len=full_seq_len,
-            stats=hook_stats,
-        )
-
-        handle = None
-
-        if hook is not None:
-            handle = self.model.get_input_embeddings().register_forward_hook(
-                hook
-            )
-
-        try:
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                **generate_kwargs,
-            )
-        finally:
-            if handle is not None:
-                handle.remove()
-
-        if point_tokens is not None and not hook_stats["replaced"]:
-            raise RuntimeError(
-                "External point tokens were provided, but generation "
-                "did not inject them into the Qwen prompt embeddings."
-            )
-
-        prompt_len = inputs["input_ids"].shape[1]
-
-        new_token_ids = generated_ids[:, prompt_len:]
-
-        generated_text = self.processor.batch_decode(
-            new_token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )
-
-        # Keep a scalar string for the current batch-size-1 implementation.
-        generated_text_out = (
-            generated_text[0]
-            if len(generated_text) == 1
-            else generated_text
-        )
-
-        return Qwen3VLBackboneOutput(
-            generated_ids=generated_ids,
-            generated_text=generated_text_out,
-            aux={
-                "prompt_text": prepared["prompt_text"],
-                "image_count": prepared["image_count"],
-                "point_count": prepared["point_count"],
-                "task_count": prepared["task_count"],
-                "point_injection_calls": hook_stats["calls"],
-                "point_injection_replaced": hook_stats["replaced"],
-            },
+    def trainable_parameter_count(self) -> int:
+        return sum(
+            p.numel()
+            for p in self.model.parameters()
+            if p.requires_grad
         )
 
 
 if __name__ == "__main__":
-    print("qwen3vl_backbone.py import scaffold OK")
+    print("qwen3vl_backbone.py REFACTORED import OK")
     print("Default checkpoint:", DEFAULT_MODEL_DIR)
