@@ -1,0 +1,23 @@
+_BASE_: qwen_base.yaml
+OUTPUT_DIR: '/path/to/language_grounding/video_output_3d_tb_test'
+INPUT:
+  FRAME_RIGHT: 1
+  FRAME_LEFT: 1
+  SAMPLING_FRAME_NUM: 3
+  INPAINT_DEPTH: True
+  RANDOM_FLIP: 'none'
+  CAMERA_DROP: False
+  STRONG_AUGS: False
+  AUGMENT_3D: False
+SOLVER:
+  IMS_PER_BATCH: 6
+  MAX_ITER: 200000
+  CHECKPOINT_PERIOD: 16000
+MODEL:
+  DECODER_3D: True
+DATASETS:
+  TRAIN: ("sr3d_ref_scannet_train_single","scanrefer_scannet_anchor_train_single","nr3d_ref_scannet_anchor_train_single","matterport_train_single","scannet200_context_instance_train_200cls_single_highres_100k",)
+  TEST: ("sr3d_ref_scannet_val_single_batched","scanrefer_scannet_anchor_val_single_batched","nr3d_ref_scannet_anchor_val_single_batched","matterport_train_single","scannet200_context_instance_train_200cls_single_highres_100k",)
+TEST:
+  EVAL_PERIOD: 1
+  EVAL_3D: True
