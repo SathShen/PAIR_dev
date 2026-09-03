@@ -1,1208 +1,1310 @@
-# Modified from: https://github.com/facebookresearch/Mask2Former/blob/main/train_net_video.py
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Main training script for Qwen3D. Originally derived from detectron2/tools.
+PAIR training framework V1.
+
+Current first closed loop
+-------------------------
+dataset/config.py DatasetSpec
+    -> UnifiedPAIRDataset
+    -> PAIR temporal 2D backbone
+    -> Temporal2DChangeDecoder
+    -> semantic T1 CE
+    -> semantic T2 CE
+    -> binary change BCE + Dice
+    -> backward / optimizer / scheduler / checkpoint / validation
+
+Design inherited from the retained Qwen3D training framework:
+- torch distributed / DDP
+- BF16 autocast
+- AdamW
+- warmup schedule
+- gradient clipping
+- checkpoint / resume
+- periodic validation
+
+But this file deliberately does NOT bring back Detectron2, Mask2Former,
+ScanNet mappers/evaluators, or Slurm.
+
+PAIR V1 currently supports batch size 1. Use gradient accumulation for a
+larger effective batch.
+
+Single GPU smoke:
+    CUDA_VISIBLE_DEVICES=2 python train_pair.py \
+        --dataset-root /home/sht/Datasets/SECONDpair \
+        --spec SECOND_SPEC \
+        --max-steps 20 \
+        --output-dir outputs/second_smoke
+
+Later 4-GPU:
+    CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    torchrun --standalone --nproc_per_node=4 train_pair.py \
+        --dataset-root /home/sht/Datasets/SECONDpair \
+        --spec SECOND_SPEC \
+        --max-steps 10000 \
+        --output-dir outputs/second
 """
 
-import socket
-import copy
-import gc
-import itertools
-import logging
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import math
 import os
+import random
 import time
-import warnings
-import weakref
-import contextlib
-from collections import OrderedDict
-from typing import Any, Dict, List, Set
-from typing import List, Mapping, Optional
-import contextlib
-import logging
-import os
-import subprocess
-from datetime import timedelta
+from pathlib import Path
+from typing import Dict
 
+import numpy as np
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-import detectron2.utils.comm as comm
-import torch.distributed
-import wandb
-import numpy as np
-from viztracer import VizTracer
-import detectron2.utils.comm as comm
-import ipdb
-import torch
-import wandb
-import torch.multiprocessing as mp
-from viztracer import VizTracer
-from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.config import get_cfg
-from detectron2.utils.events import EventStorage, get_event_storage
-from detectron2.engine import (
-    AMPTrainer,
-    DefaultTrainer,
-    SimpleTrainer,
-    default_argument_parser,
-    default_setup,
-    launch,
+from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from transformers import get_constant_schedule_with_warmup
+
+from dataset.pair_dataset import (
+    DatasetSpec,
+    UnifiedPAIRDataset,
 )
-from detectron2.engine.defaults import hooks
-from detectron2.evaluation import COCOEvaluator, DatasetEvaluator, inference_on_dataset
-from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
-from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.utils.logger import setup_logger
-from fvcore.nn.precise_bn import get_bn_modules
-from qwen3d import (
-    HFDatasetMapper,
-    HFDatasetTextMapper,
-    COCOEvaluatorMemoryEfficient,
-    Scannet3DEvaluator,
-    ReferrentialGroundingEvaluator,
-    RefCOCOEvaluator,
-    ScannetDatasetMapper,
-    ScannetSemantic3DEvaluator,
-    VQAEvaluator,
-    Sr3dDatasetMapper,
-    RefCocoDatasetMapper,
-    add_maskformer2_config,
-    add_maskformer2_video_config,
-    build_detection_test_loader,
-    build_detection_train_loader,
-    build_detection_train_loader_multi_task,
-    get_detection_dataset_dicts,
+from models.pair import PAIRModel
+from models.qwen3vl_backbone import Qwen3VLBackbone
+from models.change_decoder import (
+    Temporal2DChangeDecoder,
 )
-from qwen3d.data_video.data_utils import resolve_feature_dir_for_backbone
-from qwen3d.data_video.build import (
-    get_multiple_train_2d_dataset_dicts,
-    get_multiple_train_3d_dataset_dicts,
-    merge_datasets,
+from loss import PAIRSemanticChangeLoss
+
+
+DEFAULT_MODEL_DIR = (
+    "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
 )
 
-from qwen3d.data_video.datasets.load_2d_benchmark import (
-    LOAD_BENCHMARKS,
-)
-from qwen3d.data_video.dataset_mapper_coco import (
-    COCOInstanceNewBaselineDatasetMapper,
-)
-from qwen3d.global_vars import SCANNET_LIKE_DATASET
-from torch.nn.parallel import DistributedDataParallel
-from torchinfo import summary
 
-warnings.filterwarnings("ignore")
-torch.multiprocessing.set_sharing_strategy("file_system")
-PRECISION_LOOKUP = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
+# ======================================================================
+# CLI
+# ======================================================================
 
+def parse_args():
+    p = argparse.ArgumentParser()
 
-st = ipdb.set_trace
-DEFAULT_TIMEOUT = timedelta(minutes=180)
-
-class OneCycleLr_D2(torch.optim.lr_scheduler.OneCycleLR):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def state_dict(self):
-        return {"base_lrs": self.base_lrs, "last_epoch": self.last_epoch}
-    
-def create_ddp_model(
-    model, *, fp16_compression=False, find_unused_parameters=False, **kwargs
-):
-    """
-    Create a DistributedDataParallel model if there are >1 processes.
-
-    Args:
-        model: a torch.nn.Module
-        fp16_compression: add fp16 compression hooks to the ddp object.
-            See more at https://pytorch.org/docs/stable/ddp_comm_hooks.html#torch.distributed.algorithms.ddp_comm_hooks.default_hooks.fp16_compress_hook
-        kwargs: other arguments of :module:`torch.nn.parallel.DistributedDataParallel`.
-    """  # noqa W605
-    if comm.get_world_size() == 1:
-        return model
-    if "device_ids" not in kwargs:
-        kwargs["device_ids"] = [comm.get_local_rank()]
-    ddp = DistributedDataParallel(
-        model, **kwargs, find_unused_parameters=find_unused_parameters
+    p.add_argument(
+        "--dataset-root",
+        type=Path,
+        required=True,
     )
-    if fp16_compression:
-        from torch.distributed.algorithms.ddp_comm_hooks import default as comm_hooks
 
-        ddp.register_comm_hook(state=None, hook=comm_hooks.fp16_compress_hook)
-    return ddp
+    p.add_argument(
+        "--spec",
+        type=str,
+        required=True,
+        help="DatasetSpec variable in dataset/config.py",
+    )
+
+    p.add_argument(
+        "--train-split",
+        default="train",
+    )
+
+    p.add_argument(
+        "--val-split",
+        default="val",
+    )
+
+    p.add_argument(
+        "--model-dir",
+        default=DEFAULT_MODEL_DIR,
+    )
+
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/pair"),
+    )
+
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=10000,
+    )
+
+    p.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=500,
+    )
+
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
+
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+    )
+
+    p.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+    )
+
+    p.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+    )
+
+    p.add_argument(
+        "--decoder-dim",
+        type=int,
+        default=256,
+    )
+
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--val-every",
+        type=int,
+        default=500,
+    )
+
+    p.add_argument(
+        "--val-steps",
+        type=int,
+        default=50,
+    )
+
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=500,
+    )
+
+    p.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+    )
+
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    p.add_argument(
+        "--train-qwen",
+        action="store_true",
+        help=(
+            "Unfreeze full Qwen. Not recommended for the first smoke test. "
+            "The first V1 run should train the dense decoder only; LoRA will "
+            "be added next for efficient Qwen adaptation."
+        ),
+    )
+
+    return p.parse_args()
 
 
-class Trainer(DefaultTrainer):
-    """
-    Extension of the Trainer class adapted to MaskFormer.
-    """
+# ======================================================================
+# Distributed
+# ======================================================================
 
-    def __init__(self, cfg):
-        """
-        Args:
-            cfg (CfgNode):
-        """
-        super(DefaultTrainer, self).__init__()
-        logger = logging.getLogger("detectron2")
-        if not logger.isEnabledFor(logging.INFO):  # setup_logger is not called for d2
-            setup_logger()
-        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
-
-        # Assume these objects must be constructed in this order.
-        model = self.build_model(cfg)
-        optimizer = self.build_optimizer(cfg, model)
-        data_loader = self.build_train_loader(cfg)
-
-        model = create_ddp_model(
-            model,
-            broadcast_buffers=False,
-            find_unused_parameters=cfg.MULTI_TASK_TRAINING
-            or cfg.FIND_UNUSED_PARAMETERS,
+def setup_distributed():
+    world_size = int(
+        os.environ.get(
+            "WORLD_SIZE",
+            "1",
         )
-        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
-            model, data_loader, optimizer
+    )
+
+    distributed = world_size > 1
+
+    if distributed:
+        local_rank = int(
+            os.environ[
+                "LOCAL_RANK"
+            ]
         )
-        
-        if cfg.SOLVER.AMP.ENABLED:            
-            self._trainer.precision = PRECISION_LOOKUP.get(
-                cfg.SOLVER.AMP.DTYPE, torch.float16
-            )
 
-        self.scheduler = self.build_lr_scheduler(cfg, optimizer, curr_iter=self._trainer.iter)
-        self.checkpointer = DetectionCheckpointer(
-            # Assume you want to save checkpoints together with logs/statistics
-            model,
-            cfg.OUTPUT_DIR,
-            trainer=weakref.proxy(self),
+        torch.cuda.set_device(
+            local_rank
         )
-        self.start_iter = 0
-        self.max_iter = cfg.SOLVER.MAX_ITER
-        self.cfg = cfg
 
-        self.register_hooks(self.build_hooks())
-    
-    def write_metrics(
-        self,
-        loss_dict: Mapping[str, torch.Tensor],
-        data_time: float,
-        cur_iter: int,
-        prefix: str = "",
-    ) -> None:
-        """
-        Args:
-            loss_dict (dict): dict of scalar losses
-            data_time (float): time taken by the dataloader iteration
-            prefix (str): prefix for logging keys
-        """
-        metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
-        metrics_dict["data_time"] = data_time
+        dist.init_process_group(
+            backend="nccl"
+        )
 
-        storage = get_event_storage()
-        # Keep track of data time per rank
-        storage.put_scalar("rank_data_time", data_time, cur_iter=cur_iter)
+        rank = dist.get_rank()
+    else:
+        local_rank = 0
+        rank = 0
+        torch.cuda.set_device(0)
 
-        # Gather metrics among all workers for logging
-        # This assumes we do DDP-style training, which is currently the only
-        # supported method in detectron2.
-        all_metrics_dict = comm.gather(metrics_dict)
+    return {
+        "distributed": distributed,
+        "world_size": world_size,
+        "rank": rank,
+        "local_rank": local_rank,
+        "device": torch.device(
+            "cuda",
+            local_rank,
+        ),
+        "is_main": rank == 0,
+    }
 
-        if comm.is_main_process():
-            # data_time among workers can have high variance. The actual latency
-            # caused by data_time is the maximum among workers.
-            data_time = np.max([x.pop("data_time") for x in all_metrics_dict])
-            storage.put_scalar("data_time", data_time, cur_iter=cur_iter)
 
-            # average the rest metrics
-            metrics_dict = {
-                k: np.mean([x[k] for x in all_metrics_dict if k in x]) for k in all_metrics_dict[0].keys()
-            }
-            total_losses_reduced = sum(metrics_dict.values())
-            if not np.isfinite(total_losses_reduced):
-                raise FloatingPointError(
-                    f"Loss became infinite or NaN at iteration={cur_iter}!\n"
-                    f"loss_dict = {metrics_dict}"
-                )
-
-            storage.put_scalar(
-                "{}total_loss".format(prefix), total_losses_reduced, cur_iter=cur_iter
-            )
-            if len(metrics_dict) > 1:
-                storage.put_scalars(cur_iter=cur_iter, **metrics_dict)
-
-    def _write_metrics(
-        self,
-        loss_dict: Mapping[str, torch.Tensor],
-        data_time: float,
-        prefix: str = "",
-        iter: Optional[int] = None,
-    ) -> None:
-        logger = logging.getLogger(__name__)
-
-        iter = self.iter if iter is None else iter
-        if (iter + 1) % self._trainer.gather_metric_period == 0:
-            try:
-                self.write_metrics(loss_dict, data_time, iter, prefix)
-            except Exception:
-                logger.exception("Exception in writing metrics: ")
-                raise
-                    
-    @classmethod
-    def build_evaluator(
-        cls,
-        cfg,
-        dataset_name,
-        output_folder=None,
-        use_2d_evaluators_only=False,
-        use_3d_evaluators_only=False,
-        use_refexp_evaluator_only=False,
+def cleanup_distributed():
+    if (
+        dist.is_available()
+        and dist.is_initialized()
     ):
-        """
-        Create evaluator(s) for a given dataset.
-        This uses the special metadata "evaluator_type" associated with each builtin dataset.
-        For your own dataset, you can simply create an evaluator manually in your
-        script and do not have to worry about the hacky if-else logic here.
-        """
-        if output_folder is None:
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
-            os.makedirs(output_folder, exist_ok=True)
-        evaluators = []
+        dist.destroy_process_group()
 
-        if cfg.TEST.EVAL_3D and cfg.MODEL.DECODER_3D and not use_2d_evaluators_only:
-            if 'scanqa' in dataset_name or 'sqa3d' in dataset_name or "bench" in dataset_name:
-                evaluators.append(VQAEvaluator(
-                    dataset_name=dataset_name,
-                    evaluate_detection=cfg.QA_GROUND_LOSS and 'scanqa' in dataset_name,
-                    cfg=cfg
-                ))
-                return evaluators
-            if 'ref' in dataset_name or use_refexp_evaluator_only:
-                evaluators.append(ReferrentialGroundingEvaluator(
-                    dataset_name,
-                    thresholds=[0.25, 0.5, 0.75],
-                    topks=[1],
-                    cfg=cfg
-                ))
-                return evaluators
-            if cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-                evaluators.append(
-                    ScannetSemantic3DEvaluator(
-                        dataset_name,
-                        output_dir=output_folder,
-                        eval_sparse=cfg.TEST.EVAL_SPARSE,
-                        cfg=cfg,
-                    )
-                )
-                if cfg.USE_CLASSIFICATION_ONLY_LOSS:
-                    evaluators.append(
-                        ScannetSemantic3DEvaluator(
-                            dataset_name,
-                            output_dir=output_folder,
-                            eval_sparse=cfg.TEST.EVAL_SPARSE,
-                            cfg=cfg,
-                            cls_only_logits=True,
-                        )
-                    )
-            if cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
-                evaluators.append(
-                    Scannet3DEvaluator(
-                        dataset_name,
-                        output_dir=output_folder,
-                        eval_sparse=cfg.TEST.EVAL_SPARSE,
-                        cfg=cfg,
-                    )
-                )
-        
-        if (cfg.TEST.EVAL_2D or cfg.EVAL_PER_IMAGE) and not use_3d_evaluators_only:
-            if 'refcoco' in dataset_name:
-                print(f"Adding RefCOCO Evaluator for {dataset_name}")
-                evaluators.append(
-                    RefCOCOEvaluator(
-                        dataset_name, 
-                        thresholds=[0.25, 0.5, 0.75],
-                        topks=[1, 5, 10],
-                        cfg=cfg
-                    )
-                )
-            elif 'bench' in dataset_name:
-                print(f"using captioning benchmark evaluator for {dataset_name}")
-                evaluators.append(
-                    VQAEvaluator(
-                        dataset_name=dataset_name,
-                        evaluate_detection=False,
-                        cfg=cfg
-                    )
-                )
-            else:
-                if cfg.INPUT.ORIGINAL_EVAL:
-                    print("Using original COCO Eval, potentially is RAM hungry")
-                    evaluators.append(
-                        COCOEvaluator(
-                            dataset_name, output_dir=output_folder, use_fast_impl=False
-                        )
-                    )
-                else:
-                    evaluators.append(
-                        COCOEvaluatorMemoryEfficient(
-                            dataset_name,
-                            output_dir=output_folder,
-                            use_fast_impl=False,
-                            per_image_eval=cfg.EVAL_PER_IMAGE,
-                            evaluate_subset=cfg.EVALUATE_SUBSET,
-                        )
-                    )
-        return evaluators
 
-    @classmethod
-    def build_train_loader(cls, cfg):
-        print("build_train_loader...")
-        dataset_dicts_3d = get_multiple_train_3d_dataset_dicts(cfg)
-        dataset_dicts_2d = get_multiple_train_2d_dataset_dicts(cfg)
-        
-        if cfg.MULTI_TASK_TRAINING:
-            return build_detection_train_loader_multi_task(
-                cfg,
-                mapper_3d=None,
-                mapper_2d=None,
-                dataset_3d=dataset_dicts_3d,
-                dataset_2d=dataset_dicts_2d,
-            )
-        else:
-            dataset_dicts = [dataset_dicts_3d, dataset_dicts_2d]
-            mappers = [None, None]
-            dataset = merge_datasets(dataset_dicts, mappers, balance=True, dataset_mul=cfg.DATASET_MUL)
-            return build_detection_train_loader(cfg, mapper=None, dataset=dataset)
+# ======================================================================
+# Reproducibility
+# ======================================================================
 
-    @classmethod
-    def build_test_loader(cls, cfg, dataset_name):
-        print(f"build_test_loader: {dataset_name}, start method: {mp.get_start_method()}")
-        
-        scannet_like = False
-        for scannet_like_dataset in SCANNET_LIKE_DATASET:
-            if scannet_like_dataset in dataset_name and 'ref' not in dataset_name:
-                scannet_like = True
-                break
+def set_seed(seed, rank=0):
+    seed = int(seed) + int(rank)
 
-        if "text_bench" in dataset_name:
-            dataset_dict = LOAD_BENCHMARKS[dataset_name]()
-            mapper = HFDatasetTextMapper(
-                cfg=cfg, 
-                dataset_name=dataset_name,
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif "bench" in dataset_name:
-            dataset_dict = LOAD_BENCHMARKS[dataset_name]()
-            mapper = HFDatasetMapper(
-                dataset_name=dataset_name,
-                cfg=cfg,
-                features=dataset_dict.features,
-                is_train=False
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif "text_bench" in dataset_name:
-            dataset_dict = LOAD_BENCHMARKS[dataset_name]()
-            mapper = HFDatasetTextMapper(
-                cfg=cfg, 
-                dataset_name=dataset_name,
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif scannet_like:
-            dataset_dict = get_detection_dataset_dicts(
-                [dataset_name],
-                proposal_files=[
-                    cfg.DATASETS.PROPOSAL_FILES_TEST[
-                        list(cfg.DATASETS.TEST).index(dataset_name)
-                    ]
-                ]
-                if cfg.MODEL.LOAD_PROPOSALS
-                else None,
-                subsample_data=cfg.TEST.SUBSAMPLE_DATA
-                if dataset_name in cfg.DATASETS.TEST_SUBSAMPLED
-                else None,
-            )
-            mapper = ScannetDatasetMapper(
-                cfg,
-                is_train=False,
-                dataset_name=dataset_name,
-                dataset_dict=dataset_dict,
-                decoder_3d=False
-                if dataset_name in cfg.DATASETS.TEST_2D_ONLY
-                else cfg.MODEL.DECODER_3D,
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif 'refcoco' in dataset_name:
-            dataset_dict = get_detection_dataset_dicts(
-                [dataset_name],
-                proposal_files=[
-                    cfg.DATASETS.PROPOSAL_FILES_TEST[
-                        list(cfg.DATASETS.TEST).index(dataset_name)
-                    ]
-                ]
-                if cfg.MODEL.LOAD_PROPOSALS
-                else None,
-                subsample_data=cfg.TEST.SUBSAMPLE_DATA
-                if dataset_name in cfg.DATASETS.TEST_SUBSAMPLED
-                else None,
-            )
-            mapper = RefCocoDatasetMapper(
-                cfg,
-                is_train=False,
-                dataset_name=dataset_name,
-                decoder_3d=cfg.FORCE_DECODER_3D and not cfg.PSEUDO_2D_AUG
-                if dataset_name in cfg.DATASETS.TEST_2D_ONLY
-                else cfg.MODEL.DECODER_3D,
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif "coco" in dataset_name or "sam" in dataset_name or 'paco' in dataset_name:
-            dataset_dict = get_detection_dataset_dicts(
-                [dataset_name],
-                proposal_files=[
-                    cfg.DATASETS.PROPOSAL_FILES_TEST[
-                        list(cfg.DATASETS.TEST).index(dataset_name)
-                    ]
-                ]
-                if cfg.MODEL.LOAD_PROPOSALS
-                else None,
-                subsample_data=cfg.TEST.SUBSAMPLE_DATA
-                if dataset_name in cfg.DATASETS.TEST_SUBSAMPLED
-                else None,
-            )
-            mapper = COCOInstanceNewBaselineDatasetMapper(
-                cfg, is_train=False, dataset_name=dataset_name,
-                decoder_3d=cfg.FORCE_DECODER_3D and not cfg.PSEUDO_2D_AUG
-            )
-            return build_detection_test_loader(cfg, mapper=mapper, dataset=dataset_dict)
-        elif "ref" in dataset_name:
-            dataset_dict = get_detection_dataset_dicts(
-                dataset_names=[dataset_name],
-                proposal_files=[
-                    cfg.DATASETS.PROPOSAL_FILES_TEST[
-                        list(cfg.DATASETS.TEST).index(dataset_name)
-                    ]
-                ]
-                if cfg.MODEL.LOAD_PROPOSALS
-                else None,
-                subsample_data=cfg.TEST.SUBSAMPLE_DATA
-                if dataset_name in cfg.DATASETS.TEST_SUBSAMPLED
-                else None,
-            )
-            mapper = Sr3dDatasetMapper(
-                cfg,
-                is_train=False,
-                dataset_name=dataset_name,
-                scannet_dict=dataset_dict[1],
-                scene_to_id_map=dataset_dict[2],
-                decoder_3d=False
-                if dataset_name in cfg.DATASETS.TEST_2D_ONLY
-                else cfg.MODEL.DECODER_3D,
-            )
-            return build_detection_test_loader(
-                cfg, mapper=mapper, dataset=dataset_dict[0]
-            )
-        else:
-            raise NotImplementedError
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    def build_hooks(self):
-        """
-        Build a list of default hooks, including timing, evaluation,
-        checkpointing, lr scheduling, precise BN, writing events.
 
-        Returns:
-            list[HookBase]:
-        """
-        cfg = self.cfg.clone()
-        cfg.defrost()
-        cfg.DATALOADER.NUM_WORKERS = 0  # save some memory and time for PreciseBN
+# ======================================================================
+# Dataset config
+# ======================================================================
 
-        ret = [
-            hooks.IterationTimer(),
-            hooks.LRScheduler(),
-            hooks.PreciseBN(
-                # Run at the same freq as (but before) evaluation.
-                cfg.TEST.EVAL_PERIOD,
-                self.model,
-                # Build a new data loader to not affect training
-                self.build_train_loader(cfg),
-                cfg.TEST.PRECISE_BN.NUM_ITER,
-            )
-            if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
-            else None,
-            hooks.LRScheduler(self.optimzer_2d, self.scheduler_2d)
-            if cfg.SEPERATE_OPTIMIZERS
-            else None,
-        ]
-
-        # Do PreciseBN before checkpointer, because it updates the model and need to
-        # be saved by checkpointer.
-        # This is not always the best: if checkpointing has a different frequency,
-        # some checkpoints may have more precise statistics than others.
-        if comm.is_main_process():
-            ret.append(
-                hooks.PeriodicCheckpointer(
-                    self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD,
-                    max_to_keep=15,
-                )
-            )
-
-        def test_and_save_results():
-            self._last_eval_results = self.test(self.cfg, self.model)
-            return self._last_eval_results
-
-        # Do evaluation after checkpointer, because then if it fails,
-        # we can use the saved checkpoint to debug.
-        ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
-
-        if comm.is_main_process():
-            # Here the default print/log frequency of each writer is used.
-            # run writers in the end, so that evaluation metrics are written
-            ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
-        return ret
-
-    @classmethod
-    def build_lr_scheduler(cls, cfg, optimizer, curr_iter):
-        """
-        It now calls :func:`detectron2.solver.build_lr_scheduler`.
-        Overwrite it if you'd like a different scheduler.
-        """
-        if cfg.SOLVER.LR_SCHEDULER_NAME == "onecyclelr":
-            return OneCycleLr_D2(
-                optimizer,
-                max_lr=cfg.SOLVER.BASE_LR,
-                total_steps=cfg.SOLVER.MAX_ITER,
-                last_epoch=curr_iter-1,
-            )
-        elif cfg.SOLVER.LR_SCHEDULER_NAME == "warmupconstantlr":
-            from transformers.optimization import get_constant_schedule_with_warmup
-            return get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=cfg.SOLVER.WARMUP_ITERS, last_epoch=curr_iter-1
-            )
-        else:
-            return build_lr_scheduler(cfg, optimizer)
-
-    @classmethod
-    def build_optimizer(cls, cfg, model):
-        weight_decay_norm = cfg.SOLVER.WEIGHT_DECAY_NORM
-        weight_decay_embed = cfg.SOLVER.WEIGHT_DECAY_EMBED
-
-        defaults = {}
-        defaults["lr"] = cfg.SOLVER.BASE_LR
-        defaults["weight_decay"] = cfg.SOLVER.WEIGHT_DECAY
-
-        norm_module_types = (
-            torch.nn.BatchNorm1d,
-            torch.nn.BatchNorm2d,
-            torch.nn.BatchNorm3d,
-            torch.nn.SyncBatchNorm,
-            # NaiveSyncBatchNorm inherits from BatchNorm2d
-            torch.nn.GroupNorm,
-            torch.nn.InstanceNorm1d,
-            torch.nn.InstanceNorm2d,
-            torch.nn.InstanceNorm3d,
-            torch.nn.LayerNorm,
-            torch.nn.LocalResponseNorm,
-        )
-
-        params: List[Dict[str, Any]] = []
-        memo: Set[torch.nn.parameter.Parameter] = set()
-
-        print(summary(model))
-
-        panet_resnet_layers = ["cross_view_attn", "res_to_trans", "trans_to_res"]
-        panet_swin_layers = [
-            "cross_view_attn",
-            "cross_layer_norm",
-            "res_to_trans",
-            "trans_to_res",
-        ]
-        panet_dino_layers = [
-            "cross_view_attn",
-            "token_to_trans",
-            "trans_to_token",
-        ]
-
-        if cfg.MODEL.BACKBONE.NAME == "build_resnet_backbone":
-            backbone_panet_layers = panet_resnet_layers
-        elif cfg.MODEL.BACKBONE.NAME == "D2SwinTransformer":
-            backbone_panet_layers = panet_swin_layers
-        elif cfg.MODEL.BACKBONE.NAME == "DINOv2" or cfg.MODEL.BACKBONE.NAME == "Qwen3D" :
-            backbone_panet_layers = panet_dino_layers
-        else:
-            raise NotImplementedError
-
-        backbone_lowered_names = []
-        for module_name, module in model.named_modules():
-            for module_param_name, value in module.named_parameters(recurse=False):
-                if not value.requires_grad:
-                    continue
-                # Avoid duplicating parameters
-                if value in memo:
-                    continue
-                memo.add(value)
-
-                hyperparams = copy.copy(defaults)
-                if "backbone" in module_name:
-                    # panet layers are initialize from scratch so use default lr
-                    panet_found = False
-                    for panet_name in backbone_panet_layers:
-                        if panet_name in module_name:
-                            hyperparams["lr"] = hyperparams["lr"]
-                            panet_found = True
-                            break
-
-                    if not panet_found:
-                        hyperparams["lr"] = (
-                            hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
-                        )
-                        backbone_lowered_names.append(module_name.lower())
-                        if cfg.NOT_USE_WD_PRETRAINED:
-                            assert not cfg.MODEL.FREEZE_BACKBONE, "Won't work"
-                            hyperparams["weight_decay"] = 0.0
-                            print("Not using weight decay for backbone")
-                if (
-                    "relative_position_bias_table" in module_param_name
-                    or "absolute_pos_embed" in module_param_name
-                ):
-                    print(module_param_name)
-                    hyperparams["weight_decay"] = 0.0
-                if isinstance(module, norm_module_types):
-                    hyperparams["weight_decay"] = weight_decay_norm
-                if isinstance(module, torch.nn.Embedding):
-                    hyperparams["weight_decay"] = weight_decay_embed
-                params.append({"params": [value], **hyperparams})
-                
-        # print(f"Backbone lowered names: {backbone_lowered_names}")
-
-        def maybe_add_full_model_gradient_clipping(optim):
-            # detectron2 doesn't have full model gradient clipping now
-            clip_norm_val = cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE
-            enable = (
-                cfg.SOLVER.CLIP_GRADIENTS.ENABLED
-                and cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model"
-                and clip_norm_val > 0.0
-            )
-
-            class FullModelGradientClippingOptimizer(optim):
-                def step(self, closure=None):
-                    all_params = itertools.chain(
-                        *[x["params"] for x in self.param_groups]
-                    )
-                    torch.nn.utils.clip_grad_norm_(all_params, clip_norm_val)
-                    super().step(closure=closure)
-
-            return FullModelGradientClippingOptimizer if enable else optim
-
-        optimizer_type = cfg.SOLVER.OPTIMIZER
-        if optimizer_type == "SGD":
-            optimizer = maybe_add_full_model_gradient_clipping(torch.optim.SGD)(
-                params, cfg.SOLVER.BASE_LR, momentum=cfg.SOLVER.MOMENTUM
-            )
-        elif optimizer_type == "ADAMW":
-            optimizer = maybe_add_full_model_gradient_clipping(torch.optim.AdamW)(
-                params, cfg.SOLVER.BASE_LR
-            )
-        else:
-            raise NotImplementedError(f"no optimizer type {optimizer_type}")
-        if not cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model":
-            optimizer = maybe_add_gradient_clipping(cfg, optimizer)
-        return optimizer
-
-    @classmethod
-    def test(cls, cfg, model, evaluators=None):
-        """
-        Evaluate the given model. The given model is expected to already contain
-        weights to evaluate.
-        Args:
-            cfg (CfgNode):
-            model (nn.Module):
-            evaluators (list[DatasetEvaluator] or None): if None, will call
-                :meth:`build_evaluator`. Otherwise, must have the same length as
-                ``cfg.DATASETS.TEST``.
-        Returns:
-            dict: a dict of result metrics
-        """
-        from torch.cuda.amp import autocast
-
-        logger = logging.getLogger(__name__)
-        if isinstance(evaluators, DatasetEvaluator):
-            evaluators = [evaluators]
-        if evaluators is not None:
-            assert len(cfg.DATASETS.TEST) == len(evaluators), "{} != {}".format(
-                len(cfg.DATASETS.TEST), len(evaluators)
-            )
-
-        results = OrderedDict()
-
-        dataset_names = list(cfg.DATASETS.TEST)
-        
-
-        for idx, dataset_name in enumerate(dataset_names):
-            print(f"Evaluating on {dataset_name}, idx: {idx}")
-            data_loader = cls.build_test_loader(
-                cfg,
-                dataset_name,
-            )
-
-            # When evaluators are passed in as arguments,
-            # implicitly assume that evaluators can be created before data_loader.
-            if evaluators is not None:
-                evaluator = evaluators[idx]
-            else:
-                try:
-                    evaluator = cls.build_evaluator(
-                        cfg,
-                        dataset_name,
-                        use_2d_evaluators_only=dataset_name in cfg.DATASETS.TEST_2D_ONLY,
-                        # if cfg.MULTI_TASK_TRAINING
-                        # else False,
-                        use_3d_evaluators_only=dataset_name in cfg.DATASETS.TEST_3D_ONLY,
-                        # if cfg.MULTI_TASK_TRAINING
-                        # else False,
-                        use_refexp_evaluator_only=dataset_name in cfg.DATASETS.TEST_REFEXP_ONLY,
-                    )
-                except NotImplementedError:
-                    logger.warn(
-                        "No evaluator found. Use `DefaultTrainer.test(evaluators=)`, "
-                        "or implement its `build_evaluator` method."
-                    )
-                    results[dataset_name] = {}
-                    continue
-            
-            with autocast(dtype=PRECISION_LOOKUP[cfg.SOLVER.AMP.DTYPE]):
-                results_i = inference_on_dataset(model, data_loader, evaluator)
-            results[dataset_name] = results_i
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        results_structured = {}
-        for dataset_name in dataset_names:
-            if dataset_name in cfg.DATASETS.TEST_2D_ONLY:
-                suffix = "train" if "train_eval" in dataset_name else "val"
-            else:
-                suffix = (
-                    "train_full" if "train_eval" in dataset_name else "val_full"
-                )
-                
-            if ('coco' in dataset_name or 'sam' in dataset_name or 'paco' in dataset_name) and "full" in suffix:
-                suffix = suffix.split("_")[0] # remove _full
-
-            suffix += f'_{dataset_name.split("_")[0]}'
-            results_val = results[dataset_name].copy()
-            results_val = {
-                f'{suffix}' + k: v
-                for k, v in results_val.items()
-            }
-            results_structured.update(results_val)
-        return results_structured
-
-    def run_fwd_bwd(self):
-        """
-        Implement the AMP training logic.
-        """
-        self._trainer.iter = self.iter
-
-        assert (
-            self._trainer.model.training
-        ), "[AMPTrainer] model was changed to eval mode!"
-        assert (
-            torch.cuda.is_available()
-        ), "[AMPTrainer] CUDA is required for AMP training!"
-        from torch.cuda.amp import autocast
-
-        assert self.cfg.SOLVER.AMP.ENABLED
-
-        if self.cfg.SYNC_DATALOADER_TIMING:
-            torch.cuda.synchronize()
-        start = time.perf_counter()
-        data = next(self._trainer._data_loader_iter)
-        if self.cfg.SYNC_DATALOADER_TIMING:
-            torch.cuda.synchronize()
-
-        data_time = time.perf_counter() - start
-        if self.cfg.SYNC_DATALOADER_TIMING:
-            print(f"Data time: {data_time*1000:.2f}ms")
-
-        with autocast(dtype=self._trainer.precision):
-            loss_dict = self._trainer.model(data)
-            if isinstance(loss_dict, torch.Tensor):
-                losses = loss_dict
-                loss_dict = {"total_loss": loss_dict}
-            else:
-                loss_custom = None
-                if "loss_3d" in loss_dict or "loss_2d" in loss_dict:
-                    loss_name = "loss_3d" if "loss_3d" in loss_dict else "loss_2d"
-                    loss_custom = loss_dict[loss_name]
-                    loss_dict.pop("loss_3d", None)
-                    loss_dict.pop("loss_2d", None)
-                losses = sum(loss_dict.values())
-
-                if loss_custom is not None:
-                    loss_dict[loss_name] = loss_custom
-
-        if self.cfg.SEPERATE_OPTIMIZERS:
-            decoder_3d = data[0]["actual_decoder_3d"]
-            if decoder_3d:
-                optimizer = self._trainer.optimizer
-            else:
-                optimizer = self.optimzer_2d
-        else:
-            optimizer = self._trainer.optimizer
-        optimizer.zero_grad()
-        if self.cfg.SOLVER.AMP.DTYPE == "float16":
-            self._trainer.grad_scaler.scale(losses).backward()
-        else:
-            losses.backward()
-        self._trainer.after_backward()
-
-        self._write_metrics(loss_dict, data_time)
-        return optimizer
-
-    def run_step(self):
-        if self.cfg.DATALOADER_ONLY:
-            if self.cfg.SYNC_DATALOADER_TIMING:
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            data = next(self._trainer._data_loader_iter)
-            if self.cfg.SYNC_DATALOADER_TIMING:
-                torch.cuda.synchronize()
-
-            data_time = time.perf_counter() - start
-            if self.cfg.SYNC_DATALOADER_TIMING:
-                print(f"Data time: {data_time*1000:.2f}ms")
-
-            self._write_metrics({"random_": torch.tensor(1.0)}, data_time)
-            return
-
-        if self.cfg.GRAD_ACCUMULATION_STEPS > 1:
-            if (self.iter + 1) % self.cfg.GRAD_ACCUMULATION_STEPS == 0:
-                optimizer = self.run_fwd_bwd()
-                self._trainer.grad_scaler.step(optimizer)
-                optimizer.zero_grad(set_to_none=True)
-
-                self._trainer.grad_scaler.update()
-            else:
-                if comm.get_world_size() == 1:
-                    self.run_fwd_bwd()
-                else:
-                    with self.model.no_sync():
-                        self.run_fwd_bwd()
-        else:
-            rank = comm.get_rank()
-            custom_viz_track = VizTracer(output_file=f"profile_{rank}.json") if self.cfg.USE_VIZTRACER and (self.iter > 10) else contextlib.nullcontext()
-            with custom_viz_track:
-                optimizer = self.run_fwd_bwd()
-
-            if self.cfg.USE_VIZTRACER and (self.iter > 10):
-                print(f"Finished writing viztracer file for rank {rank}")
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
-                exit()
-
-            if self.cfg.SOLVER.AMP.DTYPE == "float16":
-                self._trainer.grad_scaler.step(optimizer)
-                self._trainer.grad_scaler.update()
-            else:
-                optimizer.step()
-
-        if self.cfg.LOG_GRADIENTS:
-            wandb.log({"random": 1.0})
-
-        if self.iter % 10 == 0 and self.cfg.LOG_MEMORY:
-            metrics_dict = {}
-            metrics_dict["max_reserved_mem_gb"] = torch.tensor(torch.cuda.max_memory_reserved() / (1024**3))
-            metrics_dict["reserved_mem_gb"] = torch.tensor(torch.cuda.memory_reserved() / (1024**3))
-            metrics_dict["max_allocated_mem_gb"] = torch.tensor(torch.cuda.max_memory_allocated() / (1024**3))
-            metrics_dict["allocated_mem_gb"] = torch.tensor(torch.cuda.memory_allocated() / (1024**3))
-            metrics_dict["global_step"] = self.iter
-            if wandb.run is not None:
-                wandb.log(metrics_dict)
-            elif self.iter % 100 == 0:
-                print(f"Logged memory metrics at global step {self.iter}: {metrics_dict}")
-
-def setup(args):
-    """
-    Create configs and perform basic setups.
-    """
-    cfg = get_cfg()
-    # for poly lr schedule
-    add_deeplab_config(cfg)
-    add_maskformer2_config(cfg)
-    add_maskformer2_video_config(cfg)
-    cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
-    resolve_feature_dir_for_backbone(cfg)
-    cfg.freeze()
-    default_setup(cfg, args)
-    # Setup logger for "mask_former" module
-    setup_logger(name="mask2former")
-    setup_logger(
-        output=cfg.OUTPUT_DIR,
-        distributed_rank=comm.get_rank(),
-        name="mask2former_video",
+def load_spec(name: str) -> DatasetSpec:
+    module = importlib.import_module(
+        "dataset.config"
     )
-    return cfg
 
+    if not hasattr(
+        module,
+        name,
+    ):
+        available = [
+            key
+            for key, value
+            in vars(module).items()
+            if isinstance(
+                value,
+                DatasetSpec,
+            )
+        ]
 
-def main(args):
-    cfg = setup(args)
-    
-    if cfg.OOM_OBSERVER:
-        print(f"Attaching OOM observer to {cfg.OUTPUT_DIR}")
-        from torchtnt.utils.oom import attach_oom_observer
-        attach_oom_observer(output_dir=str(cfg.OUTPUT_DIR), trace_max_entries=500000)
-    
-    if args.eval_only:
-        model = Trainer.build_model(cfg)
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
+        raise AttributeError(
+            f"dataset.config.{name} not found. "
+            f"Available specs: {available}"
         )
-        res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            raise NotImplementedError
-        # if comm.is_main_process():
-        # verify_results(cfg, res)
-        if wandb.run is not None:
-            wandb.finish()
-        return res
 
-    trainer = Trainer(cfg)
-    trainer.resume_or_load(resume=args.resume)
+    spec = getattr(
+        module,
+        name,
+    )
 
-    print(f"Found start method: {mp.get_start_method()}")
-    if cfg.USE_FORKSERVER_START_METHOD:
-        mp.set_start_method("forkserver", force=True)
-        print(f"Set start method: {mp.get_start_method()}")
+    if not isinstance(
+        spec,
+        DatasetSpec,
+    ):
+        raise TypeError(
+            f"dataset.config.{name} is not DatasetSpec"
+        )
 
-    print(f"World size: {comm.get_world_size()}")
-    
-    if cfg.BREAKPOINT_ON_ERROR:
-        try:
-            from qwen3d.utils.decoupled_utils import set_global_breakpoint
-            set_global_breakpoint()
-            return trainer.train()
-        except Exception as e:
-            import traceback
-            print(f"Exception: {e}")
-            print(traceback.format_exc())
-            breakpoint(traceback=e.__traceback__)
-            raise e
-        finally:
-            pass
-    else:
-        return trainer.train()
+    if not isinstance(
+        spec.class_names,
+        dict,
+    ):
+        raise TypeError(
+            f"{name}.class_names must be Dict[int, str]. "
+            "PAIR does not infer classes from labels."
+        )
 
-    
+    return spec
 
 
+# ======================================================================
+# Image bridge
+# ======================================================================
 
-def slurm_launch(
-    main_func,
-    num_gpus_per_machine,
-    num_machines=1,
-    machine_rank=0,
-    dist_url=None,
-    port=None,
-    backend="nccl",
-    cfg=(),
-    timeout=DEFAULT_TIMEOUT,
-    one_process_per_gpu=True,
+def tensor_to_pil(
+    image: torch.Tensor,
+) -> Image.Image:
+    x = (
+        image.detach()
+        .cpu()
+        .float()
+    )
+
+    if (
+        x.ndim != 3
+        or x.shape[0] not in (1, 3, 4)
+    ):
+        raise ValueError(
+            f"expected [C,H,W], got {tuple(x.shape)}"
+        )
+
+    if not torch.isfinite(
+        x
+    ).all():
+        raise ValueError(
+            "image contains NaN/Inf"
+        )
+
+    lo = float(
+        x.min()
+    )
+    hi = float(
+        x.max()
+    )
+
+    if (
+        lo < -1e-4
+        or hi > 1.0001
+    ):
+        raise ValueError(
+            f"image expected [0,1], got [{lo},{hi}]"
+        )
+
+    x = (
+        x.clamp(0, 1)
+        .mul(255)
+        .round()
+        .to(torch.uint8)
+    )
+
+    arr = (
+        x.permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+
+    if arr.shape[-1] == 1:
+        arr = arr[..., 0]
+
+    return Image.fromarray(
+        arr
+    )
+
+
+# ======================================================================
+# Trainable wrapper
+# ======================================================================
+
+class PAIR2DTrainModel(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        pair_model: PAIRModel,
+        decoder: Temporal2DChangeDecoder,
+        freeze_qwen: bool,
+    ):
+        super().__init__()
+
+        self.pair = pair_model
+        self.decoder = decoder
+        self.freeze_qwen = bool(
+            freeze_qwen
+        )
+
+        if self.freeze_qwen:
+            self.pair.qwen_backbone.model.requires_grad_(
+                False
+            )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+
+        # Frozen foundation model behaves deterministically and stores no
+        # dropout/training-state behavior. Decoder remains in train mode.
+        if (
+            mode
+            and self.freeze_qwen
+        ):
+            self.pair.qwen_backbone.model.eval()
+
+        return self
+
+    def forward(
+        self,
+        *,
+        image_t1,
+        image_t2,
+        prompt,
+        class_names,
+        output_size,
+    ):
+        pair_kwargs = dict(
+            task_mode="2d",
+            prompt=prompt,
+            images_t1=image_t1,
+            images_t2=image_t2,
+            return_logits=False,
+            return_hidden_states=True,
+            use_cache=False,
+        )
+
+        if self.freeze_qwen:
+            with torch.no_grad():
+                pair_out = self.pair(
+                    **pair_kwargs
+                )
+        else:
+            pair_out = self.pair(
+                **pair_kwargs
+            )
+
+        dense_t1 = pair_out.aux[
+            "image_hidden_2d_t1"
+        ]
+
+        dense_t2 = pair_out.aux[
+            "image_hidden_2d_t2"
+        ]
+
+        prediction = self.decoder(
+            image_hidden_2d_t1=dense_t1,
+            image_hidden_2d_t2=dense_t2,
+            task_hidden=pair_out.task_hidden,
+            class_names=class_names,
+            qwen_backbone=self.pair.qwen_backbone,
+            output_size=output_size,
+        )
+
+        return prediction
+
+
+# ======================================================================
+# Data
+# ======================================================================
+
+def trivial_collate(batch):
+    # PAIR V1 batch size = 1.
+    if len(batch) != 1:
+        raise RuntimeError(
+            "PAIR V1 currently requires per-GPU batch size 1."
+        )
+
+    return batch[0]
+
+
+def make_loader(
+    dataset,
+    *,
+    distributed,
+    shuffle,
+    num_workers,
+):
+    sampler = None
+
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=(
+            shuffle
+            and sampler is None
+        ),
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(
+            num_workers > 0
+        ),
+        collate_fn=trivial_collate,
+    )
+
+    return loader, sampler
+
+
+def infinite_loader(
+    loader,
+    sampler=None,
+):
+    epoch = 0
+
+    while True:
+        if sampler is not None:
+            sampler.set_epoch(
+                epoch
+            )
+
+        for sample in loader:
+            yield sample
+
+        epoch += 1
+
+
+# ======================================================================
+# Build model
+# ======================================================================
+
+def build_model(
+    args,
+    runtime,
+):
+    device_string = (
+        f"cuda:{runtime['local_rank']}"
+    )
+
+    qwen = Qwen3VLBackbone(
+        model_dir=args.model_dir,
+        dtype=torch.bfloat16,
+        device=device_string,
+        device_map=device_string,
+        local_files_only=True,
+    )
+
+    pair = PAIRModel(
+        qwen_backbone=qwen,
+    )
+
+    decoder = Temporal2DChangeDecoder(
+        qwen_dim=qwen.hidden_size,
+        decoder_dim=args.decoder_dim,
+    ).to(
+        runtime["device"]
+    )
+
+    model = PAIR2DTrainModel(
+        pair_model=pair,
+        decoder=decoder,
+        freeze_qwen=(
+            not args.train_qwen
+        ),
+    )
+
+    model.to(
+        runtime["device"]
+    )
+
+    return model
+
+
+# ======================================================================
+# Checkpoint
+# ======================================================================
+
+def model_for_state(model):
+    return (
+        model.module
+        if isinstance(
+            model,
+            DDP,
+        )
+        else model
+    )
+
+
+def trainable_parameter_state(
+    model,
 ):
     """
-    Launch multi-gpu or distributed training.
-    This function must be called on all machines involved in the training.
-    It will spawn child processes (defined by ``num_gpus_per_machine``) on each machine.
+    Save trainable Qwen parameters only.
 
-    This function checks slurm variables and sets environment variables for torch.distributed.
-    It expects to be called with the following
-        #SBATCH --gpus-per-node={ngpu}
-        #SBATCH --nodes={args.nodes}
-        #SBATCH --ntasks-per-node={ngpu}
-
-    Note:
-        It expects that each task on a node sees all the GPUs.
-        [Sasha]: My experience with hydra on the fair cluster is that it instead prefers we set
-            ntasks = n_gpus and n_gpus_per_task = 1
-        If use hydra for launching, then we might have to adjust this launch function, or create a new one
-
-    Args:
-        main_func: a function that will be called by `main_func(*args)`
-        num_gpus_per_machine (int): number of GPUs per machine
-        num_machines (int): the total number of machines
-        machine_rank (int): the rank of this machine
-        dist_url (str): url to connect to for distributed jobs, including protocol
-                       e.g. "tcp://127.0.0.1:8686".
-                       Can be set to "auto" to automatically select a free port on localhost
-        timeout (timedelta): timeout of the distributed workers
-        args (tuple): arguments passed to main_func
+    For V1 with frozen Qwen this is empty, so checkpoints remain small.
     """
-    print(f"Launcher got args: {num_gpus_per_machine=}, {num_machines=}, {machine_rank=}, {dist_url=}, {port=}, {backend=}, {cfg=}, {timeout=}, {one_process_per_gpu=}")
-    logger = logging.getLogger(__name__)
-    if mp.get_start_method(allow_none=True) is None:
-        mp.set_start_method("spawn")
-        
-    world_size = num_machines * num_gpus_per_machine
-    if world_size > 1:
-        # https://github.com/pytorch/pytorch/pull/14391
-        # TODO prctl in spawned processes
+    base = model_for_state(
+        model
+    )
 
-        """Initialize slurm distributed training environment.
+    trainable_names = {
+        name
+        for name, param
+        in base.pair.named_parameters()
+        if param.requires_grad
+    }
 
-        If argument ``port`` is not specified, then the master port will be system
-        environment variable ``MASTER_PORT``. If ``MASTER_PORT`` is not in system
-        environment variable, then a default port ``29500`` will be used.
+    state = base.pair.state_dict()
 
-        Args:
-            backend (str): Backend of torch.distributed.
-            port (int, optional): Master port. Defaults to None.
-        """
-        proc_id = int(os.environ["SLURM_PROCID"])
-        ntasks = int(os.environ["SLURM_NTASKS"])
-        node_list = os.environ["SLURM_NODELIST"]
-        num_gpus = torch.cuda.device_count()
-        local_rank_env = os.environ.get("SLURM_LOCALID", None)
+    return {
+        key: value.detach().cpu()
+        for key, value
+        in state.items()
+        if key in trainable_names
+    }
 
-        if one_process_per_gpu:
-            if local_rank_env is not None:
-                local_rank = int(local_rank_env)
-                print(f"Using local rank env: {local_rank}")
-            else:
-                assert False, "This is wrong"
-                num_gpus = torch.cuda.device_count()
-                local_rank = proc_id % num_gpus
-                # This seems wrong...and not necessary
-                print(f"Using local rank: {local_rank} given proc_id: {proc_id} and num_gpus: {num_gpus} visible.")
-            torch.cuda.set_device(local_rank)
-            machine_rank = proc_id // num_gpus
-        else:
-            machine_rank = int(os.environ["SLURM_NODEID"])
 
-        print(f"{local_rank_env=}, {local_rank=}, {proc_id=}, {ntasks=}, {node_list=}, {num_gpus=}, {machine_rank=}, {world_size=}, {num_gpus_per_machine=}")
+def save_checkpoint(
+    *,
+    path,
+    model,
+    optimizer,
+    scheduler,
+    step,
+    args,
+    spec_name,
+):
+    base = model_for_state(
+        model
+    )
 
-        # Hydra on the fair cluster instead prefers we set ntasks = n_gpus and n_gpus_per_task = 1
-        # if use hydra for launching, then we might have to adjust the device settings here
-
-        addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
-
-        # specify master port
-        if port is not None:
-            os.environ["MASTER_PORT"] = str(port)
-        elif "MASTER_PORT" in os.environ:
-            pass  # use MASTER_PORT in the environment variable
-        else:
-            # 29500 is torch.distributed default port
-            os.environ["MASTER_PORT"] = "29500"
-            # if dist_url.startswith("tcp://"):
-            #     port = dist_url.split(":")[-1]
-            #     print("dist_url: ", dist_url, " port: ", port)
-            # os.environ["MASTER_PORT"] = port
-
-        # use MASTER_ADDR in the environment variable if it already exists
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = addr
-
-        if one_process_per_gpu:
-            os.environ["WORLD_SIZE"] = str(ntasks)
-        else:
-            os.environ["WORLD_SIZE"] = str(ntasks * num_gpus_per_machine)
-
-        os.environ["LOCAL_RANK"] = str(local_rank)
-        os.environ["RANK"] = str(proc_id)
-
-        print(f"torch.distributed {world_size=}: {machine_rank=} {local_rank=}")
-        print(f'{os.environ["SLURM_NODEID"]=}')
-        print(f'{os.environ["SLURM_PROCID"]=}')
-        print(f'{os.environ["SLURM_NTASKS"]=}')
-        print(f'{os.environ["SLURM_NODELIST"]=}')
-        print(f'{os.environ["MASTER_ADDR"]=}')
-        print(f'{os.environ["MASTER_PORT"]=}')
-        print(f'{os.environ["WORLD_SIZE"]=}')
-        print(f'{os.environ["LOCAL_RANK"]=}')
-        print(f'{os.environ["RANK"]=}')
-
-        dist.init_process_group(backend=backend, timeout=timeout)
-        comm.synchronize()
-
-        assert comm._LOCAL_PROCESS_GROUP is None
-        num_machines = world_size // num_gpus_per_machine
-        print(f"num_machines: {num_machines}, world_size: {world_size}, num_gpus_per_machine: {num_gpus_per_machine}")
-        for i in range(num_machines):
-            ranks_on_i = list(
-                range(i * num_gpus_per_machine, (i + 1) * num_gpus_per_machine)
+    checkpoint = {
+        "step": int(step),
+        "decoder": (
+            base.decoder
+            .state_dict()
+        ),
+        "pair_trainable": (
+            trainable_parameter_state(
+                model
             )
-            print(f"ranks_on_i: {ranks_on_i}")
-            pg = dist.new_group(ranks_on_i)
-            if i == machine_rank:
-                comm._LOCAL_PROCESS_GROUP = pg
+        ),
+        "optimizer": (
+            optimizer.state_dict()
+        ),
+        "scheduler": (
+            scheduler.state_dict()
+        ),
+        "args": vars(args),
+        "spec_name": spec_name,
+    }
 
-        main_func(*cfg)
-    else:
-        main_func(*cfg)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    torch.save(
+        checkpoint,
+        path,
+    )
+
+
+def load_checkpoint(
+    *,
+    path,
+    model,
+    optimizer,
+    scheduler,
+):
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    base = model_for_state(
+        model
+    )
+
+    base.decoder.load_state_dict(
+        checkpoint[
+            "decoder"
+        ]
+    )
+
+    pair_state = checkpoint.get(
+        "pair_trainable",
+        {},
+    )
+
+    if pair_state:
+        current = base.pair.state_dict()
+
+        current.update(
+            pair_state
+        )
+
+        base.pair.load_state_dict(
+            current,
+            strict=False,
+        )
+
+    optimizer.load_state_dict(
+        checkpoint[
+            "optimizer"
+        ]
+    )
+
+    scheduler.load_state_dict(
+        checkpoint[
+            "scheduler"
+        ]
+    )
+
+    return int(
+        checkpoint[
+            "step"
+        ]
+    )
+
+
+# ======================================================================
+# One forward/loss
+# ======================================================================
+
+def forward_loss(
+    *,
+    model,
+    criterion,
+    sample,
+    spec,
+):
+    image_t1 = tensor_to_pil(
+        sample[
+            "images_t1"
+        ]
+    )
+
+    image_t2 = tensor_to_pil(
+        sample[
+            "images_t2"
+        ]
+    )
+
+    target = sample[
+        "target"
+    ]
+
+    output_size = tuple(
+        target[
+            "change"
+        ].shape[-2:]
+    )
+
+    prediction = model(
+        image_t1=image_t1,
+        image_t2=image_t2,
+        prompt=sample[
+            "prompt"
+        ],
+        class_names=spec.class_names,
+        output_size=output_size,
+    )
+
+    loss_output = criterion(
+        prediction=prediction,
+        target=target,
+        class_names=spec.class_names,
+    )
+
+    return prediction, loss_output
+
+
+# ======================================================================
+# Validation
+# ======================================================================
+
+@torch.no_grad()
+def validate(
+    *,
+    model,
+    criterion,
+    loader,
+    spec,
+    max_steps,
+    runtime,
+):
+    model.eval()
+
+    sums = {}
+    count = 0
+
+    for sample in loader:
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+        ):
+            _, loss_output = (
+                forward_loss(
+                    model=model,
+                    criterion=criterion,
+                    sample=sample,
+                    spec=spec,
+                )
+            )
+
+        values = (
+            loss_output.as_dict()
+        )
+
+        for key, value in values.items():
+            sums[key] = (
+                sums.get(
+                    key,
+                    0.0,
+                )
+                + float(
+                    value.detach()
+                    .cpu()
+                )
+            )
+
+        count += 1
+
+        if count >= max_steps:
+            break
+
+    model.train()
+
+    if count == 0:
+        return {}
+
+    result = {
+        key: value / count
+        for key, value
+        in sums.items()
+    }
+
+    if (
+        runtime["distributed"]
+    ):
+        # First V1 keeps validation logging local to rank 0.
+        # Full distributed metric reduction comes with evaluator V2.
+        pass
+
+    return result
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+def main():
+    args = parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required."
+        )
+
+    runtime = setup_distributed()
+
+    try:
+        set_seed(
+            args.seed,
+            runtime["rank"],
+        )
+
+        spec = load_spec(
+            args.spec
+        )
+
+        if (
+            spec.task_mode
+            .lower()
+            .strip()
+            != "2d"
+        ):
+            raise ValueError(
+                "Training V1 currently closes the 2D loop first."
+            )
+
+        root = (
+            args.dataset_root
+            .expanduser()
+            .resolve()
+        )
+
+        train_manifest = (
+            root
+            / "manifests"
+            / f"{args.train_split}.jsonl"
+        )
+
+        val_manifest = (
+            root
+            / "manifests"
+            / f"{args.val_split}.jsonl"
+        )
+
+        train_dataset = (
+            UnifiedPAIRDataset(
+                train_manifest,
+                spec,
+            )
+        )
+
+        val_dataset = (
+            UnifiedPAIRDataset(
+                val_manifest,
+                spec,
+            )
+            if val_manifest.exists()
+            else None
+        )
+
+        train_loader, train_sampler = (
+            make_loader(
+                train_dataset,
+                distributed=runtime[
+                    "distributed"
+                ],
+                shuffle=True,
+                num_workers=args.num_workers,
+            )
+        )
+
+        if val_dataset is not None:
+            val_loader, _ = (
+                make_loader(
+                    val_dataset,
+                    distributed=False,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                )
+            )
+        else:
+            val_loader = None
+
+        model = build_model(
+            args,
+            runtime,
+        )
+
+        if runtime["distributed"]:
+            model = DDP(
+                model,
+                device_ids=[
+                    runtime[
+                        "local_rank"
+                    ]
+                ],
+                output_device=runtime[
+                    "local_rank"
+                ],
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+
+        criterion = (
+            PAIRSemanticChangeLoss(
+                semantic_weight=1.0,
+                change_bce_weight=1.0,
+                change_dice_weight=1.0,
+            )
+            .to(
+                runtime["device"]
+            )
+        )
+
+        params = [
+            p
+            for p in model.parameters()
+            if p.requires_grad
+        ]
+
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+        scheduler = (
+            get_constant_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=args.warmup_steps,
+            )
+        )
+
+        start_step = 0
+
+        if args.resume is not None:
+            start_step = load_checkpoint(
+                path=args.resume,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
+
+        if runtime["is_main"]:
+            args.output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            print("=" * 88)
+            print("PAIR TRAINING V1")
+            print("=" * 88)
+            print(
+                "Spec:",
+                args.spec,
+            )
+            print(
+                "Classes:",
+                spec.class_names,
+            )
+            print(
+                "Train samples:",
+                len(train_dataset),
+            )
+            print(
+                "Val samples:",
+                (
+                    len(val_dataset)
+                    if val_dataset is not None
+                    else 0
+                ),
+            )
+            print(
+                "World size:",
+                runtime["world_size"],
+            )
+            print(
+                "Train Qwen:",
+                args.train_qwen,
+            )
+            print(
+                "Gradient accumulation:",
+                args.grad_accum,
+            )
+            print(
+                "Effective global batch:",
+                (
+                    runtime[
+                        "world_size"
+                    ]
+                    * args.grad_accum
+                ),
+            )
+            print()
+
+        model.train()
+
+        train_iter = infinite_loader(
+            train_loader,
+            train_sampler,
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        log_sums = {}
+        log_count = 0
+        wall_start = time.time()
+
+        for step in range(
+            start_step,
+            args.max_steps,
+        ):
+            sample = next(
+                train_iter
+            )
+
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+            ):
+                _, loss_output = (
+                    forward_loss(
+                        model=model,
+                        criterion=criterion,
+                        sample=sample,
+                        spec=spec,
+                    )
+                )
+
+                loss = (
+                    loss_output.total
+                    / args.grad_accum
+                )
+
+            loss.backward()
+
+            values = (
+                loss_output.as_dict()
+            )
+
+            for key, value in values.items():
+                log_sums[key] = (
+                    log_sums.get(
+                        key,
+                        0.0,
+                    )
+                    + float(
+                        value.detach()
+                        .cpu()
+                    )
+                )
+
+            log_count += 1
+
+            update = (
+                (step + 1)
+                % args.grad_accum
+                == 0
+            )
+
+            if update:
+                if (
+                    args.max_grad_norm
+                    > 0
+                ):
+                    torch.nn.utils.clip_grad_norm_(
+                        params,
+                        args.max_grad_norm,
+                    )
+
+                optimizer.step()
+                scheduler.step()
+
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+            global_step = step + 1
+
+            if (
+                runtime["is_main"]
+                and global_step
+                % args.log_every
+                == 0
+            ):
+                elapsed = (
+                    time.time()
+                    - wall_start
+                )
+
+                means = {
+                    key: value
+                    / max(
+                        log_count,
+                        1,
+                    )
+                    for key, value
+                    in log_sums.items()
+                }
+
+                lr = optimizer.param_groups[
+                    0
+                ][
+                    "lr"
+                ]
+
+                print(
+                    f"step {global_step:6d} | "
+                    f"loss {means['loss']:.4f} | "
+                    f"sem1 {means['loss_semantic_t1']:.4f} | "
+                    f"sem2 {means['loss_semantic_t2']:.4f} | "
+                    f"bce {means['loss_change_bce']:.4f} | "
+                    f"dice {means['loss_change_dice']:.4f} | "
+                    f"lr {lr:.3e} | "
+                    f"{elapsed / args.log_every:.2f}s/step"
+                )
+
+                record = {
+                    "step": global_step,
+                    "lr": lr,
+                    **means,
+                }
+
+                with (
+                    args.output_dir
+                    / "train_log.jsonl"
+                ).open(
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        json.dumps(
+                            record
+                        )
+                        + "\n"
+                    )
+
+                log_sums = {}
+                log_count = 0
+                wall_start = time.time()
+
+            if (
+                val_loader is not None
+                and global_step
+                % args.val_every
+                == 0
+            ):
+                if runtime["distributed"]:
+                    dist.barrier()
+
+                if runtime["is_main"]:
+                    val_result = validate(
+                        model=model_for_state(
+                            model
+                        ),
+                        criterion=criterion,
+                        loader=val_loader,
+                        spec=spec,
+                        max_steps=args.val_steps,
+                        runtime=runtime,
+                    )
+
+                    print(
+                        "VAL",
+                        global_step,
+                        val_result,
+                    )
+
+                if runtime["distributed"]:
+                    dist.barrier()
+
+                model.train()
+
+            if (
+                runtime["is_main"]
+                and global_step
+                % args.save_every
+                == 0
+            ):
+                save_checkpoint(
+                    path=(
+                        args.output_dir
+                        / f"step_{global_step:07d}.pt"
+                    ),
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    step=global_step,
+                    args=args,
+                    spec_name=args.spec,
+                )
+
+        if runtime["is_main"]:
+            save_checkpoint(
+                path=(
+                    args.output_dir
+                    / "last.pt"
+                ),
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=args.max_steps,
+                args=args,
+                spec_name=args.spec,
+            )
+
+            print("Training complete.")
+
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
-    os.environ["WANDB_MODE"] = "offline"
-    args = default_argument_parser().parse_args()
-    print(f"Entering main with train.py!")
-    
-    print(f"Opts: {args.opts}")
-    print("Command Line Args:", args)
-    # torch.autograd.set_detect_anomaly(True)
-    # torch.multiprocessing.set_sharing_strategy('file_system')
-    # torch.backends.cudnn.deterministic = True  #needed
-    # torch.use_deterministic_algorithms(True, warn_only=True)
-
-    # Set critical NCCL environment variables
-    # os.environ["NCCL_BLOCKING_WAIT"] = "0"  # Non-blocking communications
-    # os.environ["NCCL_SOCKET_NTHREADS"] = "4"  # More socket threads
-    # os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"  # More sockets per thread
-    # os.environ["NCCL_P2P_DISABLE"] = "1"  # Disable P2P which can cause hangs
-    # dist.init_process_group(backend='nccl' if dist.is_nccl_available() else 'gloo', init_method='env://', timeout=timedelta(seconds=10800))
-
-    _launcher = "main"
-    _kwargs = dict()
-    
-    if "launcher=" in args.opts[0]:
-        _launcher = args.opts[0].split("=")[1]
-        args.opts = args.opts[1:]
-
-    if _launcher == "slurm":
-        print(f"Using SLURM launcher on host: {socket.gethostname()}")
-        launcher = slurm_launch
-        _kwargs["cfg"] = (args,)
-
-        # this is needed to prevent memory leak in conv2d layers
-        # see: https://github.com/pytorch/pytorch/issues/98688#issuecomment-1869290827
-        # os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-        launcher(
-            main,
-            args.num_gpus,
-            num_machines=args.num_machines,
-            machine_rank=args.machine_rank,
-            dist_url=args.dist_url,
-            **_kwargs
-        )
-
-    else:
-        launcher = launch
-        _kwargs["args"] = (args,)
-        
-        # this is needed to prevent memory leak in conv2d layers
-        # see: https://github.com/pytorch/pytorch/issues/98688#issuecomment-1869290827
-        # os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
-        launcher(
-            main,
-            args.num_gpus,
-            num_machines=args.num_machines,
-            machine_rank=args.machine_rank,
-            dist_url=args.dist_url,
-            timeout=DEFAULT_TIMEOUT,
-            **_kwargs
-        )
+    main()
