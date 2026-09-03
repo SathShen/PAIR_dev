@@ -1,27 +1,27 @@
 """
-PAIR semantic-change loss.
+PAIR unified semantic-change loss.
 
-Supports arbitrary raw dataset class IDs declared manually in DatasetSpec:
+Decoder-side logits:
+    semantic_logits_t1 : [N1, K]
+    semantic_logits_t2 : [N2, K]
+    change_logits_t1   : [N1]
+    change_logits_t2   : [N2]
 
-    class_names = {
-        0: "unchanged",
-        10: "water",
-        50: "building",
-    }
+Targets may be 2D maps [H,W] or 3D point labels [N]; they are flattened here.
 
-Raw semantic labels are remapped only according to this dictionary:
+Dataset class IDs do NOT need to be continuous. Example:
+    class_names = {0: "unchanged", 10: "water", 50: "building"}
 
-    raw 0  -> local 0
-    raw 10 -> local 1
-    raw 50 -> local 2
-
-No label-file scanning or automatic class discovery is performed.
+The model-local classifier order is the sorted raw IDs:
+    0 -> local 0
+    10 -> local 1
+    50 -> local 2
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -47,350 +47,155 @@ class ChangeLossOutput:
 
 
 class PAIRSemanticChangeLoss(nn.Module):
-    def __init__(
-        self,
-        *,
-        semantic_weight: float = 1.0,
-        change_bce_weight: float = 1.0,
-        change_dice_weight: float = 1.0,
-        dice_eps: float = 1.0,
-    ):
+    def __init__(self, semantic_weight=1.0, change_bce_weight=1.0,
+                 change_dice_weight=1.0, dice_eps=1.0):
         super().__init__()
-
-        self.semantic_weight = float(
-            semantic_weight
-        )
-        self.change_bce_weight = float(
-            change_bce_weight
-        )
-        self.change_dice_weight = float(
-            change_dice_weight
-        )
-        self.dice_eps = float(
-            dice_eps
-        )
-
-    # ------------------------------------------------------------------
-    # Raw -> local class mapping
-    # ------------------------------------------------------------------
+        self.semantic_weight = float(semantic_weight)
+        self.change_bce_weight = float(change_bce_weight)
+        self.change_dice_weight = float(change_dice_weight)
+        self.dice_eps = float(dice_eps)
 
     @staticmethod
-    def make_raw_to_local(
-        class_names: Dict[int, str],
-    ) -> Dict[int, int]:
-        if not isinstance(class_names, dict):
-            raise TypeError(
-                "class_names must be Dict[int, str]"
-            )
-
-        raw_ids = sorted(
-            int(k)
-            for k in class_names.keys()
-        )
-
-        return {
-            raw_id: local_id
-            for local_id, raw_id
-            in enumerate(raw_ids)
-        }
+    def make_raw_to_local(class_names: Dict[int, str]) -> Dict[int, int]:
+        if not isinstance(class_names, dict) or not class_names:
+            raise TypeError("class_names must be a non-empty Dict[int, str]")
+        raw_ids = sorted(int(k) for k in class_names.keys())
+        return {raw_id: local_id for local_id, raw_id in enumerate(raw_ids)}
 
     @classmethod
-    def remap_semantic_target(
-        cls,
-        *,
-        raw_target: torch.Tensor,
-        valid_mask: torch.Tensor,
-        class_names: Dict[int, str],
-        ignore_index: int = -100,
-    ) -> torch.Tensor:
-        """
-        Convert arbitrary source class IDs into CE-compatible 0..K-1 indices.
+    def remap_semantic_target(cls, raw_target, valid_mask, class_names, ignore_index=-100):
+        raw_target = raw_target.reshape(-1).long()
+        valid_mask = valid_mask.reshape(-1).bool()
+        if raw_target.numel() != valid_mask.numel():
+            raise ValueError("semantic target and valid mask sizes differ")
 
-        Only positions where valid_mask=True are checked.
-        """
-        if raw_target.shape != valid_mask.shape:
-            raise ValueError(
-                "semantic target and valid mask shapes differ"
-            )
-
-        mapping = cls.make_raw_to_local(
-            class_names
-        )
-
-        local = torch.full_like(
-            raw_target,
-            fill_value=int(ignore_index),
-            dtype=torch.long,
-        )
-
-        matched = torch.zeros_like(
-            valid_mask,
-            dtype=torch.bool,
-        )
-
-        for raw_id, local_id in mapping.items():
-            mask = (
-                valid_mask
-                & (raw_target == raw_id)
-            )
-
-            local[mask] = int(
-                local_id
-            )
-
+        local = torch.full_like(raw_target, int(ignore_index))
+        matched = torch.zeros_like(valid_mask)
+        for raw_id, local_id in cls.make_raw_to_local(class_names).items():
+            mask = valid_mask & (raw_target == raw_id)
+            local[mask] = local_id
             matched |= mask
 
-        bad = (
-            valid_mask
-            & ~matched
-        )
-
+        bad = valid_mask & ~matched
         if bad.any():
-            bad_values = torch.unique(
-                raw_target[bad]
-            ).detach().cpu().tolist()
-
+            values = torch.unique(raw_target[bad]).detach().cpu().tolist()
             raise ValueError(
-                "Valid semantic labels contain raw class IDs not declared "
-                f"in DatasetSpec.class_names: {bad_values}"
+                f"Semantic labels {values} are not declared in DatasetSpec.class_names"
             )
-
         return local
 
-    # ------------------------------------------------------------------
-    # Loss components
-    # ------------------------------------------------------------------
+    @classmethod
+    def semantic_ce(cls, logits, raw_target, valid_mask, class_names):
+        if logits.ndim != 2:
+            raise ValueError(f"semantic logits must be [N,K], got {tuple(logits.shape)}")
 
-    @staticmethod
-    def masked_semantic_ce(
-        *,
-        logits: torch.Tensor,
-        raw_target: torch.Tensor,
-        valid_mask: torch.Tensor,
-        class_names: Dict[int, str],
-    ) -> torch.Tensor:
-        if logits.ndim != 4:
+        raw_target = raw_target.to(logits.device).reshape(-1)
+        valid_mask = valid_mask.to(logits.device).reshape(-1).bool()
+        if logits.shape[0] != raw_target.numel():
             raise ValueError(
-                f"semantic logits must be [B,K,H,W], got {tuple(logits.shape)}"
+                f"semantic logits/target size mismatch: {logits.shape[0]} vs {raw_target.numel()}"
             )
-
-        if raw_target.ndim == 2:
-            raw_target = raw_target.unsqueeze(
-                0
-            )
-
-        if valid_mask.ndim == 2:
-            valid_mask = valid_mask.unsqueeze(
-                0
-            )
-
-        local_target = (
-            PAIRSemanticChangeLoss
-            .remap_semantic_target(
-                raw_target=raw_target,
-                valid_mask=valid_mask,
-                class_names=class_names,
-            )
-        )
-
-        if not valid_mask.any():
-            # Differentiable zero.
-            return logits.sum() * 0.0
-
-        return F.cross_entropy(
-            logits.float(),
-            local_target,
-            ignore_index=-100,
-        )
-
-    @staticmethod
-    def masked_change_bce(
-        *,
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if logits.ndim != 4 or logits.shape[1] != 1:
+        if logits.shape[1] != len(class_names):
             raise ValueError(
-                "change_logits must be [B,1,H,W]"
+                f"semantic logits K={logits.shape[1]} but class_names has {len(class_names)} classes"
             )
-
-        logits = logits[:, 0]
-
-        if target.ndim == 2:
-            target = target.unsqueeze(
-                0
-            )
-
-        if valid_mask.ndim == 2:
-            valid_mask = valid_mask.unsqueeze(
-                0
-            )
-
         if not valid_mask.any():
             return logits.sum() * 0.0
 
-        y = target[
-            valid_mask
-        ].float()
+        local_target = cls.remap_semantic_target(raw_target, valid_mask, class_names)
+        return F.cross_entropy(logits.float(), local_target, ignore_index=-100)
 
-        if not torch.all(
-            (y == 0) | (y == 1)
-        ):
-            values = torch.unique(
-                y
-            ).detach().cpu().tolist()
+    @staticmethod
+    def _prepare_change(logits, target, valid_mask):
+        logits = logits.reshape(-1)
+        target = target.to(logits.device).reshape(-1)
+        valid_mask = valid_mask.to(logits.device).reshape(-1).bool()
 
+        if logits.numel() != target.numel() or target.numel() != valid_mask.numel():
             raise ValueError(
-                f"valid change target must contain only 0/1, got {values}"
+                f"change logits/target/mask size mismatch: "
+                f"{logits.numel()}, {target.numel()}, {valid_mask.numel()}"
             )
+        if not valid_mask.any():
+            return logits, target.float(), valid_mask
 
+        y = target[valid_mask]
+        if not torch.all((y == 0) | (y == 1)):
+            values = torch.unique(y).detach().cpu().tolist()
+            raise ValueError(f"valid change target must contain only 0/1, got {values}")
+
+        return logits, target.float(), valid_mask
+
+    def change_bce(self, logits, target, valid_mask):
+        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
+        if not valid_mask.any():
+            return logits.sum() * 0.0
         return F.binary_cross_entropy_with_logits(
-            logits[valid_mask].float(),
-            y,
+            logits[valid_mask].float(), target[valid_mask]
         )
 
-    def masked_change_dice(
-        self,
-        *,
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = logits[:, 0]
-
-        if target.ndim == 2:
-            target = target.unsqueeze(
-                0
-            )
-
-        if valid_mask.ndim == 2:
-            valid_mask = valid_mask.unsqueeze(
-                0
-            )
-
+    def change_dice(self, logits, target, valid_mask):
+        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
         if not valid_mask.any():
             return logits.sum() * 0.0
 
-        prob = torch.sigmoid(
-            logits.float()
+        prob = torch.sigmoid(logits[valid_mask].float())
+        target = target[valid_mask]
+        intersection = (prob * target).sum()
+        dice = (2 * intersection + self.dice_eps) / (
+            prob.sum() + target.sum() + self.dice_eps
         )
-
-        target = target.float()
-
-        prob = prob[
-            valid_mask
-        ]
-
-        target = target[
-            valid_mask
-        ]
-
-        intersection = (
-            prob * target
-        ).sum()
-
-        denominator = (
-            prob.sum()
-            + target.sum()
-        )
-
-        dice = (
-            2.0 * intersection
-            + self.dice_eps
-        ) / (
-            denominator
-            + self.dice_eps
-        )
-
         return 1.0 - dice
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _change_target(target, time_id):
+        """
+        Current 2D datasets use one shared change map:
+            change / change_valid
 
-    def forward(
-        self,
-        *,
-        prediction,
-        target,
-        class_names: Dict[int, str],
-    ) -> ChangeLossOutput:
-        sem_t1 = target[
-            "semantic_t1"
-        ].to(
-            prediction.semantic_logits_t1.device
+        Future 3D datasets may have different T1/T2 point topologies and can provide:
+            change_t1 / change_valid_t1
+            change_t2 / change_valid_t2
+        """
+        key = f"change_t{time_id}"
+        valid_key = f"change_valid_t{time_id}"
+        if key in target:
+            if valid_key not in target:
+                raise KeyError(f"{key} exists but {valid_key} is missing")
+            return target[key], target[valid_key]
+        return target["change"], target["change_valid"]
+
+    def forward(self, *, prediction, target, class_names: Dict[int, str]):
+        sem1 = self.semantic_ce(
+            prediction.semantic_logits_t1, target["semantic_t1"],
+            target["semantic_valid_t1"], class_names
+        )
+        sem2 = self.semantic_ce(
+            prediction.semantic_logits_t2, target["semantic_t2"],
+            target["semantic_valid_t2"], class_names
         )
 
-        sem_t2 = target[
-            "semantic_t2"
-        ].to(
-            prediction.semantic_logits_t2.device
-        )
+        change_t1, valid_t1 = self._change_target(target, 1)
+        change_t2, valid_t2 = self._change_target(target, 2)
 
-        sem_valid_t1 = target[
-            "semantic_valid_t1"
-        ].to(
-            prediction.semantic_logits_t1.device
-        )
+        bce1 = self.change_bce(prediction.change_logits_t1, change_t1, valid_t1)
+        bce2 = self.change_bce(prediction.change_logits_t2, change_t2, valid_t2)
+        dice1 = self.change_dice(prediction.change_logits_t1, change_t1, valid_t1)
+        dice2 = self.change_dice(prediction.change_logits_t2, change_t2, valid_t2)
 
-        sem_valid_t2 = target[
-            "semantic_valid_t2"
-        ].to(
-            prediction.semantic_logits_t2.device
-        )
-
-        change = target[
-            "change"
-        ].to(
-            prediction.change_logits.device
-        )
-
-        change_valid = target[
-            "change_valid"
-        ].to(
-            prediction.change_logits.device
-        )
-
-        loss_sem1 = self.masked_semantic_ce(
-            logits=prediction.semantic_logits_t1,
-            raw_target=sem_t1,
-            valid_mask=sem_valid_t1,
-            class_names=class_names,
-        )
-
-        loss_sem2 = self.masked_semantic_ce(
-            logits=prediction.semantic_logits_t2,
-            raw_target=sem_t2,
-            valid_mask=sem_valid_t2,
-            class_names=class_names,
-        )
-
-        loss_bce = self.masked_change_bce(
-            logits=prediction.change_logits,
-            target=change,
-            valid_mask=change_valid,
-        )
-
-        loss_dice = self.masked_change_dice(
-            logits=prediction.change_logits,
-            target=change,
-            valid_mask=change_valid,
-        )
+        change_bce = 0.5 * (bce1 + bce2)
+        change_dice = 0.5 * (dice1 + dice2)
 
         total = (
-            self.semantic_weight
-            * (loss_sem1 + loss_sem2)
-            + self.change_bce_weight
-            * loss_bce
-            + self.change_dice_weight
-            * loss_dice
+            self.semantic_weight * (sem1 + sem2)
+            + self.change_bce_weight * change_bce
+            + self.change_dice_weight * change_dice
         )
 
         return ChangeLossOutput(
             total=total,
-            semantic_t1=loss_sem1,
-            semantic_t2=loss_sem2,
-            change_bce=loss_bce,
-            change_dice=loss_dice,
+            semantic_t1=sem1,
+            semantic_t2=sem2,
+            change_bce=change_bce,
+            change_dice=change_dice,
         )

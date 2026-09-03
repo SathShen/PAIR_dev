@@ -35,7 +35,7 @@ LANDSATSCD_SPEC = DatasetSpec(
         2: "desert",
         3: "building",
         4: "water",
-    }
+    },
 
     image_size=512,
     ignore_value=None,
