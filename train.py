@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from dataset.pair_dataset import DatasetSpec, UnifiedPAIRDataset
+from datasets.pair_dataset import DatasetSpec, UnifiedPAIRDataset
 from loss import PAIRSemanticChangeLoss
 from metrics import PAIRMetrics, normalized_confusion_image
 from models.change_decoder import UnifiedChangeDecoder, UnifiedTokenSet, build_identity_temporal_links
