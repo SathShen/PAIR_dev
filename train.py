@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
+
 PAIR unified training framework.
 
 PAIR 2D training uses true vectorized physical batching inside each GPU.
