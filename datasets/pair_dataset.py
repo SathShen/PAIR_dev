@@ -63,7 +63,7 @@ class DatasetSpec:
     name: str
     task_mode: str                 # 2d | 3d | 2d3d
     label_mode: str = "semantic_pair"  # semantic_pair | post_semantic | binary | custom
-    class_names: Optional[Sequence[str]] = None
+    class_names: Optional[Dict[int, str]] = None
 
     # Optional paired raster output size (H, W). This is not registration.
     image_size: Optional[Tuple[int, int]] = None
@@ -360,14 +360,34 @@ def build_default_prompt(spec: DatasetSpec) -> str:
     )
 
     if spec.label_mode == "semantic_pair":
-        text += " For changed regions, infer the semantic class before and after change."
+        text += (
+            " For changed regions, infer the semantic class "
+            "before and after change."
+        )
+
     elif spec.label_mode == "post_semantic":
-        text += " The pre-change semantic class may be unknown, while the post-change class is supervised."
+        text += (
+            " The pre-change semantic class may be unknown, "
+            "while the post-change class is supervised."
+        )
+
     elif spec.label_mode == "binary":
-        text += " The source dataset only supervises change; semantic classes before and after change are unknown."
+        text += (
+            " The source dataset only supervises change; "
+            "semantic classes before and after change are unknown."
+        )
 
     if spec.class_names:
-        text += " Valid semantic classes are: " + ", ".join(spec.class_names) + "."
+        classes = ", ".join(
+            f"{class_id}: {class_name}"
+            for class_id, class_name in spec.class_names.items()
+        )
+
+        text += (
+            " Valid semantic classes are: "
+            + classes
+            + "."
+        )
 
     return text
 

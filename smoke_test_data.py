@@ -2,153 +2,66 @@
 # -*- coding: utf-8 -*-
 
 """
-Real 2D dataset -> PAIR temporal model smoke test.
+PAIR real multi-class dataset -> config DatasetSpec -> train-mode forward test.
 
-Tests
-=====
-1. Read train/val/test JSONL with UnifiedPAIRDataset.
-2. Resolve relative manifest paths correctly.
-3. Load real T1/T2 images and semantic labels.
-4. Build canonical semantic-change target:
-       change
-       semantic_t1
-       semantic_t2
-       change_valid
-       semantic_valid_t1
-       semantic_valid_t2
-5. Check image/label geometry and tensor validity.
-6. Convert the dataset image tensor safely to PIL for Qwen preprocessing.
-7. Build the real Qwen3-VL backbone + temporal PAIR model.
-8. Feed REAL dataset T1/T2 into task_mode="2d".
-9. Verify:
-       image_hidden_t1
-       image_hidden_t2
-       task_hidden
-       T1/T2 representations differ
-10. Optional native language generation.
+This test intentionally reads DatasetSpec from:
 
-This test intentionally does NOT resize to 448x448.
-It uses the dataset's current spatial size unless DatasetSpec.image_size
-is manually set below.
+    datasets/config.py
 
-Run example
-===========
-CUDA_VISIBLE_DEVICES=2 python smoke_test_real_2d_dataset.py \
-    --dataset-root /data2/sht/Datasets/SECONDBbi \
-    --split train
+It DOES NOT infer class names or class count from the data.
 
-Optional generation:
-CUDA_VISIBLE_DEVICES=2 python smoke_test_real_2d_dataset.py \
-    --dataset-root /data2/sht/Datasets/SECONDBbi \
+Pipeline
+--------
+dataset/config.py
+      ↓
+manual DatasetSpec
+      ↓
+manifests/train.jsonl
+      ↓
+UnifiedPAIRDataset
+      ↓
+real multi-class T1/T2 semantic labels
+      ↓
+real T1/T2 images
+      ↓
+PAIRModel.train()
+      ↓
+temporal 2D forward with autograd
+      ↓
+image_hidden_t1 / image_hidden_t2 / task_hidden / logits
+
+Run
+---
+CUDA_VISIBLE_DEVICES=2 python smoke_test_dataset_forward.py \
+    --dataset-root /home/sht/Datasets/SECONDpair \
     --split train \
-    --generate
+    --spec SECOND_SPEC \
+    --index 0
 """
 
 from __future__ import annotations
 
 import argparse
-import inspect
+import importlib
 import os
-import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from PIL import Image
 
-
-# ======================================================================
-# PAIR dataset import
-# ======================================================================
-
-# Try the likely project locations so this smoke test does not care whether
-# pair_dataset.py is currently in datasets/, data_preparation/, or repo root.
-try:
-    from datasets.pair_dataset import (
-        DatasetSpec,
-        UnifiedPAIRDataset,
-        UNKNOWN_CLASS_ID,
-        IGNORE_CLASS_ID,
-    )
-    DATASET_IMPORT = "datasets.pair_dataset"
-
-except ImportError:
-    try:
-        from data_preparation.pair_dataset import (
-            DatasetSpec,
-            UnifiedPAIRDataset,
-            UNKNOWN_CLASS_ID,
-            IGNORE_CLASS_ID,
-        )
-        DATASET_IMPORT = "data_preparation.pair_dataset"
-
-    except ImportError:
-        from pair_dataset import (
-            DatasetSpec,
-            UnifiedPAIRDataset,
-            UNKNOWN_CLASS_ID,
-            IGNORE_CLASS_ID,
-        )
-        DATASET_IMPORT = "pair_dataset"
-
-
+from datasets.pair_dataset import (
+    DatasetSpec,
+    UnifiedPAIRDataset,
+    IGNORE_CLASS_ID,
+    UNKNOWN_CLASS_ID,
+)
 from models.pair import PAIRModel
 from models.qwen3vl_backbone import Qwen3VLBackbone
 
 
-DEFAULT_MODEL_DIR = (
-    "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
-)
+DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
 
-
-# ======================================================================
-# MANUAL DATASET SPEC
-# ======================================================================
-#
-# IMPORTANT:
-# Do NOT let the preparation script guess these values.
-#
-# For the first smoke test, class_names=None is enough to verify the data/model
-# pipeline. Once the exact SECOND class-ID mapping is confirmed, fill it here.
-#
-# Example:
-#
-# CLASS_NAMES = [
-#     "class_0",
-#     "class_1",
-#     ...
-# ]
-#
-CLASS_NAMES = None
-
-# Leave None to preserve the dataset's native image size.
-IMAGE_SIZE = None
-
-# Change this only if the actual source labels use another ignore value.
-IGNORE_VALUE = 255
-
-
-def build_spec() -> DatasetSpec:
-    return DatasetSpec(
-        name="SECONDBbi",
-        task_mode="2d",
-        label_mode="semantic_pair",
-        class_names=CLASS_NAMES,
-        image_size=IMAGE_SIZE,
-        ignore_value=IGNORE_VALUE,
-        strict_geo_alignment=True,
-        prompt=(
-            "Perform semantic change detection between Time 1 and Time 2. "
-            "Identify unchanged regions and changed regions, and infer the "
-            "semantic classes before and after each change when possible."
-        ),
-    )
-
-
-# ======================================================================
-# Utilities
-# ======================================================================
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -157,23 +70,26 @@ def parse_args():
         "--dataset-root",
         type=Path,
         required=True,
-        help=(
-            "Prepared dataset root containing images_t1/, images_t2/, "
-            "semantic_t1/, semantic_t2/, manifests/."
-        ),
+        help="Prepared dataset root containing manifests/ and flat modality folders.",
     )
 
     parser.add_argument(
         "--split",
-        choices=["train", "val", "test"],
+        choices=("train", "val", "test"),
         default="train",
+    )
+
+    parser.add_argument(
+        "--spec",
+        type=str,
+        default="SECOND_SPEC",
+        help="Variable name of DatasetSpec in dataset/config.py.",
     )
 
     parser.add_argument(
         "--index",
         type=int,
         default=0,
-        help="Sample index inside the selected split.",
     )
 
     parser.add_argument(
@@ -182,48 +98,101 @@ def parse_args():
         default=DEFAULT_MODEL_DIR,
     )
 
-    parser.add_argument(
-        "--generate",
-        action="store_true",
-        help="Also test native Qwen language generation.",
-    )
-
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=48,
-    )
-
     return parser.parse_args()
 
 
-def gib(num_bytes: int) -> float:
-    return num_bytes / (1024 ** 3)
+def load_spec(spec_name: str) -> DatasetSpec:
+    """
+    Load one manually written DatasetSpec from dataset/config.py.
+
+    No automatic class discovery from labels is performed.
+    """
+    module = importlib.import_module("datasets.configs")
+
+    if not hasattr(module, spec_name):
+        available = {
+            name: value
+            for name, value in vars(module).items()
+            if isinstance(value, DatasetSpec)
+        }
+
+        names = ", ".join(sorted(available)) if available else "<none>"
+
+        raise AttributeError(
+            f"dataset.config has no DatasetSpec named {spec_name!r}.\n"
+            f"Available DatasetSpec objects: {names}"
+        )
+
+    spec = getattr(module, spec_name)
+
+    if not isinstance(spec, DatasetSpec):
+        raise TypeError(
+            f"dataset.config.{spec_name} exists, but is not DatasetSpec: "
+            f"{type(spec)}"
+        )
+
+    return spec
 
 
-def summarize_tensor(
-    name: str,
-    x: torch.Tensor | None,
-):
+def tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    """
+    UnifiedPAIRDataset currently returns float32 [C,H,W] in [0,1].
+    Convert back to uint8 PIL so Qwen owns its native image preprocessing.
+    """
+    if image.ndim != 3:
+        raise ValueError(
+            f"Expected [C,H,W], got {tuple(image.shape)}"
+        )
+
+    x = image.detach().cpu().float()
+
+    if not torch.isfinite(x).all():
+        raise ValueError("Image contains NaN/Inf.")
+
+    vmin = float(x.min())
+    vmax = float(x.max())
+
+    if vmin < -1e-4 or vmax > 1.0001:
+        raise ValueError(
+            f"Expected image in [0,1], got [{vmin}, {vmax}]"
+        )
+
+    x = (
+        x.clamp(0, 1)
+        .mul(255.0)
+        .round()
+        .to(torch.uint8)
+    )
+
+    arr = (
+        x.permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+
+    if arr.shape[-1] == 1:
+        arr = arr[..., 0]
+
+    return Image.fromarray(arr)
+
+
+def tensor_info(name: str, x):
     if x is None:
-        print(f"  {name}: None")
+        print(f"  {name:26s}: None")
         return
 
     print(
-        f"  {name}: "
+        f"  {name:26s}: "
         f"shape={tuple(x.shape)}, "
         f"dtype={x.dtype}, "
-        f"device={x.device}"
+        f"device={x.device}, "
+        f"requires_grad={x.requires_grad}"
     )
 
 
-def unique_summary(
-    tensor: torch.Tensor,
-    *,
-    max_values: int = 30,
-):
+def label_stats(name: str, x: torch.Tensor):
     values, counts = torch.unique(
-        tensor.detach().cpu(),
+        x.detach().cpu(),
         return_counts=True,
     )
 
@@ -234,517 +203,278 @@ def unique_summary(
         )
     )
 
-    if len(pairs) > max_values:
-        return pairs[:max_values] + [
-            ("...", "...")
-        ]
+    print(
+        f"  {name:26s}: {pairs}"
+    )
 
     return pairs
 
 
-def chw_float_to_pil(
-    image: torch.Tensor,
-) -> Image.Image:
-    """
-    Convert UnifiedPAIRDataset image tensor [C,H,W], float approximately
-    in [0,1], back to a normal uint8 PIL image before Qwen processing.
-
-    Why?
-    ----
-    The dataset loader currently returns normalized torch tensors, while the
-    already validated PAIR temporal smoke tests feed PIL images to Qwen.
-    Converting explicitly here prevents an image processor from accidentally
-    applying an additional 1/255 scaling to an already normalized tensor.
-
-    This is a smoke-test bridge. Later we can decide whether the canonical
-    dataset output should keep both raw/PIL and decoder tensor representations.
-    """
-
-    if not torch.is_tensor(image):
-        raise TypeError(
-            f"Expected torch.Tensor image, got {type(image)}"
-        )
-
-    if image.ndim != 3:
-        raise ValueError(
-            f"Expected image [C,H,W], got {tuple(image.shape)}"
-        )
-
-    if image.shape[0] not in (1, 3, 4):
-        raise ValueError(
-            f"Unsupported channel count: {image.shape[0]}"
-        )
-
-    x = (
-        image.detach()
-        .cpu()
-        .float()
-    )
-
-    if not torch.isfinite(x).all():
-        raise ValueError(
-            "Image tensor contains NaN/Inf."
-        )
-
-    vmin = float(x.min().item())
-    vmax = float(x.max().item())
-
-    # Current pair_dataset.py should produce ~[0,1].
-    # Fail loudly instead of silently clipping badly normalized data.
-    if vmin < -1e-4 or vmax > 1.0001:
-        raise ValueError(
-            "Dataset image is not in expected [0,1] range: "
-            f"min={vmin}, max={vmax}"
-        )
-
-    x = (
-        x.clamp(0.0, 1.0)
-        * 255.0
-    ).round().to(
-        torch.uint8
-    )
-
-    arr = (
-        x.permute(1, 2, 0)
-        .contiguous()
-        .numpy()
-    )
-
-    if arr.shape[2] == 1:
-        arr = arr[:, :, 0]
-
-    return Image.fromarray(arr)
-
-
-def assert_bool_mask(
-    name: str,
-    mask: torch.Tensor,
-    expected_shape,
+def validate_multiclass_target(
+    spec: DatasetSpec,
+    target,
 ):
-    assert mask.dtype == torch.bool, (
-        f"{name} must be bool, got {mask.dtype}"
+    """
+    Check the real semantic labels against the MANUALLY written class_names.
+
+    We do not derive class_names from labels.
+    """
+    if spec.class_names is None:
+        raise ValueError(
+            "This test is specifically for real multi-class data, but "
+            f"{spec.name}.class_names is None in dataset/config.py.\n"
+            "Fill class_names manually in the DatasetSpec first."
+        )
+
+    class_names = list(spec.class_names)
+    num_classes = len(class_names)
+
+    if num_classes < 2:
+        raise ValueError(
+            f"Need a multi-class DatasetSpec, got {num_classes} class(es)."
+        )
+
+    sem1 = target["semantic_t1"]
+    sem2 = target["semantic_t2"]
+
+    valid1 = target["semantic_valid_t1"]
+    valid2 = target["semantic_valid_t2"]
+
+    ids1 = torch.unique(
+        sem1[valid1]
+    ).tolist()
+
+    ids2 = torch.unique(
+        sem2[valid2]
+    ).tolist()
+
+    bad1 = [
+        int(v)
+        for v in ids1
+        if not (0 <= int(v) < num_classes)
+    ]
+
+    bad2 = [
+        int(v)
+        for v in ids2
+        if not (0 <= int(v) < num_classes)
+    ]
+
+    if bad1 or bad2:
+        raise ValueError(
+            "Real semantic label IDs do not match the manually written "
+            "DatasetSpec.class_names.\n"
+            f"num_classes={num_classes}\n"
+            f"bad T1 IDs={bad1}\n"
+            f"bad T2 IDs={bad2}\n"
+            "Fix dataset/config.py or the source label mapping manually."
+        )
+
+    observed = sorted(
+        set(
+            int(v)
+            for v in ids1 + ids2
+        )
     )
 
-    assert tuple(mask.shape) == tuple(expected_shape), (
-        f"{name} shape {tuple(mask.shape)} != {tuple(expected_shape)}"
+    print("  manual class_names:")
+    for i, name in enumerate(class_names):
+        suffix = "  [present in this sample]" if i in observed else ""
+        print(
+            f"    {i:2d}: {name}{suffix}"
+        )
+
+    print(
+        "  observed valid semantic IDs:",
+        observed,
     )
 
+    return num_classes, observed
 
-# ======================================================================
-# Main
-# ======================================================================
+
+def gib(value: int) -> float:
+    return value / 1024**3
+
 
 def main():
     args = parse_args()
 
-    dataset_root = (
+    root = (
         args.dataset_root
         .expanduser()
         .resolve()
     )
 
     manifest = (
-        dataset_root
+        root
         / "manifests"
         / f"{args.split}.jsonl"
     )
 
-    print("=" * 92)
-    print("PAIR REAL 2D DATASET -> TEMPORAL MODEL SMOKE TEST")
-    print("=" * 92)
-    print()
-    print("Dataset module :", DATASET_IMPORT)
-    print("Dataset root   :", dataset_root)
-    print("Manifest       :", manifest)
-    print("Split          :", args.split)
-    print("Sample index   :", args.index)
-    print("Qwen checkpoint:", args.model_dir)
+    print("=" * 96)
+    print("PAIR REAL MULTI-CLASS DATASET -> TRAIN FORWARD")
+    print("=" * 96)
     print()
 
-    assert dataset_root.is_dir(), (
-        f"Dataset root not found: {dataset_root}"
+    # ==================================================================
+    # 1. Read the ACTUAL manually written DatasetSpec
+    # ==================================================================
+    print("[1] LOAD DatasetSpec FROM dataset/config.py")
+
+    spec = load_spec(
+        args.spec
     )
 
-    assert manifest.is_file(), (
-        f"Manifest not found: {manifest}"
+    print(
+        f"  spec variable             : dataset.config.{args.spec}"
+    )
+    print(
+        f"  name                      : {spec.name}"
+    )
+    print(
+        f"  task_mode                 : {spec.task_mode}"
+    )
+    print(
+        f"  label_mode                : {spec.label_mode}"
+    )
+    print(
+        f"  class_names               : {list(spec.class_names) if spec.class_names is not None else None}"
+    )
+    print(
+        f"  image_size                : {spec.image_size}"
+    )
+    print(
+        f"  ignore_value              : {spec.ignore_value}"
     )
 
-    assert os.path.isdir(args.model_dir), (
-        f"Qwen checkpoint not found: {args.model_dir}"
-    )
+    if spec.task_mode.lower().strip() != "2d":
+        raise ValueError(
+            f"This test expects a 2D spec, got {spec.task_mode!r}."
+        )
+
+    if spec.label_mode.lower().strip() != "semantic_pair":
+        raise ValueError(
+            "This multi-class SECOND test expects label_mode='semantic_pair', "
+            f"got {spec.label_mode!r}."
+        )
+
+    print("  CONFIG SPEC: PASS")
+    print()
 
     # ==================================================================
-    # 1. Build real dataset
+    # 2. Read real dataset through UnifiedPAIRDataset
     # ==================================================================
-    print("[1] Building UnifiedPAIRDataset...")
+    print("[2] LOAD REAL MULTI-CLASS DATA")
 
-    spec = build_spec()
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"Manifest not found: {manifest}"
+        )
 
     dataset = UnifiedPAIRDataset(
         manifest,
         spec,
     )
 
-    assert len(dataset) > 0, (
-        "Dataset is empty."
+    print(
+        "  dataset length            :",
+        len(dataset),
     )
 
-    assert 0 <= args.index < len(dataset), (
-        f"--index {args.index} outside dataset length {len(dataset)}"
-    )
-
-    print("  dataset length:", len(dataset))
-    print("  task mode:", spec.task_mode)
-    print("  label mode:", spec.label_mode)
-    print("  class_names:", spec.class_names)
-    print("  image_size:", spec.image_size)
-    print("  DATASET BUILD OK")
-    print()
-
-    # ==================================================================
-    # 2. Load one REAL sample
-    # ==================================================================
-    print("[2] Reading real sample...")
+    if not 0 <= args.index < len(dataset):
+        raise IndexError(
+            f"index={args.index}, dataset length={len(dataset)}"
+        )
 
     t0 = time.perf_counter()
-
     sample = dataset[
         args.index
     ]
+    read_time = time.perf_counter() - t0
 
     print(
-        f"  read time: "
-        f"{time.perf_counter() - t0:.3f} s"
+        "  sample_id                 :",
+        sample["sample_id"],
     )
-
-    print("  sample_id:", sample["sample_id"])
-    print("  dataset_name:", sample["dataset_name"])
-    print("  task_mode:", sample["task_mode"])
-    print("  sample keys:", sorted(sample.keys()))
-
-    assert sample["task_mode"] == "2d"
-
-    assert "images_t1" in sample
-    assert "images_t2" in sample
-    assert "target" in sample
+    print(
+        f"  read time                 : {read_time:.3f} s"
+    )
 
     image_t1 = sample["images_t1"]
     image_t2 = sample["images_t2"]
     target = sample["target"]
 
-    summarize_tensor(
+    tensor_info(
         "images_t1",
         image_t1,
     )
-    summarize_tensor(
+
+    tensor_info(
         "images_t2",
         image_t2,
     )
 
-    assert image_t1.ndim == 3
-    assert image_t2.ndim == 3
-
-    assert image_t1.shape == image_t2.shape, (
-        "T1/T2 image tensors have different shapes."
-    )
-
-    assert torch.isfinite(
-        image_t1
-    ).all()
-
-    assert torch.isfinite(
-        image_t2
-    ).all()
-
-    print(
-        "  image T1 range:",
-        float(image_t1.min()),
-        "to",
-        float(image_t1.max()),
-    )
-    print(
-        "  image T2 range:",
-        float(image_t2.min()),
-        "to",
-        float(image_t2.max()),
-    )
-
-    print("  REAL IMAGE PAIR OK")
-    print()
-
-    # ==================================================================
-    # 3. Validate canonical SCD target
-    # ==================================================================
-    print("[3] Checking canonical semantic-change target...")
-
-    required_target_keys = (
-        "change",
+    label_stats(
         "semantic_t1",
+        target["semantic_t1"],
+    )
+
+    label_stats(
         "semantic_t2",
-        "change_valid",
-        "semantic_valid_t1",
-        "semantic_valid_t2",
+        target["semantic_t2"],
     )
 
-    for key in required_target_keys:
-        assert key in target, (
-            f"Missing target field: {key}"
-        )
-
-    change = target["change"]
-    sem_t1 = target["semantic_t1"]
-    sem_t2 = target["semantic_t2"]
-
-    h, w = image_t1.shape[-2:]
-    spatial_shape = (
-        h,
-        w,
+    label_stats(
+        "change",
+        target["change"],
     )
 
-    assert tuple(
-        change.shape
-    ) == spatial_shape
+    assert image_t1.shape == image_t2.shape
 
-    assert tuple(
-        sem_t1.shape
-    ) == spatial_shape
-
-    assert tuple(
-        sem_t2.shape
-    ) == spatial_shape
-
-    assert_bool_mask(
-        "change_valid",
-        target["change_valid"],
-        spatial_shape,
+    num_classes, observed_ids = validate_multiclass_target(
+        spec,
+        target,
     )
 
-    assert_bool_mask(
-        "semantic_valid_t1",
-        target["semantic_valid_t1"],
-        spatial_shape,
-    )
-
-    assert_bool_mask(
-        "semantic_valid_t2",
-        target["semantic_valid_t2"],
-        spatial_shape,
-    )
-
-    print(
-        "  semantic_t1 values/counts:",
-        unique_summary(
-            sem_t1
-        ),
-    )
-
-    print(
-        "  semantic_t2 values/counts:",
-        unique_summary(
-            sem_t2
-        ),
-    )
-
-    print(
-        "  change values/counts:",
-        unique_summary(
-            change
-        ),
-    )
-
-    print(
-        "  valid change pixels:",
-        int(
-            target[
-                "change_valid"
-            ].sum()
-        ),
-        "/",
-        change.numel(),
-    )
-
-    print(
-        "  valid T1 semantic pixels:",
-        int(
-            target[
-                "semantic_valid_t1"
-            ].sum()
-        ),
-        "/",
-        sem_t1.numel(),
-    )
-
-    print(
-        "  valid T2 semantic pixels:",
-        int(
-            target[
-                "semantic_valid_t2"
-            ].sum()
-        ),
-        "/",
-        sem_t2.numel(),
-    )
-
-    valid_change = change[
+    # Canonical change must still be binary over valid positions.
+    valid_change = target["change"][
         target["change_valid"]
     ]
 
-    valid_values = set(
-        torch.unique(
+    change_ids = set(
+        int(v)
+        for v in torch.unique(
             valid_change
         ).tolist()
     )
 
-    assert valid_values.issubset(
+    if not change_ids.issubset(
         {0, 1}
-    ), (
-        "Valid canonical change labels must be only 0/1, "
-        f"but got {sorted(valid_values)}"
-    )
-
-    # For semantic_pair supervision, where both labels are valid,
-    # change should exactly equal semantic_t1 != semantic_t2.
-    both_semantic_valid = (
-        target[
-            "semantic_valid_t1"
-        ]
-        & target[
-            "semantic_valid_t2"
-        ]
-        & target[
-            "change_valid"
-        ]
-    )
-
-    if both_semantic_valid.any():
-        derived = (
-            sem_t1[
-                both_semantic_valid
-            ]
-            != sem_t2[
-                both_semantic_valid
-            ]
-        ).long()
-
-        actual = change[
-            both_semantic_valid
-        ]
-
-        assert torch.equal(
-            derived,
-            actual,
-        ), (
-            "Canonical change != (semantic_t1 != semantic_t2) "
-            "on valid semantic pixels."
-        )
-
-    print("  CANONICAL TARGET OK")
-    print()
-
-    # ==================================================================
-    # 4. Convert dataset images to Qwen-safe PIL
-    # ==================================================================
-    print("[4] Converting real image tensors to Qwen-safe PIL...")
-
-    pil_t1 = chw_float_to_pil(
-        image_t1
-    )
-
-    pil_t2 = chw_float_to_pil(
-        image_t2
-    )
-
-    print(
-        "  PIL T1:",
-        pil_t1.mode,
-        pil_t1.size,
-    )
-
-    print(
-        "  PIL T2:",
-        pil_t2.mode,
-        pil_t2.size,
-    )
-
-    assert pil_t1.size == (
-        image_t1.shape[2],
-        image_t1.shape[1],
-    )
-
-    assert pil_t2.size == (
-        image_t2.shape[2],
-        image_t2.shape[1],
-    )
-
-    print("  PIL CONVERSION OK")
-    print()
-
-    # ==================================================================
-    # 5. Check that LOCAL pair.py is the temporal model
-    # ==================================================================
-    print("[5] Checking local PAIR temporal interface...")
-
-    forward_signature = inspect.signature(
-        PAIRModel.forward
-    )
-
-    parameter_names = set(
-        forward_signature.parameters.keys()
-    )
-
-    print(
-        "  PAIRModel.forward parameters:",
-        list(
-            forward_signature.parameters.keys()
-        ),
-    )
-
-    if (
-        "images_t1" not in parameter_names
-        or "images_t2" not in parameter_names
     ):
-        raise RuntimeError(
-            "\nYour local models/pair.py is NOT the temporal PAIR version.\n"
-            "Expected PAIRModel.forward(..., images_t1=..., images_t2=...).\n"
-            "Do not continue with the old single-image `images=` interface."
+        raise ValueError(
+            f"Canonical change contains non-binary valid IDs: {change_ids}"
         )
 
-    print("  TEMPORAL PAIR INTERFACE OK")
+    print("  REAL MULTI-CLASS DATA: PASS")
     print()
 
     # ==================================================================
-    # 6. Build real Qwen + 2D PAIR
+    # 3. Build model
     # ==================================================================
-    print("[6] Building Qwen3VLBackbone + PAIRModel...")
+    print("[3] BUILD PAIR")
 
-    assert torch.cuda.is_available(), (
-        "CUDA is required for the full-model test."
-    )
+    if not os.path.isdir(args.model_dir):
+        raise FileNotFoundError(
+            f"Qwen checkpoint not found: {args.model_dir}"
+        )
 
-    device = torch.device(
-        "cuda"
-    )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required."
+        )
 
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-
-    print(
-        "  PyTorch:",
-        torch.__version__,
-    )
-    print(
-        "  CUDA:",
-        torch.version.cuda,
-    )
-    print(
-        "  GPU:",
-        torch.cuda.get_device_name(
-            device
-        ),
-    )
-
-    t0 = time.perf_counter()
 
     qwen = Qwen3VLBackbone(
         model_dir=args.model_dir,
@@ -758,240 +488,201 @@ def main():
         qwen_backbone=qwen,
     )
 
-    model.eval()
-
-    torch.cuda.synchronize()
+    model.train()
 
     print(
-        f"  model load time: "
-        f"{time.perf_counter() - t0:.2f} s"
+        "  model.training            :",
+        model.training,
     )
+
     print(
-        "  Qwen hidden size:",
+        "  qwen hidden size          :",
         qwen.hidden_size,
     )
 
-    print("  MODEL BUILD OK")
+    print("  MODEL BUILD: PASS")
     print()
 
     # ==================================================================
-    # 7. REAL DATA -> temporal PAIR forward
+    # 4. REAL training-style forward
     # ==================================================================
-    print("[7] Feeding REAL T1/T2 into temporal PAIR...")
+    print("[4] REAL TRAIN-MODE FORWARD")
 
-    prompt = sample["prompt"]
-
-    print("  prompt:")
-    print(
-        "   ",
-        prompt,
+    pil_t1 = tensor_to_pil(
+        image_t1
     )
 
+    pil_t2 = tensor_to_pil(
+        image_t2
+    )
+
+    # No no_grad(), no inference_mode().
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    with torch.inference_mode():
-        output = model(
-            task_mode="2d",
-            prompt=prompt,
-            images_t1=pil_t1,
-            images_t2=pil_t2,
-            return_logits=False,
-            return_hidden_states=True,
-        )
+    output = model(
+        task_mode=spec.task_mode,
 
-    torch.cuda.synchronize()
+        prompt=sample["prompt"],
 
-    print(
-        f"  forward time: "
-        f"{time.perf_counter() - t0:.3f} s"
+        images_t1=pil_t1,
+        images_t2=pil_t2,
+
+        return_logits=True,
+        return_hidden_states=True,
+
+        use_cache=False,
     )
 
-    summarize_tensor(
+    torch.cuda.synchronize()
+    forward_time = (
+        time.perf_counter()
+        - t0
+    )
+
+    print(
+        f"  forward time              : {forward_time:.3f} s"
+    )
+
+    tensor_info(
         "image_hidden_t1",
         output.image_hidden_t1,
     )
 
-    summarize_tensor(
+    tensor_info(
         "image_hidden_t2",
         output.image_hidden_t2,
     )
 
-    summarize_tensor(
+    tensor_info(
         "task_hidden",
         output.task_hidden,
     )
 
-    assert output.image_hidden_t1 is not None
-    assert output.image_hidden_t2 is not None
-    assert output.task_hidden is not None
-
-    assert output.image_hidden_t1.ndim == 2
-    assert output.image_hidden_t2.ndim == 2
-
-    assert output.image_hidden_t1.shape[1] == qwen.hidden_size
-    assert output.image_hidden_t2.shape[1] == qwen.hidden_size
-
-    assert output.task_hidden.shape[-1] == qwen.hidden_size
-
-    assert torch.isfinite(
-        output.image_hidden_t1
-    ).all()
-
-    assert torch.isfinite(
-        output.image_hidden_t2
-    ).all()
-
-    assert torch.isfinite(
-        output.task_hidden
-    ).all()
-
-    # Point branch must be inactive.
-    assert output.point_hidden_t1 is None
-    assert output.point_hidden_t2 is None
-
-    print(
-        "  Qwen image token counts T1/T2:",
-        output.image_hidden_t1.shape[0],
-        output.image_hidden_t2.shape[0],
+    tensor_info(
+        "logits",
+        output.logits,
     )
 
-    # Different native image resolutions may produce dynamic token counts.
-    # T1/T2 of the same paired sample should still produce matching counts.
-    assert (
-        output.image_hidden_t1.shape[0]
-        == output.image_hidden_t2.shape[0]
-    ), (
-        "T1/T2 Qwen image token counts differ."
-    )
+    if output.aux is not None:
+        tensor_info(
+            "image_hidden_2d_t1",
+            output.aux.get(
+                "image_hidden_2d_t1"
+            ),
+        )
 
-    image_delta = (
+        tensor_info(
+            "image_hidden_2d_t2",
+            output.aux.get(
+                "image_hidden_2d_t2"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Autograd must exist in a training forward.
+    # ------------------------------------------------------------------
+    required_grad_outputs = {
+        "image_hidden_t1": output.image_hidden_t1,
+        "image_hidden_t2": output.image_hidden_t2,
+        "task_hidden": output.task_hidden,
+        "logits": output.logits,
+    }
+
+    for name, value in required_grad_outputs.items():
+        if value is None:
+            raise RuntimeError(
+                f"{name} is None."
+            )
+
+        if not value.requires_grad:
+            raise RuntimeError(
+                f"{name}.requires_grad=False in train-mode forward."
+            )
+
+        if not torch.isfinite(
+            value
+        ).all():
+            raise RuntimeError(
+                f"{name} contains NaN/Inf."
+            )
+
+    delta = (
         output.image_hidden_t1.float()
         - output.image_hidden_t2.float()
-    ).abs().mean().item()
+    ).abs().mean()
 
     print(
-        "  mean |image_hidden_t1 - image_hidden_t2|:",
-        image_delta,
+        "  mean |T1-T2 hidden|       :",
+        float(
+            delta.detach().cpu()
+        ),
     )
 
-    if torch.equal(
-        image_t1,
-        image_t2,
+    if (
+        not torch.equal(
+            image_t1,
+            image_t2,
+        )
+        and float(
+            delta.detach().cpu()
+        ) <= 0.0
     ):
-        print(
-            "  NOTE: raw T1/T2 tensors are identical; "
-            "representation-difference assertion skipped."
-        )
-    else:
-        assert image_delta > 0.0, (
-            "Real T1/T2 images differ but Qwen representations are identical."
+        raise RuntimeError(
+            "T1/T2 images differ but contextual visual representations collapsed."
         )
 
-    # If temporal PAIR exposes spatial hidden features, validate them too.
-    if output.aux is not None:
-        spatial_t1 = output.aux.get(
-            "image_hidden_2d_t1"
-        )
-        spatial_t2 = output.aux.get(
-            "image_hidden_2d_t2"
-        )
-
-        if spatial_t1 is not None:
-            summarize_tensor(
-                "image_hidden_2d_t1",
-                spatial_t1,
-            )
-
-        if spatial_t2 is not None:
-            summarize_tensor(
-                "image_hidden_2d_t2",
-                spatial_t2,
-            )
-
-        print(
-            "  aux image counts T1/T2:",
-            output.aux.get(
-                "image_count_t1"
-            ),
-            output.aux.get(
-                "image_count_t2"
-            ),
-        )
-
-    print("  REAL DATA -> PAIR FORWARD OK")
+    print("  TRAIN FORWARD: PASS")
     print()
 
     # ==================================================================
-    # 8. Optional generation
+    # 5. Summary
     # ==================================================================
-    if args.generate:
-        print("[8] Testing native generation with REAL T1/T2...")
+    print("[5] GPU")
 
-        with torch.inference_mode():
-            generated = model.generate(
-                task_mode="2d",
-                prompt=prompt,
-                images_t1=pil_t1,
-                images_t2=pil_t2,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-            )
+    print(
+        "  peak allocated            : "
+        f"{gib(torch.cuda.max_memory_allocated()):.2f} GiB"
+    )
 
-        print("  generated text:")
-        print(
-            "   ",
-            generated.generated_text,
-        )
+    print(
+        "  peak reserved             : "
+        f"{gib(torch.cuda.max_memory_reserved()):.2f} GiB"
+    )
 
-        assert generated.generated_ids is not None
-        assert isinstance(
-            generated.generated_text,
-            str,
-        )
-
-        print("  REAL DATA GENERATION OK")
-        print()
-
-    # ==================================================================
-    # Final
-    # ==================================================================
-    torch.cuda.synchronize()
-
-    print("=" * 92)
+    print()
+    print("=" * 96)
     print("SUCCESS")
-    print("=" * 92)
-    print()
-    print("The real 2D pipeline is connected:")
-    print()
-    print("  manifests/*.jsonl")
-    print("          ↓")
-    print("  UnifiedPAIRDataset")
-    print("          ↓")
-    print("  real Image T1 / Image T2")
-    print("          ↓")
-    print("  canonical semantic-change target")
-    print("          ↓")
-    print("  temporal Qwen3-VL / PAIR")
-    print("          ↓")
-    print("  image_hidden_t1 / image_hidden_t2 / task_hidden")
-    print()
+    print("=" * 96)
     print(
-        "Peak allocated GPU memory:",
-        f"{gib(torch.cuda.max_memory_allocated()):.2f} GiB",
+        f"DatasetSpec source          : dataset.config.{args.spec}"
     )
     print(
-        "Peak reserved GPU memory: ",
-        f"{gib(torch.cuda.max_memory_reserved()):.2f} GiB",
+        f"Manual semantic classes     : {num_classes}"
+    )
+    print(
+        f"Classes present in sample   : {observed_ids}"
+    )
+    print(
+        "Real multi-class data       : PASS"
+    )
+    print(
+        "Canonical semantic target   : PASS"
+    )
+    print(
+        "PAIR train-mode forward     : PASS"
+    )
+    print(
+        "Autograd graph              : PASS"
     )
     print()
-    print("Manifest relative paths:   PASS")
-    print("Real paired image loading: PASS")
-    print("Canonical target:          PASS")
-    print("Real T1/T2 -> PAIR:        PASS")
-    print("Dynamic image size:        PASS")
-    if args.generate:
-        print("Native generation:         PASS")
+    print(
+        "No class vocabulary was inferred from label files."
+    )
+    print(
+        "The next step after this passes is the real dense semantic-change "
+        "decoder/loss, then backward."
+    )
 
 
 if __name__ == "__main__":

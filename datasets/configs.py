@@ -11,15 +11,15 @@ SECOND_SPEC = DatasetSpec(
     task_mode="2d",
     label_mode="semantic_pair",
 
-    class_names=[
-        "unchanged",   # 0
-        "water",   # 1
-        "ground",   # 2
-        "low vegetation",   # 3
-        "tree",   # 4
-        "building",   # 5
-        "sports field"   # 6
-    ],
+    class_names={
+        0: "unchanged",
+        1: "water",
+        2: "ground",
+        3: "low vegetation",
+        4: "tree",
+        5: "building",
+        6: "sports field",
+    },
 
     image_size=512,
     ignore_value=None,
@@ -29,13 +29,13 @@ LANDSATSCD_SPEC = DatasetSpec(
     name="LandsatSCD",
     task_mode="2d",
     label_mode="semantic_pair",
-    class_names=[
-        "unchanged",   # 0
-        "farmland",   # 1
-        "desert",   # 2
-        "building",   # 3
-        "water"   # 4
-    ],
+    class_names={
+        0: "unchanged",
+        1: "farmland",
+        2: "desert",
+        3: "building",
+        4: "water",
+    }
 
     image_size=512,
     ignore_value=None,
