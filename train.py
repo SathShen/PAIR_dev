@@ -162,14 +162,14 @@ def make_writer(output_dir, is_main):
 # =============================================================================
 
 def load_spec(name):
-    module = importlib.import_module("dataset.config")
+    module = importlib.import_module("datasets.configs")
     if not hasattr(module, name):
         available = [k for k, v in vars(module).items() if isinstance(v, DatasetSpec)]
-        raise AttributeError(f"dataset.config.{name} not found. Available: {available}")
+        raise AttributeError(f"datasets.configs.{name} not found. Available: {available}")
 
     spec = getattr(module, name)
     if not isinstance(spec, DatasetSpec):
-        raise TypeError(f"dataset.config.{name} is not DatasetSpec")
+        raise TypeError(f"datasets.configs.{name} is not DatasetSpec")
     if not isinstance(spec.class_names, dict) or not spec.class_names:
         raise TypeError(f"{name}.class_names must be a non-empty Dict[int, str]")
     return spec
