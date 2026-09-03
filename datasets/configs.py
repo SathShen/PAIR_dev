@@ -21,8 +21,8 @@ SECOND_SPEC = DatasetSpec(
         "sports field"   # 6
     ],
 
-    image_size=None,
-    ignore_value=255,
+    image_size=512,
+    ignore_value=None,
 )
 
 LANDSATSCD_SPEC = DatasetSpec(
@@ -37,6 +37,6 @@ LANDSATSCD_SPEC = DatasetSpec(
         "water"   # 4
     ],
 
-    image_size=None,
-    ignore_value=255,
+    image_size=512,
+    ignore_value=None,
 )

@@ -73,7 +73,7 @@ class DatasetSpec:
 
     changed_value: int = 1
     unchanged_value: int = 0
-    ignore_value: Optional[int] = 255
+    ignore_value: Optional[int] = None
 
     # Reject misregistered GeoTIFF pairs instead of silently stretching them.
     strict_geo_alignment: bool = True
