@@ -4,14 +4,14 @@
 """
 PAIR unified training framework.
 
-Current physical batch is 1 sample/GPU because the Qwen/PAIR forward is ragged.
---batch-size means GLOBAL EFFECTIVE BATCH SIZE. Gradient accumulation is derived:
+PAIR 2D training uses true vectorized physical batching inside each GPU.
 
-    grad_accum = batch_size / (world_size * micro_batch_size)
+Batch control is explicit:
+    --per-gpu-batch-size   physical samples processed by each GPU per forward
+    --grad-accum           number of forward/backward micro-steps per optimizer update
 
-Example:
-    1 GPU, --batch-size 8  -> grad_accum 8
-    4 GPU, --batch-size 8  -> grad_accum 2
+Effective global batch is reported as:
+    per_gpu_batch_size * world_size * grad_accum
 
 Training modes:
     --qwen-tuning frozen
@@ -80,9 +80,10 @@ def parse_args():
     p.add_argument("--output-dir", type=Path, default=Path("outputs/pair"))
 
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=8,
-                   help="Global effective batch size; physical per-GPU batch is currently 1")
-    p.add_argument("--micro-batch-size", type=int, default=1)
+    p.add_argument("--per-gpu-batch-size", type=int, default=4,
+                   help="True physical batch size processed by each GPU per forward")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps")
     p.add_argument("--num-workers", type=int, default=4)
 
     p.add_argument("--lr", type=float, default=1e-4, help="Decoder/adapter LR")
@@ -189,33 +190,33 @@ def tensor_to_pil(image):
     return Image.fromarray(arr)
 
 
-def collate_one(batch):
-    if len(batch) != 1:
-        raise RuntimeError("PAIR currently requires physical batch_size=1 per GPU")
-    return batch[0]
+def collate_batch(batch):
+    if not batch:
+        raise RuntimeError("Empty batch")
+    return list(batch)
 
 
-def make_train_loader(dataset, runtime, num_workers):
+def make_train_loader(dataset, runtime, num_workers, per_gpu_batch_size):
     sampler = DistributedSampler(
         dataset, num_replicas=runtime["world_size"], rank=runtime["rank"],
         shuffle=True, seed=0, drop_last=False,
     )
     loader = DataLoader(
-        dataset, batch_size=1, sampler=sampler, num_workers=num_workers,
-        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_one,
+        dataset, batch_size=per_gpu_batch_size, sampler=sampler, num_workers=num_workers,
+        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_batch,
     )
     return loader, sampler
 
 
-def make_val_loader(dataset, runtime, num_workers):
+def make_val_loader(dataset, runtime, num_workers, per_gpu_batch_size):
     sampler = DistributedSampler(
         dataset, num_replicas=runtime["world_size"], rank=runtime["rank"],
         shuffle=False, drop_last=False,
     ) if runtime["distributed"] else None
 
     loader = DataLoader(
-        dataset, batch_size=1, sampler=sampler, shuffle=False, num_workers=num_workers,
-        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_one,
+        dataset, batch_size=per_gpu_batch_size, sampler=sampler, shuffle=False, num_workers=num_workers,
+        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_batch,
     )
     return loader
 
@@ -238,47 +239,118 @@ def make_grid_positions(shape, device):
         raise RuntimeError("Missing image token shape")
     t, h, w = shape
     if t != 1:
-        raise NotImplementedError(f"Current image adapter expects T=1, got {shape}")
+        raise NotImplementedError(f"Current 2D training expects T=1, got {shape}")
     ys = torch.linspace(-1, 1, h, device=device)
     xs = torch.linspace(-1, 1, w, device=device)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     return torch.stack((xx.reshape(-1), yy.reshape(-1), torch.zeros(h * w, device=device)), 1)
 
 
-def make_image_token_set(features, positions):
+def make_batched_image_token_set(features, shapes, batch_ids):
+    if features is None or batch_ids is None:
+        raise RuntimeError("Missing batched image features/batch IDs")
+
+    positions = []
+    expected_ids = []
+    for b, shape in enumerate(shapes):
+        pos = make_grid_positions(shape, features.device)
+        positions.append(pos)
+        expected_ids.append(torch.full(
+            (pos.shape[0],), b, dtype=torch.long, device=features.device
+        ))
+
+    positions = torch.cat(positions, 0)
+    expected_ids = torch.cat(expected_ids, 0)
+    batch_ids = batch_ids.to(features.device).long()
+
+    if features.shape[0] != positions.shape[0]:
+        raise RuntimeError(
+            f"Feature/position count mismatch: {features.shape[0]} vs {positions.shape[0]}"
+        )
+    if not torch.equal(batch_ids, expected_ids):
+        raise RuntimeError("PAIR image token order/batch IDs do not match expected sample-major layout")
+
     n = features.shape[0]
-    if positions.shape[0] != n:
-        raise ValueError(f"Feature/position count mismatch: {n} vs {positions.shape[0]}")
     return UnifiedTokenSet(
         features=features, positions=positions,
         modality_ids=torch.zeros(n, dtype=torch.long, device=features.device),
-        batch_ids=torch.zeros(n, dtype=torch.long, device=features.device),
+        batch_ids=batch_ids,
     )
 
 
-def restore_2d_prediction(prediction, shape_t1, shape_t2, output_size):
-    def semantic(logits, shape):
-        t, h, w = shape
+def restore_2d_prediction_batch(prediction, shapes_t1, shapes_t2, output_sizes):
+    def restore_semantic(logits, shapes):
+        chunks, cursor = [], 0
         k = logits.shape[1]
-        if t != 1 or logits.shape[0] != h * w:
-            raise ValueError(f"Cannot restore semantic {tuple(logits.shape)} from grid {shape}")
-        x = logits.T.reshape(1, k, h, w)
-        x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
-        return x[0].permute(1, 2, 0).reshape(-1, k)
+        for shape, output_size in zip(shapes, output_sizes):
+            t, h, w = shape
+            n = t * h * w
+            if t != 1:
+                raise RuntimeError(f"Expected T=1, got {shape}")
+            part = logits[cursor:cursor+n]
+            if part.shape[0] != n:
+                raise RuntimeError("Semantic token split mismatch")
+            x = part.T.reshape(1, k, h, w)
+            x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+            chunks.append(x[0].permute(1, 2, 0).reshape(-1, k))
+            cursor += n
+        if cursor != logits.shape[0]:
+            raise RuntimeError("Unconsumed semantic logits after batch topology restore")
+        return torch.cat(chunks, 0)
 
-    def change(logits, shape):
-        t, h, w = shape
-        if t != 1 or logits.numel() != h * w:
-            raise ValueError(f"Cannot restore change {tuple(logits.shape)} from grid {shape}")
-        x = F.interpolate(logits.reshape(1, 1, h, w), size=output_size,
-                          mode="bilinear", align_corners=False)
-        return x[0, 0].reshape(-1)
+    def restore_change(logits, shapes):
+        chunks, cursor = [], 0
+        for shape, output_size in zip(shapes, output_sizes):
+            t, h, w = shape
+            n = t * h * w
+            if t != 1:
+                raise RuntimeError(f"Expected T=1, got {shape}")
+            part = logits[cursor:cursor+n]
+            if part.numel() != n:
+                raise RuntimeError("Change token split mismatch")
+            x = F.interpolate(
+                part.reshape(1, 1, h, w), size=output_size,
+                mode="bilinear", align_corners=False
+            )
+            chunks.append(x[0, 0].reshape(-1))
+            cursor += n
+        if cursor != logits.numel():
+            raise RuntimeError("Unconsumed change logits after batch topology restore")
+        return torch.cat(chunks, 0)
 
-    prediction.semantic_logits_t1 = semantic(prediction.semantic_logits_t1, shape_t1)
-    prediction.semantic_logits_t2 = semantic(prediction.semantic_logits_t2, shape_t2)
-    prediction.change_logits_t1 = change(prediction.change_logits_t1, shape_t1)
-    prediction.change_logits_t2 = change(prediction.change_logits_t2, shape_t2)
+    prediction.semantic_logits_t1 = restore_semantic(
+        prediction.semantic_logits_t1, shapes_t1
+    )
+    prediction.semantic_logits_t2 = restore_semantic(
+        prediction.semantic_logits_t2, shapes_t2
+    )
+    prediction.change_logits_t1 = restore_change(
+        prediction.change_logits_t1, shapes_t1
+    )
+    prediction.change_logits_t2 = restore_change(
+        prediction.change_logits_t2, shapes_t2
+    )
     return prediction
+
+
+def merge_targets(samples):
+    keys = (
+        "change", "semantic_t1", "semantic_t2",
+        "change_valid", "semantic_valid_t1", "semantic_valid_t2",
+    )
+    merged = {}
+    for key in keys:
+        merged[key] = torch.cat([
+            sample["target"][key].reshape(-1) for sample in samples
+        ], 0)
+
+    # Optional topology-specific change targets for future 3D.
+    for key in ("change_t1", "change_t2", "change_valid_t1", "change_valid_t2"):
+        if all(key in sample["target"] for sample in samples):
+            merged[key] = torch.cat([
+                sample["target"][key].reshape(-1) for sample in samples
+            ], 0)
+    return merged
 
 
 # =============================================================================
@@ -300,16 +372,19 @@ class PAIRTrainModel(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         if mode:
-            # Vision is frozen in frozen/LoRA modes. Keep it deterministic.
             if self.qwen_tuning in ("frozen", "lora"):
-                self.pair.qwen_backbone.model.visual.eval()
+                self.pair.visual_module().eval()
             if self.qwen_tuning == "frozen":
                 self.pair.qwen_backbone.model.eval()
         return self
 
-    def forward_2d(self, image_t1, image_t2, prompt, class_names, output_size):
+    def forward_2d(self, images_t1, images_t2, prompts, class_names, output_sizes):
+        if not (len(images_t1) == len(images_t2) == len(prompts) == len(output_sizes)):
+            raise ValueError("Batched 2D inputs have inconsistent lengths")
+
         kwargs = dict(
-            task_mode="2d", prompt=prompt, images_t1=image_t1, images_t2=image_t2,
+            task_mode="2d", prompt=prompts,
+            images_t1=images_t1, images_t2=images_t2,
             return_logits=False, return_hidden_states=True,
             return_dense_features=True, use_cache=False,
         )
@@ -325,30 +400,63 @@ class PAIRTrainModel(nn.Module):
         if out.image_hidden_t1 is None or out.image_hidden_t2 is None or out.task_hidden is None:
             raise RuntimeError("PAIR did not expose LLM reasoning features")
 
-        shape1, shape2 = out.aux["image_token_shape_t1"], out.aux["image_token_shape_t2"]
+        shapes1 = out.aux["image_token_shapes_t1"]
+        shapes2 = out.aux["image_token_shapes_t2"]
+        if len(shapes1) != len(prompts) or len(shapes2) != len(prompts):
+            raise RuntimeError("PAIR returned incorrect number of image token grids")
+
+        for b, (s1, s2) in enumerate(zip(shapes1, shapes2)):
+            if s1 != s2:
+                raise RuntimeError(
+                    f"Current aligned 2D temporal links require identical T1/T2 grids; "
+                    f"batch {b}: {s1} vs {s2}"
+                )
+
         dense1 = self.image_adapter(out.image_dense_t1)
         dense2 = self.image_adapter(out.image_dense_t2)
-        pos1, pos2 = make_grid_positions(shape1, dense1.device), make_grid_positions(shape2, dense2.device)
+
+        dense_t1 = make_batched_image_token_set(
+            dense1, shapes1, out.aux["image_dense_batch_ids_t1"]
+        )
+        dense_t2 = make_batched_image_token_set(
+            dense2, shapes2, out.aux["image_dense_batch_ids_t2"]
+        )
+        reasoning_t1 = make_batched_image_token_set(
+            out.image_hidden_t1, shapes1, out.aux["image_reasoning_batch_ids_t1"]
+        )
+        reasoning_t2 = make_batched_image_token_set(
+            out.image_hidden_t2, shapes2, out.aux["image_reasoning_batch_ids_t2"]
+        )
+
+        # Because both streams are concatenated sample-major and each pair has
+        # the same grid, global identity indices stay within each sample.
+        if dense1.shape[0] != dense2.shape[0]:
+            raise RuntimeError("Aligned 2D batch has different total T1/T2 token counts")
 
         prediction = self.decoder(
-            dense_t1=make_image_token_set(dense1, pos1),
-            dense_t2=make_image_token_set(dense2, pos2),
-            reasoning_t1=make_image_token_set(out.image_hidden_t1, pos1),
-            reasoning_t2=make_image_token_set(out.image_hidden_t2, pos2),
+            dense_t1=dense_t1, dense_t2=dense_t2,
+            reasoning_t1=reasoning_t1, reasoning_t2=reasoning_t2,
             task_hidden=out.task_hidden,
-            links_t1_to_t2=build_identity_temporal_links(dense1.shape[0], device=dense1.device),
-            links_t2_to_t1=build_identity_temporal_links(dense2.shape[0], device=dense2.device),
-            class_names=class_names, qwen_backbone=self.pair.qwen_backbone,
-            # Keep class-language encoding detached; projection remains trainable.
+            links_t1_to_t2=build_identity_temporal_links(
+                dense1.shape[0], device=dense1.device
+            ),
+            links_t2_to_t1=build_identity_temporal_links(
+                dense2.shape[0], device=dense2.device
+            ),
+            class_names=class_names,
+            qwen_backbone=self.pair.qwen_backbone,
             detach_qwen_class_encoder=True,
         )
-        return restore_2d_prediction(prediction, shape1, shape2, output_size)
+        return restore_2d_prediction_batch(
+            prediction, shapes1, shapes2, output_sizes
+        )
 
     def forward(self, task_mode, **kwargs):
         if task_mode == "2d":
             return self.forward_2d(**kwargs)
         raise NotImplementedError(
-            f"Training adapter for {task_mode!r} is not connected yet; decoder core is unified."
+            f"Training adapter for {task_mode!r} is not connected yet. "
+            "The unified decoder itself is batch/ragged aware."
         )
 
 
@@ -476,21 +584,26 @@ def load_checkpoint(path, model, optimizer, scheduler):
 # Forward / validation / logging
 # =============================================================================
 
-def forward_loss(model, criterion, sample, spec):
+def forward_loss(model, criterion, samples, spec):
     if spec.task_mode != "2d":
-        raise NotImplementedError("Current training adapter closes 2D first")
+        raise NotImplementedError("Current training adapter closes batched 2D first")
 
-    target = sample["target"]
-    output_size = tuple(target["change"].shape[-2:])
+    images_t1 = [tensor_to_pil(s["images_t1"]) for s in samples]
+    images_t2 = [tensor_to_pil(s["images_t2"]) for s in samples]
+    prompts = [s["prompt"] for s in samples]
+    output_sizes = [tuple(s["target"]["change"].shape[-2:]) for s in samples]
+
     prediction = model(
         task_mode="2d",
-        image_t1=tensor_to_pil(sample["images_t1"]),
-        image_t2=tensor_to_pil(sample["images_t2"]),
-        prompt=sample["prompt"], class_names=spec.class_names,
-        output_size=output_size,
+        images_t1=images_t1, images_t2=images_t2,
+        prompts=prompts, class_names=spec.class_names,
+        output_sizes=output_sizes,
     )
-    loss_output = criterion(prediction=prediction, target=target, class_names=spec.class_names)
-    return prediction, loss_output
+    target = merge_targets(samples)
+    loss_output = criterion(
+        prediction=prediction, target=target, class_names=spec.class_names
+    )
+    return prediction, loss_output, target
 
 
 def all_reduce_loss_sums(sums, count, device):
@@ -512,14 +625,15 @@ def validate(model, criterion, loader, spec, runtime, args):
     sums, count = {}, 0
     start = time.time()
 
-    for sample in loader:
+    for samples in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            prediction, loss_output = forward_loss(model, criterion, sample, spec)
+            prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec)
 
-        evaluator.update(prediction, sample["target"])
+        evaluator.update(prediction, merged_target)
+        batch_n = len(samples)
         for key, value in loss_output.as_dict().items():
-            sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-        count += 1
+            sums[key] = sums.get(key, 0.0) + float(value.detach().cpu()) * batch_n
+        count += batch_n
 
         if args.val_max_samples > 0 and count >= args.val_max_samples:
             break
@@ -592,8 +706,8 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.micro_batch_size != 1:
-        raise ValueError("PAIR currently supports --micro-batch-size 1 only")
+    if args.grad_accum < 1:
+        raise ValueError("--grad-accum must be >= 1")
 
     runtime = setup_distributed()
     writer = None
@@ -607,16 +721,16 @@ def main():
         val_path = root / "manifests" / f"{args.val_split}.jsonl"
         val_ds = UnifiedPAIRDataset(val_path, spec) if val_path.exists() else None
 
-        train_loader, train_sampler = make_train_loader(train_ds, runtime, args.num_workers)
-        val_loader = make_val_loader(val_ds, runtime, args.num_workers) if val_ds is not None else None
+        train_loader, train_sampler = make_train_loader(
+            train_ds, runtime, args.num_workers, args.per_gpu_batch_size
+        )
+        val_loader = make_val_loader(
+            val_ds, runtime, args.num_workers, args.per_gpu_batch_size
+        ) if val_ds is not None else None
 
-        physical_global = runtime["world_size"] * args.micro_batch_size
-        if args.batch_size < physical_global or args.batch_size % physical_global != 0:
-            raise ValueError(
-                f"--batch-size {args.batch_size} must be divisible by world_size*micro_batch "
-                f"({runtime['world_size']}*{args.micro_batch_size}={physical_global})"
-            )
-        grad_accum = args.batch_size // physical_global
+        grad_accum = args.grad_accum
+        physical_global = runtime["world_size"] * args.per_gpu_batch_size
+        effective_global = physical_global * grad_accum
 
         model = build_model(args, runtime)
         if runtime["distributed"]:
@@ -665,9 +779,9 @@ def main():
             print("LoRA trainable:", f"{lora_trainable / 1e6:.2f} M")
             print("Total trainable:", f"{total_trainable / 1e6:.2f} M")
             print("GPUs:", runtime["world_size"])
-            print("Physical batch/GPU:", args.micro_batch_size)
+            print("Per-GPU batch size:", args.per_gpu_batch_size)
             print("Gradient accumulation:", grad_accum)
-            print("Effective global batch:", args.batch_size)
+            print("Effective global batch:", effective_global)
             print("Updates/epoch:", updates_per_epoch)
             print("Total optimizer updates:", total_updates)
             print("TensorBoard:", args.output_dir / "tensorboard")
@@ -681,10 +795,10 @@ def main():
             train_sampler.set_epoch(epoch)
             optimizer.zero_grad(set_to_none=True)
             accum_count = 0
-            window, window_count = {}, 0
+            window, window_count, window_samples = {}, 0, 0
             window_start = time.time()
 
-            for batch_idx, sample in enumerate(train_loader):
+            for batch_idx, samples in enumerate(train_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
                     continue
 
@@ -698,13 +812,14 @@ def main():
 
                 with sync_context:
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        _, loss_output = forward_loss(model, criterion, sample, spec)
+                        _, loss_output, _ = forward_loss(model, criterion, samples, spec)
                         loss = loss_output.total / grad_accum
                     loss.backward()
 
                 for key, value in loss_output.as_dict().items():
                     window[key] = window.get(key, 0.0) + float(value.detach().cpu())
                 window_count += 1
+                window_samples += len(samples)
 
                 if not update_now:
                     continue
@@ -734,7 +849,7 @@ def main():
                     log = {
                         **means, "epoch": epoch + 1, "optimizer_step": optimizer_step,
                         "grad_norm": grad_norm,
-                        "samples_per_sec": window_count * physical_global / max(elapsed, 1e-6),
+                        "samples_per_sec": window_samples * runtime["world_size"] / max(elapsed, 1e-6),
                         "gpu_alloc_GiB": torch.cuda.memory_allocated() / 1024**3,
                         "gpu_reserved_GiB": torch.cuda.memory_reserved() / 1024**3,
                         "lr_pair": lrs.get("pair", 0.0), "lr_lora": lrs.get("lora", 0.0),
@@ -752,7 +867,7 @@ def main():
                         write_jsonl(train_json, log)
                         log_tensorboard_train(writer, log, optimizer_step)
 
-                    window, window_count = {}, 0
+                    window, window_count, window_samples = {}, 0, 0
                     window_start = time.time()
 
             start_batch = 0

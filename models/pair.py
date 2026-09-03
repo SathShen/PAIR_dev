@@ -1,18 +1,12 @@
 """
 PAIR: Prompt-Aware Image-Point Reasoning.
 
-Shared temporal backbone for 2d / 3d / 2d3d.
+Batch-aware temporal backbone for 2d / 3d / 2d3d.
 
-PAIR exposes two kinds of features for the unified decoder:
-1) dense perception features before LLM reasoning
-   - image_dense_t*: Qwen vision merged embeddings
-   - point_dense_t*: PTv3 per-point features
-2) contextual reasoning features after LLM
-   - image_hidden_t*
-   - point_hidden_t*
-   - task_hidden
+True vectorized batching is enabled for the 2D Qwen path. Dense and reasoning
+tokens are returned as flat ragged token sets with matching batch IDs in aux.
 
-Current limitation: batch size = 1.
+Single-sample behavior remains backward compatible.
 """
 
 from __future__ import annotations
@@ -55,10 +49,6 @@ class PAIRModel(nn.Module):
         self.point_encoder = point_encoder
         self.point_adapter = point_adapter
 
-    # ------------------------------------------------------------------
-    # Task routing
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _normalize_task_mode(task_mode: str) -> str:
         aliases = {
@@ -78,14 +68,37 @@ class PAIRModel(nn.Module):
                          point_dict_t1, point_dict_t2):
         if task_mode in ("2d", "2d3d") and (images_t1 is None or images_t2 is None):
             raise ValueError(f"task_mode={task_mode!r} requires images_t1 and images_t2")
-
         if task_mode in ("3d", "2d3d"):
             if point_dict_t1 is None or point_dict_t2 is None:
                 raise ValueError(f"task_mode={task_mode!r} requires point_dict_t1 and point_dict_t2")
-            if self.point_encoder is None:
-                raise RuntimeError("3D input requested but point_encoder is not configured")
-            if self.point_adapter is None:
-                raise RuntimeError("3D input requested but point_adapter is not configured")
+            if self.point_encoder is None or self.point_adapter is None:
+                raise RuntimeError("3D input requested but point encoder/adapter is not configured")
+
+    # ------------------------------------------------------------------
+    # Qwen module resolution (works before and after PEFT wrapping)
+    # ------------------------------------------------------------------
+
+    def _find_submodule(self, name: str):
+        queue = [self.qwen_backbone.model]
+        seen = set()
+        while queue:
+            module = queue.pop(0)
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+            if hasattr(module, name):
+                return getattr(module, name)
+            for attr in ("base_model", "model"):
+                child = getattr(module, attr, None)
+                if child is not None and child is not module:
+                    queue.append(child)
+        raise AttributeError(f"Could not resolve Qwen submodule {name!r}")
+
+    def visual_module(self):
+        return self._find_submodule("visual")
+
+    def language_model_module(self):
+        return self._find_submodule("language_model")
 
     # ------------------------------------------------------------------
     # Shared 3D branch
@@ -94,7 +107,6 @@ class PAIRModel(nn.Module):
     def encode_points(self, point_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         point_encoded = self.point_encoder(point_dict)
         adapter_out = self.point_adapter.forward_with_metadata(point_encoded)
-
         return {
             "point_encoded": point_encoded,
             "point_adapter_output": adapter_out,
@@ -110,72 +122,69 @@ class PAIRModel(nn.Module):
         return point_encoded.features, point_encoded.coord, point_encoded.batch
 
     # ------------------------------------------------------------------
-    # Point-token helpers
+    # Point injection
     # ------------------------------------------------------------------
 
-    def _normalize_single_point_tokens(self, point_tokens):
-        if point_tokens is None:
-            return None
-        if not torch.is_tensor(point_tokens):
-            raise TypeError("point_tokens must be a torch.Tensor")
-        if point_tokens.ndim == 3:
-            if point_tokens.shape[0] != 1:
-                raise NotImplementedError("PAIR V1 supports batch size 1")
-            point_tokens = point_tokens[0]
-        if point_tokens.ndim != 2:
-            raise ValueError(f"point_tokens must be [N,D] or [1,N,D], got {tuple(point_tokens.shape)}")
-        if point_tokens.shape[-1] != self.qwen_backbone.hidden_size:
-            raise ValueError(
-                f"Point token dim must equal Qwen hidden size "
-                f"{self.qwen_backbone.hidden_size}, got {point_tokens.shape[-1]}"
-            )
-        return point_tokens
+    def _point_batch(self, point_tokens, batch_size):
+        return self.qwen_backbone._point_token_batch(
+            point_tokens, batch_size, "point_tokens"
+        )
 
-    def _concat_point_tokens(self, point_tokens_t1, point_tokens_t2):
-        pieces = [
-            x for x in (
-                self._normalize_single_point_tokens(point_tokens_t1),
-                self._normalize_single_point_tokens(point_tokens_t2),
-            ) if x is not None
-        ]
-        return None if not pieces else torch.cat(pieces, dim=0).unsqueeze(0)
+    def _concat_point_tokens(self, t1, t2, batch_size):
+        a = self._point_batch(t1, batch_size)
+        b = self._point_batch(t2, batch_size)
+        out = []
+        for x, y in zip(a, b):
+            parts = [z for z in (x, y) if z is not None]
+            out.append(None if not parts else torch.cat(parts, dim=0))
+        return out
 
-    def _validate_point_layout(self, point_tokens, point_mask):
-        expected = point_tokens.shape[1]
-        actual = int(point_mask.sum().item())
-        if expected != actual:
-            raise RuntimeError(
-                f"Prepared {expected} point tokens but prompt contains {actual} <POINT> placeholders"
-            )
+    @staticmethod
+    def _validate_point_layout(point_tokens, point_mask):
+        if len(point_tokens) != point_mask.shape[0]:
+            raise RuntimeError("Point token batch size does not match point mask")
+        for b, tokens in enumerate(point_tokens):
+            expected = 0 if tokens is None else int(tokens.shape[0])
+            actual = int(point_mask[b].sum().item())
+            if expected != actual:
+                raise RuntimeError(
+                    f"Batch {b}: prepared {expected} point tokens but prompt has {actual}"
+                )
 
     def _make_point_injection_hook(self, *, point_tokens, point_mask,
                                    full_seq_len, stats):
         self._validate_point_layout(point_tokens, point_mask)
         hidden_size = self.qwen_backbone.hidden_size
+        batch_size = len(point_tokens)
 
         def hook(module, args, output):
             stats["calls"] += 1
-            if (torch.is_tensor(output) and output.ndim == 3 and
-                    output.shape == (1, full_seq_len, hidden_size)):
-                out = output.clone()
-                mask = point_mask[0].to(out.device)
-                out[0, mask] = point_tokens[0].to(out.device, out.dtype)
-                stats["replaced"] = True
-                return out
-            return output
+            if not (torch.is_tensor(output) and output.ndim == 3):
+                return output
+            if output.shape != (batch_size, full_seq_len, hidden_size):
+                return output
+
+            out = output.clone()
+            replaced = False
+            for b, tokens in enumerate(point_tokens):
+                if tokens is None:
+                    continue
+                mask = point_mask[b].to(out.device)
+                out[b, mask] = tokens.to(device=out.device, dtype=out.dtype)
+                replaced = True
+            stats["replaced"] = replaced
+            return out
 
         return hook
 
     # ------------------------------------------------------------------
-    # Qwen capture hooks
+    # Capture hooks
     # ------------------------------------------------------------------
 
     @staticmethod
     def _make_visual_capture_hook(store):
         def hook(module, args, output):
-            # Qwen3VL vision returns:
-            #   (merged_image_embeddings, deepstack_visual_features)
-            if isinstance(output, (tuple, list)) and len(output) > 0:
+            if isinstance(output, (tuple, list)) and output:
                 store["dense"] = output[0]
             elif torch.is_tensor(output):
                 store["dense"] = output
@@ -185,7 +194,7 @@ class PAIRModel(nn.Module):
     def _make_language_capture_hook(store):
         def hook(module, args, output):
             hidden = getattr(output, "last_hidden_state", None)
-            if hidden is None and isinstance(output, (tuple, list)) and len(output) > 0:
+            if hidden is None and isinstance(output, (tuple, list)) and output:
                 hidden = output[0]
             if hidden is not None:
                 store["last_hidden"] = hidden
@@ -198,75 +207,124 @@ class PAIRModel(nn.Module):
     def _image_token_shape(self, inputs, grid_index):
         if grid_index is None or "image_grid_thw" not in inputs:
             return None
-
         grid = inputs["image_grid_thw"][grid_index]
-        t, h_patch, w_patch = [int(x.item()) for x in grid]
+        t, hp, wp = [int(x.item()) for x in grid]
         merge = int(self.qwen_backbone.vision_spatial_merge_size)
-
-        if h_patch % merge != 0 or w_patch % merge != 0:
+        if hp % merge or wp % merge:
             raise RuntimeError("Qwen image grid is not divisible by spatial_merge_size")
+        return t, hp // merge, wp // merge
 
-        return t, h_patch // merge, w_patch // merge
+    def _image_token_shapes(self, inputs, indices):
+        return [self._image_token_shape(inputs, idx) for idx in indices]
 
-    def _reshape_image_tokens(self, tokens, inputs, grid_index):
-        if tokens is None:
-            return None
-        shape = self._image_token_shape(inputs, grid_index)
-        if shape is None:
-            return None
+    @staticmethod
+    def _split_visual_dense(vision_dense, prepared):
+        if vision_dense is None:
+            return None, None, None, None
 
-        t, h, w = shape
-        expected = t * h * w
-        if tokens.shape[0] != expected:
+        records = prepared["image_records"]
+        counts = prepared["image_counts_in_order"]
+        batch_size = prepared["batch_size"]
+        t1_parts, t2_parts = [[] for _ in range(batch_size)], [[] for _ in range(batch_size)]
+        cursor = 0
+
+        for (b, label), count in zip(records, counts):
+            part = vision_dense[cursor:cursor + count]
+            if part.shape[0] != count:
+                raise RuntimeError("Vision dense token accounting mismatch")
+            (t1_parts if label == "t1" else t2_parts)[b].append(part)
+            cursor += count
+
+        if cursor != vision_dense.shape[0]:
             raise RuntimeError(
-                f"Image token count {tokens.shape[0]} does not match grid {shape} ({expected})"
+                f"Vision dense count {vision_dense.shape[0]} != consumed {cursor}"
+            )
+
+        def flatten(parts):
+            features, ids = [], []
+            for b, chunks in enumerate(parts):
+                if not chunks:
+                    continue
+                x = torch.cat(chunks, dim=0)
+                features.append(x)
+                ids.append(torch.full(
+                    (x.shape[0],), b, dtype=torch.long, device=x.device
+                ))
+            if not features:
+                return None, None
+            return torch.cat(features, dim=0), torch.cat(ids, dim=0)
+
+        f1, b1 = flatten(t1_parts)
+        f2, b2 = flatten(t2_parts)
+        return f1, f2, b1, b2
+
+    @staticmethod
+    def _reshape_single(tokens, shape):
+        if tokens is None or shape is None:
+            return None
+        t, h, w = shape
+        if tokens.shape[0] != t * h * w:
+            raise RuntimeError(
+                f"Image token count {tokens.shape[0]} does not match grid {shape}"
             )
         return tokens.reshape(t, h, w, tokens.shape[-1])
 
-    @staticmethod
-    def _split_image_dense(vision_dense, prepared):
-        if vision_dense is None:
-            return None, None
-
-        n1 = int(prepared["image_count_t1"])
-        n2 = int(prepared["image_count_t2"])
-        if vision_dense.shape[0] != n1 + n2:
-            raise RuntimeError(
-                f"Vision dense count {vision_dense.shape[0]} != expected {n1+n2}"
-            )
-
-        cursor = 0
-        t1 = vision_dense[cursor:cursor + n1] if n1 else None
-        cursor += n1
-        t2 = vision_dense[cursor:cursor + n2] if n2 else None
-        return t1, t2
+    def _split_by_batch(self, tokens, batch_ids, shapes):
+        if tokens is None:
+            return [None] * len(shapes)
+        return [
+            self._reshape_single(tokens[batch_ids == b], shape)
+            for b, shape in enumerate(shapes)
+        ]
 
     # ------------------------------------------------------------------
-    # Contextual hidden extraction
+    # Hidden extraction
     # ------------------------------------------------------------------
 
     def _extract_multimodal_hidden(self, *, last_hidden, prepared, inputs):
         device = last_hidden.device
+        bsz = prepared["batch_size"]
 
-        def mask(name):
-            return prepared[name].to(device)
+        image_mask_t1 = prepared["image_mask_t1"].to(device)
+        image_mask_t2 = prepared["image_mask_t2"].to(device)
+        point_mask_t1 = prepared["point_mask_t1"].to(device)
+        point_mask_t2 = prepared["point_mask_t2"].to(device)
+        task_mask = prepared["task_mask"].to(device)
 
-        image_mask_t1, image_mask_t2 = mask("image_mask_t1"), mask("image_mask_t2")
-        point_mask_t1, point_mask_t2 = mask("point_mask_t1"), mask("point_mask_t2")
-        task_mask = mask("task_mask")
+        def flatten(mask):
+            parts, batch_ids = [], []
+            for b in range(bsz):
+                selected = last_hidden[b][mask[b]]
+                if selected.numel() == 0:
+                    continue
+                parts.append(selected)
+                batch_ids.append(torch.full(
+                    (selected.shape[0],), b, dtype=torch.long, device=device
+                ))
+            if not parts:
+                return None, None
+            return torch.cat(parts, 0), torch.cat(batch_ids, 0)
 
-        if int(task_mask.sum().item()) != 1:
-            raise RuntimeError("PAIR expects exactly one <TASK> token")
+        image_hidden_t1, image_batch_t1 = flatten(image_mask_t1)
+        image_hidden_t2, image_batch_t2 = flatten(image_mask_t2)
+        point_hidden_t1, point_batch_t1 = flatten(point_mask_t1)
+        point_hidden_t2, point_batch_t2 = flatten(point_mask_t2)
 
-        def select(m):
-            return last_hidden[0][m[0]] if int(m.sum().item()) > 0 else None
+        task_parts = []
+        for b in range(bsz):
+            x = last_hidden[b][task_mask[b]]
+            if x.shape[0] != 1:
+                raise RuntimeError(
+                    f"Batch {b}: expected one task hidden, got {x.shape[0]}"
+                )
+            task_parts.append(x[0])
+        task_hidden = torch.stack(task_parts, 0)
 
-        image_hidden_t1 = select(image_mask_t1)
-        image_hidden_t2 = select(image_mask_t2)
-        point_hidden_t1 = select(point_mask_t1)
-        point_hidden_t2 = select(point_mask_t2)
-        task_hidden = last_hidden[0][task_mask[0]].reshape(
-            1, self.qwen_backbone.hidden_size
+        shapes1 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t1"]
+        )
+        shapes2 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t2"]
         )
 
         return {
@@ -275,18 +333,17 @@ class PAIRModel(nn.Module):
             "point_hidden_t1": point_hidden_t1,
             "point_hidden_t2": point_hidden_t2,
             "task_hidden": task_hidden,
-            # Backward-compatible contextual 2D views.
-            "image_hidden_2d_t1": self._reshape_image_tokens(
-                image_hidden_t1, inputs, prepared["image_grid_index_t1"]
+            "image_batch_ids_t1": image_batch_t1,
+            "image_batch_ids_t2": image_batch_t2,
+            "point_reasoning_batch_ids_t1": point_batch_t1,
+            "point_reasoning_batch_ids_t2": point_batch_t2,
+            "image_hidden_2d_t1_list": self._split_by_batch(
+                image_hidden_t1, image_batch_t1, shapes1
             ),
-            "image_hidden_2d_t2": self._reshape_image_tokens(
-                image_hidden_t2, inputs, prepared["image_grid_index_t2"]
+            "image_hidden_2d_t2_list": self._split_by_batch(
+                image_hidden_t2, image_batch_t2, shapes2
             ),
         }
-
-    # ------------------------------------------------------------------
-    # Qwen preparation
-    # ------------------------------------------------------------------
 
     def _prepare_qwen(self, *, prompt, images_t1, images_t2,
                       point_tokens_t1, point_tokens_t2):
@@ -294,27 +351,27 @@ class PAIRModel(nn.Module):
             prompt=prompt, images_t1=images_t1, images_t2=images_t2,
             point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
         )
-
         device = self.qwen_backbone.model_device
         inputs = {
-            key: value.to(device) if torch.is_tensor(value) else value
-            for key, value in prepared["inputs"].items()
+            k: v.to(device) if torch.is_tensor(v) else v
+            for k, v in prepared["inputs"].items()
         }
-
-        point_tokens = self._concat_point_tokens(point_tokens_t1, point_tokens_t2)
+        point_tokens = self._concat_point_tokens(
+            point_tokens_t1, point_tokens_t2, prepared["batch_size"]
+        )
         return {**prepared, "inputs": inputs, "point_tokens": point_tokens}
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, *, task_mode: str, prompt: str,
+    def forward(self, *, task_mode: str, prompt,
                 images_t1=None, images_t2=None,
                 point_dict_t1=None, point_dict_t2=None,
                 return_logits: bool = True,
                 return_hidden_states: bool = True,
                 return_dense_features: bool = True,
-                use_cache: bool = False, **qwen_kwargs) -> PAIROutput:
+                use_cache: bool = False, **qwen_kwargs):
 
         task_mode = self._normalize_task_mode(task_mode)
         self._validate_inputs(
@@ -342,33 +399,31 @@ class PAIRModel(nn.Module):
 
         inputs = prepared["inputs"]
         point_tokens = prepared["point_tokens"]
-        injection_stats = {"calls": 0, "replaced": False}
+        stats = {"calls": 0, "replaced": False}
+        visual_capture, language_capture, handles = {}, {}, []
 
-        handles = []
-        visual_capture, language_capture = {}, {}
-
-        if point_tokens is not None:
+        if any(x is not None for x in point_tokens):
             handles.append(
                 self.qwen_backbone.model.get_input_embeddings().register_forward_hook(
                     self._make_point_injection_hook(
                         point_tokens=point_tokens,
                         point_mask=prepared["point_mask"],
                         full_seq_len=inputs["input_ids"].shape[1],
-                        stats=injection_stats,
+                        stats=stats,
                     )
                 )
             )
 
         if return_dense_features and task_mode in ("2d", "2d3d"):
             handles.append(
-                self.qwen_backbone.model.visual.register_forward_hook(
+                self.visual_module().register_forward_hook(
                     self._make_visual_capture_hook(visual_capture)
                 )
             )
 
         if return_hidden_states:
             handles.append(
-                self.qwen_backbone.model.language_model.register_forward_hook(
+                self.language_model_module().register_forward_hook(
                     self._make_language_capture_hook(language_capture)
                 )
             )
@@ -381,52 +436,61 @@ class PAIRModel(nn.Module):
                 **inputs, return_dict=True, use_cache=use_cache, **qwen_kwargs
             )
         finally:
-            for handle in handles:
-                handle.remove()
+            for h in handles:
+                h.remove()
 
-        if point_tokens is not None and not injection_stats["replaced"]:
+        if any(x is not None for x in point_tokens) and not stats["replaced"]:
             raise RuntimeError("Temporal point tokens were prepared but not injected into Qwen")
 
         image_dense_t1 = image_dense_t2 = None
+        image_dense_batch_t1 = image_dense_batch_t2 = None
         if return_dense_features and task_mode in ("2d", "2d3d"):
             if "dense" not in visual_capture:
-                raise RuntimeError("Qwen vision forward ran but pre-LLM image features were not captured")
-            image_dense_t1, image_dense_t2 = self._split_image_dense(
+                raise RuntimeError("Qwen vision forward ran but image dense features were not captured")
+            (image_dense_t1, image_dense_t2,
+             image_dense_batch_t1, image_dense_batch_t2) = self._split_visual_dense(
                 visual_capture["dense"], prepared
             )
 
-        image_hidden_t1 = image_hidden_t2 = None
-        point_hidden_t1 = point_hidden_t2 = None
-        task_hidden = None
-        hidden_extra = {}
-
+        hidden = {}
         if return_hidden_states:
             if "last_hidden" not in language_capture:
                 raise RuntimeError("Qwen language hidden state was not captured")
-
             hidden = self._extract_multimodal_hidden(
                 last_hidden=language_capture["last_hidden"],
                 prepared=prepared, inputs=inputs,
             )
-            image_hidden_t1, image_hidden_t2 = hidden["image_hidden_t1"], hidden["image_hidden_t2"]
-            point_hidden_t1, point_hidden_t2 = hidden["point_hidden_t1"], hidden["point_hidden_t2"]
-            task_hidden = hidden["task_hidden"]
-            hidden_extra = {
-                "image_hidden_2d_t1": hidden["image_hidden_2d_t1"],
-                "image_hidden_2d_t2": hidden["image_hidden_2d_t2"],
-            }
 
         point_dense_t1, point_coord_t1, point_batch_t1 = self._dense_point_fields(point_encoded_t1)
         point_dense_t2, point_coord_t2, point_batch_t2 = self._dense_point_fields(point_encoded_t2)
 
+        shapes1 = self._image_token_shapes(inputs, prepared["image_grid_indices_t1"])
+        shapes2 = self._image_token_shapes(inputs, prepared["image_grid_indices_t2"])
+        single = prepared["single_input"]
+
+        dense2d1 = self._split_by_batch(image_dense_t1, image_dense_batch_t1, shapes1)
+        dense2d2 = self._split_by_batch(image_dense_t2, image_dense_batch_t2, shapes2)
+
         aux = {
             "task_mode": task_mode,
+            "batch_size": prepared["batch_size"],
+
+            "image_dense_batch_ids_t1": image_dense_batch_t1,
+            "image_dense_batch_ids_t2": image_dense_batch_t2,
+            "image_reasoning_batch_ids_t1": hidden.get("image_batch_ids_t1"),
+            "image_reasoning_batch_ids_t2": hidden.get("image_batch_ids_t2"),
+
+            "image_token_shapes_t1": shapes1,
+            "image_token_shapes_t2": shapes2,
+            "image_dense_2d_t1_list": dense2d1,
+            "image_dense_2d_t2_list": dense2d2,
+            "image_hidden_2d_t1_list": hidden.get("image_hidden_2d_t1_list"),
+            "image_hidden_2d_t2_list": hidden.get("image_hidden_2d_t2_list"),
+
             "point_encoded_t1": point_encoded_t1,
             "point_encoded_t2": point_encoded_t2,
             "point_tokens_t1": point_tokens_t1,
             "point_tokens_t2": point_tokens_t2,
-            "point_tokens_concat": point_tokens,
-
             "point_dense_coord_t1": point_coord_t1,
             "point_dense_coord_t2": point_coord_t2,
             "point_dense_batch_t1": point_batch_t1,
@@ -437,64 +501,65 @@ class PAIRModel(nn.Module):
             "point_token_indices_t1": None if out_t1 is None else out_t1["point_token_indices"],
             "point_token_indices_t2": None if out_t2 is None else out_t2["point_token_indices"],
 
-            "image_token_shape_t1": self._image_token_shape(inputs, prepared["image_grid_index_t1"]),
-            "image_token_shape_t2": self._image_token_shape(inputs, prepared["image_grid_index_t2"]),
-            "image_dense_2d_t1": self._reshape_image_tokens(
-                image_dense_t1, inputs, prepared["image_grid_index_t1"]
-            ),
-            "image_dense_2d_t2": self._reshape_image_tokens(
-                image_dense_t2, inputs, prepared["image_grid_index_t2"]
-            ),
-
             "prompt_text": prepared["prompt_text"],
-            "image_count_t1": prepared["image_count_t1"],
-            "image_count_t2": prepared["image_count_t2"],
-            "point_count_t1": prepared["point_count_t1"],
-            "point_count_t2": prepared["point_count_t2"],
+            "prompt_texts": prepared["prompt_texts"],
+            "image_counts_t1": prepared["image_counts_t1"],
+            "image_counts_t2": prepared["image_counts_t2"],
+            "point_counts_t1": prepared["point_counts_t1"],
+            "point_counts_t2": prepared["point_counts_t2"],
             "task_count": prepared["task_count"],
-            "point_injection_calls": injection_stats["calls"],
-            "point_injection_replaced": injection_stats["replaced"],
-            **hidden_extra,
+            "point_injection_calls": stats["calls"],
+            "point_injection_replaced": stats["replaced"],
         }
+
+        # Single-sample aliases keep existing smoke tests working.
+        if single:
+            aux.update({
+                "image_token_shape_t1": shapes1[0],
+                "image_token_shape_t2": shapes2[0],
+                "image_dense_2d_t1": dense2d1[0],
+                "image_dense_2d_t2": dense2d2[0],
+                "image_hidden_2d_t1": (
+                    hidden.get("image_hidden_2d_t1_list") or [None]
+                )[0],
+                "image_hidden_2d_t2": (
+                    hidden.get("image_hidden_2d_t2_list") or [None]
+                )[0],
+            })
 
         return PAIROutput(
             image_dense_t1=image_dense_t1,
             image_dense_t2=image_dense_t2,
             point_dense_t1=point_dense_t1,
             point_dense_t2=point_dense_t2,
-            image_hidden_t1=image_hidden_t1,
-            image_hidden_t2=image_hidden_t2,
-            point_hidden_t1=point_hidden_t1,
-            point_hidden_t2=point_hidden_t2,
-            task_hidden=task_hidden,
+            image_hidden_t1=hidden.get("image_hidden_t1"),
+            image_hidden_t2=hidden.get("image_hidden_t2"),
+            point_hidden_t1=hidden.get("point_hidden_t1"),
+            point_hidden_t2=hidden.get("point_hidden_t2"),
+            task_hidden=hidden.get("task_hidden"),
             logits=qwen_outputs.logits if return_logits else None,
             aux=aux,
         )
 
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
-    def generate(self, *, task_mode: str, prompt: str,
+    def generate(self, *, task_mode: str, prompt,
                  images_t1=None, images_t2=None,
                  point_dict_t1=None, point_dict_t2=None,
                  max_new_tokens: int = 64, do_sample: bool = False,
-                 **generate_kwargs) -> PAIROutput:
-
+                 **generate_kwargs):
+        # Keep generation simple and compatible. Batch generation is supported
+        # by Qwen after prepare_inputs; point injection uses the same hook.
         task_mode = self._normalize_task_mode(task_mode)
         self._validate_inputs(
             task_mode=task_mode, images_t1=images_t1, images_t2=images_t2,
             point_dict_t1=point_dict_t1, point_dict_t2=point_dict_t2,
         )
 
-        out_t1 = out_t2 = None
         point_tokens_t1 = point_tokens_t2 = None
-
         if task_mode in ("3d", "2d3d"):
-            out_t1 = self.encode_points(point_dict_t1)
-            out_t2 = self.encode_points(point_dict_t2)
-            point_tokens_t1, point_tokens_t2 = out_t1["point_tokens"], out_t2["point_tokens"]
+            out1 = self.encode_points(point_dict_t1)
+            out2 = self.encode_points(point_dict_t2)
+            point_tokens_t1, point_tokens_t2 = out1["point_tokens"], out2["point_tokens"]
 
         prepared = self._prepare_qwen(
             prompt=prompt,
@@ -507,8 +572,7 @@ class PAIRModel(nn.Module):
         inputs, point_tokens = prepared["inputs"], prepared["point_tokens"]
         stats = {"calls": 0, "replaced": False}
         handle = None
-
-        if point_tokens is not None:
+        if any(x is not None for x in point_tokens):
             handle = self.qwen_backbone.model.get_input_embeddings().register_forward_hook(
                 self._make_point_injection_hook(
                     point_tokens=point_tokens,
@@ -519,7 +583,7 @@ class PAIRModel(nn.Module):
             )
 
         try:
-            generated_ids = self.qwen_backbone.model.generate(
+            ids = self.qwen_backbone.model.generate(
                 **inputs, max_new_tokens=max_new_tokens,
                 do_sample=do_sample, **generate_kwargs
             )
@@ -527,30 +591,24 @@ class PAIRModel(nn.Module):
             if handle is not None:
                 handle.remove()
 
-        if point_tokens is not None and not stats["replaced"]:
-            raise RuntimeError("Temporal point tokens were not injected during generation")
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            prompt_lens = [inputs["input_ids"].shape[1]] * inputs["input_ids"].shape[0]
+        else:
+            prompt_lens = attention_mask.sum(1).tolist()
 
-        prompt_len = inputs["input_ids"].shape[1]
-        new_token_ids = generated_ids[:, prompt_len:]
-        text = self.qwen_backbone.processor.batch_decode(
-            new_token_ids, skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )
-        text = text[0] if len(text) == 1 else text
+        texts = []
+        for b, prompt_len in enumerate(prompt_lens):
+            new_ids = ids[b, int(prompt_len):]
+            texts.append(self.qwen_backbone.processor.decode(
+                new_ids, skip_special_tokens=True
+            ))
 
         return PAIROutput(
-            generated_ids=generated_ids,
-            generated_text=text,
-            aux={
-                "task_mode": task_mode,
-                "point_encoded_t1": None if out_t1 is None else out_t1["point_encoded"],
-                "point_encoded_t2": None if out_t2 is None else out_t2["point_encoded"],
-                "point_tokens_t1": point_tokens_t1,
-                "point_tokens_t2": point_tokens_t2,
-                "point_token_coord_t1": None if out_t1 is None else out_t1["point_token_coord"],
-                "point_token_coord_t2": None if out_t2 is None else out_t2["point_token_coord"],
-                "prompt_text": prepared["prompt_text"],
-                "point_injection_calls": stats["calls"],
-                "point_injection_replaced": stats["replaced"],
-            },
+            generated_ids=ids,
+            generated_text=texts[0] if prepared["single_input"] else texts,
+            aux={"task_mode": task_mode, "batch_size": prepared["batch_size"]},
         )
+
+
+PAIR = PAIRModel
