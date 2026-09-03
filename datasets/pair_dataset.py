@@ -91,7 +91,7 @@ class CanonicalChangeTarget:
         UNKNOWN_CLASS_ID = -1
         IGNORE_CLASS_ID  = -100
 
-        OTHER    = 0
+        UNCHANGED    = 0
         BUILDING = 1
         ROAD     = 2
         WATER    = 3
@@ -391,7 +391,10 @@ def read_label_array(path: Union[str, Path]) -> torch.Tensor:
         else:
             raise ValueError(f"Expected single-channel label, got {arr.shape}: {path}")
 
-    return torch.as_tensor(arr, dtype=torch.long)
+    return torch.as_tensor(
+        np.array(arr, copy=True),
+        dtype=torch.long,
+    )
 
 
 def _read_geotiff(path: Path):
