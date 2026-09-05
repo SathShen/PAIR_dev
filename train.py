@@ -2,41 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
+PAIR multi-dataset unified training.
 
-PAIR unified training framework.
+CLI:
+    python train.py --config configs/pair_train.json --datasets SECOND Estonia3D
 
-PAIR 2D training uses true vectorized physical batching inside each GPU.
+Dataset JSON entries contain only training-level values that cannot be inferred
+from the prepared data directory. Modality, route, supervision mode and
+manifest locations are inferred automatically by datasets/config_loader.py.
 
-Batch control is explicit:
-    --per-gpu-batch-size   physical samples processed by each GPU per forward
-    --grad-accum           number of forward/backward micro-steps per optimizer update
-
-Effective global batch is reported as:
-    per_gpu_batch_size * world_size * grad_accum
-
-Training modes:
-    --qwen-tuning frozen
-    --qwen-tuning lora   (default)
-    --qwen-tuning full
-
-Validation reports:
-    binary change metrics
-    T1/T2 semantic metrics
-    combined semantic metrics
-    SECOND-style F_scd / SeK / mIoU / OA / Score when an unchanged class exists
-
-Logs:
-    stdout
-    train_log.jsonl
-    val_log.jsonl
-    TensorBoard
+Each experiment epoch consumes exactly one pass of every selected dataset.
+Per-dataset optimizer-update counts are derived automatically from DataLoader
+length and gradient accumulation, then shuffled into one deterministic epoch
+plan. DDP ranks share exactly the same plan.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib
 import json
 import math
 import os
@@ -51,11 +35,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from datasets.pair_dataset import DatasetSpec, UnifiedPAIRDataset
+from datasets.config_loader import ExperimentConfig, load_experiment_config
+from datasets.multi_dataset import DatasetRegistry, MultiDatasetScheduler
+
 from loss import PAIRSemanticChangeLoss
 from metrics import PAIRMetrics, normalized_confusion_image
 from models.change_decoder import UnifiedChangeDecoder, UnifiedTokenSet, build_identity_temporal_links
@@ -73,47 +57,76 @@ DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset-root", type=Path, required=True)
-    p.add_argument("--spec", required=True)
-    p.add_argument("--train-split", default="train")
-    p.add_argument("--val-split", default="val")
-    p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/pair"))
-
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--per-gpu-batch-size", type=int, default=4,
-                   help="True physical batch size processed by each GPU per forward")
-    p.add_argument("--grad-accum", type=int, default=1,
-                   help="Gradient accumulation steps")
-    p.add_argument("--num-workers", type=int, default=4)
-
-    p.add_argument("--lr", type=float, default=1e-4, help="Decoder/adapter LR")
-    p.add_argument("--lora-lr", type=float, default=2e-5)
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--warmup-ratio", type=float, default=0.03)
-    p.add_argument("--scheduler", choices=("cosine", "constant"), default="cosine")
-    p.add_argument("--max-grad-norm", type=float, default=1.0)
-
-    p.add_argument("--decoder-dim", type=int, default=256)
-    p.add_argument("--qwen-tuning", choices=("frozen", "lora", "full"), default="lora")
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
-    p.add_argument("--lora-dropout", type=float, default=0.05)
-    p.add_argument("--lora-target-modules", default="q_proj,k_proj,v_proj,o_proj")
-
-    p.add_argument("--change-threshold", type=float, default=0.5)
-    p.add_argument("--unchanged-class-id", type=int, default=None)
-    p.add_argument("--val-every-epochs", type=int, default=1)
-    p.add_argument("--val-max-samples", type=int, default=0,
-                   help="0 = full validation set")
-    p.add_argument("--log-every", type=int, default=20,
-                   help="Optimizer updates between train logs")
-    p.add_argument("--save-every-epochs", type=int, default=1)
-    p.add_argument("--best-metric", default="scd/F_scd")
+    p.add_argument(
+        "--config", type=Path, default=Path("configs/pair_train.json"),
+        help="Full PAIR experiment JSON config",
+    )
+    p.add_argument(
+        "--datasets", nargs="+", default=None,
+        help="Dataset names from config. Example: --datasets SECOND Estonia3D",
+    )
+    p.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Optional override for logging.output_dir",
+    )
     p.add_argument("--resume", type=Path, default=None)
-    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
+
+def build_settings(experiment: ExperimentConfig, cli):
+    """Flatten JSON sections for existing model/optimizer helpers."""
+    m = experiment.model
+    lora = m.get("lora", {})
+    o = experiment.optimizer
+    t = experiment.training
+    v = experiment.validation
+    lg = experiment.logging
+
+    output_dir = (
+        cli.output_dir if cli.output_dir is not None
+        else Path(lg.get("output_dir", f"outputs/{experiment.experiment['name']}"))
+    )
+    targets = lora.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+    if isinstance(targets, str):
+        targets_string = targets
+    else:
+        targets_string = ",".join(str(x) for x in targets)
+
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        # model
+        model_dir=str(m["qwen_model"]),
+        qwen_tuning=str(m.get("qwen_tuning", "lora")),
+        decoder_dim=int(m.get("decoder_dim", 256)),
+        lora_r=int(lora.get("r", 16)),
+        lora_alpha=int(lora.get("alpha", 32)),
+        lora_dropout=float(lora.get("dropout", 0.05)),
+        lora_target_modules=targets_string,
+
+        # optimizer
+        lr=float(o.get("lr", 1e-4)),
+        lora_lr=float(o.get("lora_lr", 2e-5)),
+        weight_decay=float(o.get("weight_decay", 0.01)),
+        scheduler=str(o.get("scheduler", "cosine")),
+        warmup_ratio=float(o.get("warmup_ratio", 0.03)),
+        max_grad_norm=float(o.get("max_grad_norm", 1.0)),
+
+        # training
+        epochs=int(experiment.experiment["epochs"]),
+        grad_accum=int(t.get("grad_accum", 1)),
+        num_workers=int(t.get("num_workers", 4)),
+
+        # validation/logging
+        change_threshold=float(v.get("change_threshold", 0.5)),
+        val_every_epochs=int(v.get("every_epochs", 1)),
+        val_max_samples=int(v.get("max_samples", 0)),
+        best_metric=str(v.get("best_metric", "macro/scd/F_scd")),
+        log_every=int(lg.get("log_every", 20)),
+        save_every_epochs=int(lg.get("save_every_epochs", 1)),
+        output_dir=Path(output_dir),
+        resume=cli.resume,
+        seed=int(experiment.experiment.get("seed", 42)),
+    )
 
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -158,22 +171,8 @@ def make_writer(output_dir, is_main):
 
 
 # =============================================================================
-# Dataset
+# Image bridge
 # =============================================================================
-
-def load_spec(name):
-    module = importlib.import_module("datasets.configs")
-    if not hasattr(module, name):
-        available = [k for k, v in vars(module).items() if isinstance(v, DatasetSpec)]
-        raise AttributeError(f"datasets.configs.{name} not found. Available: {available}")
-
-    spec = getattr(module, name)
-    if not isinstance(spec, DatasetSpec):
-        raise TypeError(f"datasets.configs.{name} is not DatasetSpec")
-    if not isinstance(spec.class_names, dict) or not spec.class_names:
-        raise TypeError(f"{name}.class_names must be a non-empty Dict[int, str]")
-    return spec
-
 
 def tensor_to_pil(image):
     x = image.detach().cpu().float()
@@ -189,37 +188,6 @@ def tensor_to_pil(image):
     if arr.shape[-1] == 1:
         arr = arr[..., 0]
     return Image.fromarray(arr)
-
-
-def collate_batch(batch):
-    if not batch:
-        raise RuntimeError("Empty batch")
-    return list(batch)
-
-
-def make_train_loader(dataset, runtime, num_workers, per_gpu_batch_size):
-    sampler = DistributedSampler(
-        dataset, num_replicas=runtime["world_size"], rank=runtime["rank"],
-        shuffle=True, seed=0, drop_last=False,
-    )
-    loader = DataLoader(
-        dataset, batch_size=per_gpu_batch_size, sampler=sampler, num_workers=num_workers,
-        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_batch,
-    )
-    return loader, sampler
-
-
-def make_val_loader(dataset, runtime, num_workers, per_gpu_batch_size):
-    sampler = DistributedSampler(
-        dataset, num_replicas=runtime["world_size"], rank=runtime["rank"],
-        shuffle=False, drop_last=False,
-    ) if runtime["distributed"] else None
-
-    loader = DataLoader(
-        dataset, batch_size=per_gpu_batch_size, sampler=sampler, shuffle=False, num_workers=num_workers,
-        pin_memory=True, persistent_workers=num_workers > 0, collate_fn=collate_batch,
-    )
-    return loader
 
 
 # =============================================================================
@@ -540,20 +508,33 @@ def non_qwen_pair_state(model):
     return {k: v.detach().cpu() for k, v in state.items() if k in names}
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, batch_in_epoch,
-                    optimizer_step, args, best_metric, best_value):
+def save_checkpoint(
+    path, model, optimizer, scheduler,
+    epoch, update_in_epoch, optimizer_step,
+    settings, experiment, resolved_config,
+    best_metric, best_value,
+):
     base = unwrap(model)
     checkpoint = {
-        "epoch": int(epoch), "batch_in_epoch": int(batch_in_epoch),
+        "epoch": int(epoch),
+        "update_in_epoch": int(update_in_epoch),
         "optimizer_step": int(optimizer_step),
+
         "decoder": base.decoder.state_dict(),
         "image_adapter": base.image_adapter.state_dict(),
         "lora": lora_state_dict(base.pair.qwen_backbone.model),
         "pair_trainable": non_qwen_pair_state(model),
+
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "best_metric": best_metric, "best_value": best_value,
-        "args": vars(args),
+
+        "best_metric": best_metric,
+        "best_value": best_value,
+
+        # Full self-describing training configuration.
+        "config": resolved_config,
+        "config_hash": experiment.hash_resolved(resolved_config),
+        "selected_datasets": list(experiment.selected_names),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
@@ -575,7 +556,7 @@ def load_checkpoint(path, model, optimizer, scheduler):
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return (
-        int(ckpt.get("epoch", 0)), int(ckpt.get("batch_in_epoch", 0)),
+        int(ckpt.get("epoch", 0)), int(ckpt.get("update_in_epoch", 0)),
         int(ckpt.get("optimizer_step", 0)),
         ckpt.get("best_metric"), ckpt.get("best_value"),
     )
@@ -586,7 +567,7 @@ def load_checkpoint(path, model, optimizer, scheduler):
 # =============================================================================
 
 def forward_loss(model, criterion, samples, spec):
-    if spec.task_mode != "2d":
+    if spec.route != "2d":
         raise NotImplementedError("Current training adapter closes batched 2D first")
 
     images_t1 = [tensor_to_pil(s["images_t1"]) for s in samples]
@@ -621,7 +602,7 @@ def validate(model, criterion, loader, spec, runtime, args):
     model.eval()
     evaluator = PAIRMetrics(
         spec.class_names, runtime["device"], args.change_threshold,
-        unchanged_raw_id=args.unchanged_class_id,
+        unchanged_raw_id=spec.unchanged_raw_id,
     )
     sums, count = {}, 0
     start = time.time()
@@ -648,46 +629,66 @@ def validate(model, criterion, loader, spec, runtime, args):
     return result
 
 
-def log_tensorboard_train(writer, values, step):
+def log_tensorboard_train(writer, values, step, dataset_name):
     if writer is None:
         return
     for key, value in values.items():
-        writer.add_scalar(f"train/{key}", value, step)
+        if isinstance(value, (int, float)):
+            writer.add_scalar(f"train/{dataset_name}/{key}", value, step)
 
 
-def log_tensorboard_val(writer, result, step):
+def log_tensorboard_val(writer, result, step, dataset_name):
     if writer is None:
         return
 
     for key, value in result["losses"].items():
-        writer.add_scalar(f"val/{key}", value, step)
+        writer.add_scalar(f"val/{dataset_name}/loss/{key}", value, step)
     for key, value in result["scalars"].items():
-        writer.add_scalar(f"val/{key}", value, step)
+        writer.add_scalar(f"val/{dataset_name}/{key}", value, step)
 
     for class_name, values in result["per_class"].items():
         safe = class_name.replace("/", "_")
         for metric in ("IoU", "F1", "Precision", "Recall"):
-            writer.add_scalar(f"val/per_class/{safe}/{metric}", values[metric], step)
+            writer.add_scalar(
+                f"val/{dataset_name}/per_class/{safe}/{metric}",
+                values[metric], step,
+            )
 
     for name, cm in result["confusion"].items():
         writer.add_image(
-            f"val/confusion/{name}", normalized_confusion_image(cm),
+            f"val/{dataset_name}/confusion/{name}",
+            normalized_confusion_image(cm),
             step, dataformats="CHW",
         )
 
 
-def write_jsonl(path, record):
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+def log_tensorboard_macro(writer, macro, step):
+    if writer is None:
+        return
+    for key, value in macro.items():
+        writer.add_scalar(f"val/{key}", value, step)
 
 
-def print_val(result):
+def compute_macro_metrics(results_by_dataset):
+    buckets = {}
+    for result in results_by_dataset.values():
+        for key, value in result["scalars"].items():
+            buckets.setdefault(key, []).append(float(value))
+
+    return {
+        f"macro/{key}": sum(values) / len(values)
+        for key, values in buckets.items()
+        if values
+    }
+
+
+def print_val(dataset_name, result):
     s = result["scalars"]
     loss = result["losses"].get("loss", float("nan"))
     print(
-        f"VAL | loss={loss:.4f} | change F1={s['change/F1']:.4f} "
-        f"IoU={s['change/IoU']:.4f} | sem mIoU={s['semantic/mIoU']:.4f} "
-        f"mF1={s['semantic/mF1']:.4f}",
+        f"VAL [{dataset_name}] | loss={loss:.4f} | "
+        f"change F1={s['change/F1']:.4f} IoU={s['change/IoU']:.4f} | "
+        f"sem mIoU={s['semantic/mIoU']:.4f} mF1={s['semantic/mF1']:.4f}",
         end="",
     )
     if "scd/F_scd" in s:
@@ -699,231 +700,407 @@ def print_val(result):
         print()
 
 
+def write_jsonl(path, record):
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    args = parse_args()
+    cli = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.grad_accum < 1:
-        raise ValueError("--grad-accum must be >= 1")
 
     runtime = setup_distributed()
     writer = None
 
     try:
-        set_seed(args.seed, runtime["rank"])
-        spec = load_spec(args.spec)
-        root = args.dataset_root.expanduser().resolve()
-        train_ds = UnifiedPAIRDataset(root / "manifests" / f"{args.train_split}.jsonl", spec)
+        experiment = load_experiment_config(cli.config, cli.datasets)
+        settings = build_settings(experiment, cli)
 
-        val_path = root / "manifests" / f"{args.val_split}.jsonl"
-        val_ds = UnifiedPAIRDataset(val_path, spec) if val_path.exists() else None
+        if settings.grad_accum < 1:
+            raise ValueError("training.grad_accum must be >= 1")
 
-        train_loader, train_sampler = make_train_loader(
-            train_ds, runtime, args.num_workers, args.per_gpu_batch_size
+        set_seed(settings.seed, runtime["rank"])
+
+        registry = DatasetRegistry(
+            experiment, runtime, num_workers=settings.num_workers
         )
-        val_loader = make_val_loader(
-            val_ds, runtime, args.num_workers, args.per_gpu_batch_size
-        ) if val_ds is not None else None
+        dataset_scheduler = MultiDatasetScheduler(
+            experiment, registry, settings.grad_accum
+        )
 
-        grad_accum = args.grad_accum
-        physical_global = runtime["world_size"] * args.per_gpu_batch_size
-        effective_global = physical_global * grad_accum
+        updates_per_epoch = dataset_scheduler.updates_per_epoch
+        total_updates = updates_per_epoch * settings.epochs
 
-        model = build_model(args, runtime)
+        model = build_model(settings, runtime)
         if runtime["distributed"]:
+            # Mixed 2D / 3D / 2D3D training intentionally leaves modality
+            # branches unused on some optimizer updates.
             model = DDP(
-                model, device_ids=[runtime["local_rank"]],
+                model,
+                device_ids=[runtime["local_rank"]],
                 output_device=runtime["local_rank"],
-                broadcast_buffers=False, find_unused_parameters=False,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
             )
 
         criterion = PAIRSemanticChangeLoss().to(runtime["device"])
-        optimizer, main_params, lora_params = build_optimizer(model, args)
-        updates_per_epoch = math.ceil(len(train_loader) / grad_accum)
-        total_updates = updates_per_epoch * args.epochs
-        scheduler = build_scheduler(optimizer, total_updates, args.warmup_ratio, args.scheduler)
+        optimizer, _, _ = build_optimizer(model, settings)
+        scheduler = build_scheduler(
+            optimizer, total_updates,
+            settings.warmup_ratio, settings.scheduler,
+        )
 
-        start_epoch = start_batch = optimizer_step = 0
-        best_metric, best_value = args.best_metric, -float("inf")
-        if args.resume is not None:
-            start_epoch, start_batch, optimizer_step, old_metric, old_value = load_checkpoint(
-                args.resume, model, optimizer, scheduler
+        start_epoch = 0
+        start_update_in_epoch = 0
+        optimizer_step = 0
+        best_metric = settings.best_metric
+        best_value = -float("inf")
+
+        if settings.resume is not None:
+            (
+                start_epoch, start_update_in_epoch, optimizer_step,
+                old_metric, old_value,
+            ) = load_checkpoint(
+                settings.resume, model, optimizer, scheduler
             )
             if old_metric is not None:
                 best_metric = old_metric
             if old_value is not None:
                 best_value = float(old_value)
 
+        # Runtime-resolved config is deliberately separate from the source JSON.
+        dataset_runtime = registry.runtime_summary(settings.grad_accum)
+        for name, info in dataset_runtime.items():
+            info["effective_global_batch"] = (
+                experiment.datasets[name].per_gpu_batch_size
+                * runtime["world_size"]
+                * settings.grad_accum
+            )
+
+        runtime_config = {
+            "world_size": runtime["world_size"],
+            "updates_per_epoch": updates_per_epoch,
+            "total_optimizer_updates": total_updates,
+            "grad_accum": settings.grad_accum,
+            "dataset_epoch_plan": dataset_scheduler.summary(),
+            "datasets": dataset_runtime,
+        }
+        resolved_config = experiment.resolved_dict(runtime=runtime_config)
+
         if runtime["is_main"]:
-            args.output_dir.mkdir(parents=True, exist_ok=True)
-            writer = make_writer(args.output_dir, True)
-            (args.output_dir / "config.json").write_text(
-                json.dumps(vars(args), ensure_ascii=False, indent=2, default=str),
+            settings.output_dir.mkdir(parents=True, exist_ok=True)
+            writer = make_writer(
+                settings.output_dir,
+                bool(experiment.logging.get("tensorboard", True)),
+            ) if experiment.logging.get("tensorboard", True) else None
+
+            # Preserve the user-authored source config unchanged.
+            source_config_text = experiment.path.read_text(encoding="utf-8")
+            (settings.output_dir / "config.json").write_text(
+                source_config_text, encoding="utf-8"
+            )
+            (settings.output_dir / "config_resolved.json").write_text(
+                json.dumps(resolved_config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
             base = unwrap(model)
-            lora_trainable, _ = lora_parameter_count(base.pair.qwen_backbone.model)
-            total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            lora_trainable, _ = lora_parameter_count(
+                base.pair.qwen_backbone.model
+            )
+            total_trainable = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
 
-            print("=" * 92)
-            print("PAIR UNIFIED TRAINING")
-            print("=" * 92)
-            print("Spec:", args.spec)
-            print("Classes:", spec.class_names)
-            print("Train/Val:", len(train_ds), "/", 0 if val_ds is None else len(val_ds))
-            print("Qwen tuning:", args.qwen_tuning)
+            print("=" * 96)
+            print("PAIR MULTI-DATASET TRAINING")
+            print("=" * 96)
+            print("Experiment:", experiment.experiment["name"])
+            print("Datasets:", ", ".join(experiment.selected_names))
+            print("Qwen tuning:", settings.qwen_tuning)
             print("LoRA trainable:", f"{lora_trainable / 1e6:.2f} M")
             print("Total trainable:", f"{total_trainable / 1e6:.2f} M")
             print("GPUs:", runtime["world_size"])
-            print("Per-GPU batch size:", args.per_gpu_batch_size)
-            print("Gradient accumulation:", grad_accum)
-            print("Effective global batch:", effective_global)
+            print("Gradient accumulation:", settings.grad_accum)
             print("Updates/epoch:", updates_per_epoch)
             print("Total optimizer updates:", total_updates)
-            print("TensorBoard:", args.output_dir / "tensorboard")
+            print("Automatic dataset epoch plan:", dataset_scheduler.summary())
+            print()
+            for name in experiment.selected_names:
+                info = dataset_runtime[name]
+                print(
+                    f"  {name}: route={info['route']} "
+                    f"train={info['train_samples']} val={info['val_samples']} "
+                    f"per_gpu_batch={info['per_gpu_batch_size']} "
+                    f"effective_global_batch={info['effective_global_batch']} "
+                    f"updates={info['optimizer_updates_per_epoch']} "
+                    f"fraction={info['update_fraction']:.3f}"
+                )
+            print("TensorBoard:", settings.output_dir / "tensorboard")
             print()
 
-        train_json = args.output_dir / "train_log.jsonl"
-        val_json = args.output_dir / "val_log.jsonl"
+        train_json = settings.output_dir / "train_log.jsonl"
+        val_json = settings.output_dir / "val_log.jsonl"
         model.train()
 
-        for epoch in range(start_epoch, args.epochs):
-            train_sampler.set_epoch(epoch)
-            optimizer.zero_grad(set_to_none=True)
-            accum_count = 0
-            window, window_count, window_samples = {}, 0, 0
-            window_start = time.time()
+        for epoch in range(start_epoch, settings.epochs):
+            registry.reset_epoch(epoch)
+            schedule = dataset_scheduler.epoch_schedule(
+                epoch, runtime
+            )
+            schedule_counts = {
+                name: sum(
+                    1 for item in schedule
+                    if item.dataset_name == name
+                )
+                for name in experiment.selected_names
+            }
 
-            for batch_idx, samples in enumerate(train_loader):
-                if epoch == start_epoch and batch_idx < start_batch:
-                    continue
+            first_update = (
+                start_update_in_epoch
+                if epoch == start_epoch else 0
+            )
 
-                accum_count += 1
-                is_last = batch_idx + 1 == len(train_loader)
-                update_now = accum_count == grad_accum or is_last
+            # Reconstruct exact loader positions for mid-epoch resume.
+            if first_update > 0:
+                registry.consume_updates(schedule[:first_update])
 
-                sync_context = contextlib.nullcontext()
-                if isinstance(model, DDP) and not update_now:
-                    sync_context = model.no_sync()
+            for update_idx in range(first_update, updates_per_epoch):
+                update = schedule[update_idx]
+                dataset_name = update.dataset_name
+                accumulation_steps = update.microbatches
+                handle = registry.handles[dataset_name]
+                spec = handle.config.spec
 
-                with sync_context:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        _, loss_output, _ = forward_loss(model, criterion, samples, spec)
-                        loss = loss_output.total / grad_accum
-                    loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+                update_sums = {}
+                update_samples = 0
+                update_start = time.time()
 
-                for key, value in loss_output.as_dict().items():
-                    window[key] = window.get(key, 0.0) + float(value.detach().cpu())
-                window_count += 1
-                window_samples += len(samples)
+                for micro_idx in range(accumulation_steps):
+                    samples = registry.next_train_batch(dataset_name)
+                    update_samples += len(samples)
 
-                if not update_now:
-                    continue
+                    sync_context = contextlib.nullcontext()
+                    if (
+                        isinstance(model, DDP)
+                        and micro_idx + 1 < accumulation_steps
+                    ):
+                        sync_context = model.no_sync()
 
-                if accum_count != grad_accum:
-                    scale = grad_accum / accum_count
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            p.grad.mul_(scale)
+                    with sync_context:
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            _, loss_output, _ = forward_loss(
+                                model, criterion, samples, spec
+                            )
+                            loss = loss_output.total / accumulation_steps
+                        loss.backward()
 
-                params = [p for p in model.parameters() if p.requires_grad]
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(
-                    params, args.max_grad_norm
-                ).detach().cpu()) if args.max_grad_norm > 0 else float("nan")
+                    for key, value in loss_output.as_dict().items():
+                        update_sums[key] = (
+                            update_sums.get(key, 0.0)
+                            + float(value.detach().cpu())
+                        )
+
+                trainable = [
+                    p for p in model.parameters() if p.requires_grad
+                ]
+                grad_norm = (
+                    float(torch.nn.utils.clip_grad_norm_(
+                        trainable, settings.max_grad_norm
+                    ).detach().cpu())
+                    if settings.max_grad_norm > 0
+                    else float("nan")
+                )
 
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
-                accum_count = 0
 
-                if optimizer_step % args.log_every == 0:
-                    elapsed = time.time() - window_start
-                    means = {k: v / max(window_count, 1) for k, v in window.items()}
-                    lrs = {g.get("name", str(i)): g["lr"] for i, g in enumerate(optimizer.param_groups)}
+                means = {
+                    key: value / accumulation_steps
+                    for key, value in update_sums.items()
+                }
+                lrs = {
+                    g.get("name", str(i)): g["lr"]
+                    for i, g in enumerate(optimizer.param_groups)
+                }
+                elapsed = time.time() - update_start
 
-                    log = {
-                        **means, "epoch": epoch + 1, "optimizer_step": optimizer_step,
-                        "grad_norm": grad_norm,
-                        "samples_per_sec": window_samples * runtime["world_size"] / max(elapsed, 1e-6),
-                        "gpu_alloc_GiB": torch.cuda.memory_allocated() / 1024**3,
-                        "gpu_reserved_GiB": torch.cuda.memory_reserved() / 1024**3,
-                        "lr_pair": lrs.get("pair", 0.0), "lr_lora": lrs.get("lora", 0.0),
-                    }
+                update_log = {
+                    **means,
+                    "dataset": dataset_name,
+                    "route": handle.config.route,
+                    "epoch": epoch + 1,
+                    "update_in_epoch": update_idx + 1,
+                    "optimizer_step": optimizer_step,
+                    "accumulation_steps": accumulation_steps,
+                    "grad_norm": grad_norm,
+                    "samples_per_sec": (
+                        update_samples * runtime["world_size"]
+                        / max(elapsed, 1e-6)
+                    ),
+                    "gpu_alloc_GiB": (
+                        torch.cuda.memory_allocated() / 1024**3
+                    ),
+                    "gpu_reserved_GiB": (
+                        torch.cuda.memory_reserved() / 1024**3
+                    ),
+                    "lr_pair": lrs.get("pair", 0.0),
+                    "lr_lora": lrs.get("lora", 0.0),
+                }
 
-                    if runtime["is_main"]:
-                        print(
-                            f"E{epoch+1:03d} U{optimizer_step:06d} | "
-                            f"loss={means['loss']:.4f} sem1={means['loss_semantic_t1']:.4f} "
-                            f"sem2={means['loss_semantic_t2']:.4f} "
-                            f"bce={means['loss_change_bce']:.4f} dice={means['loss_change_dice']:.4f} | "
-                            f"grad={grad_norm:.3f} lr={lrs.get('pair', 0):.2e}/"
-                            f"{lrs.get('lora', 0):.2e} | {log['samples_per_sec']:.2f} sample/s"
-                        )
-                        write_jsonl(train_json, log)
-                        log_tensorboard_train(writer, log, optimizer_step)
+                if runtime["is_main"] and (
+                    optimizer_step % settings.log_every == 0
+                ):
+                    print(
+                        f"E{epoch+1:03d} U{optimizer_step:06d} "
+                        f"[{dataset_name} x{accumulation_steps}] | "
+                        f"loss={means['loss']:.4f} "
+                        f"sem1={means['loss_semantic_t1']:.4f} "
+                        f"sem2={means['loss_semantic_t2']:.4f} "
+                        f"bce={means['loss_change_bce']:.4f} "
+                        f"dice={means['loss_change_dice']:.4f} | "
+                        f"grad={grad_norm:.3f} "
+                        f"lr={lrs.get('pair', 0):.2e}/"
+                        f"{lrs.get('lora', 0):.2e} | "
+                        f"{update_log['samples_per_sec']:.2f} sample/s"
+                    )
+                    write_jsonl(train_json, update_log)
+                    log_tensorboard_train(
+                        writer, update_log, optimizer_step, dataset_name
+                    )
 
-                    window, window_count, window_samples = {}, 0, 0
-                    window_start = time.time()
+            start_update_in_epoch = 0
 
-            start_batch = 0
+            if runtime["is_main"]:
+                print(
+                    f"Epoch {epoch+1} dataset updates: "
+                    + ", ".join(
+                        f"{name}={schedule_counts[name]}"
+                        for name in experiment.selected_names
+                    )
+                )
 
-            # Full validation at epoch interval.
-            val_result = None
-            if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
+            # ----------------------------------------------------------
+            # Validation: each dataset owns an independent metric space.
+            # ----------------------------------------------------------
+            results_by_dataset = {}
+            if (epoch + 1) % settings.val_every_epochs == 0:
                 if runtime["distributed"]:
                     dist.barrier()
-                val_result = validate(model, criterion, val_loader, spec, runtime, args)
-                if runtime["is_main"]:
-                    print_val(val_result)
+
+                for dataset_name in experiment.selected_names:
+                    handle = registry.handles[dataset_name]
+                    if handle.val_loader is None:
+                        continue
+
+                    result = validate(
+                        model, criterion,
+                        handle.val_loader,
+                        handle.config.spec,
+                        runtime, settings,
+                    )
+                    results_by_dataset[dataset_name] = result
+
+                    if runtime["is_main"]:
+                        print_val(dataset_name, result)
+                        log_tensorboard_val(
+                            writer, result, optimizer_step, dataset_name
+                        )
+
+                macro = compute_macro_metrics(results_by_dataset)
+
+                if runtime["is_main"] and results_by_dataset:
+                    log_tensorboard_macro(writer, macro, optimizer_step)
+
                     record = {
-                        "epoch": epoch + 1, "optimizer_step": optimizer_step,
-                        "seconds": val_result["seconds"],
-                        "losses": val_result["losses"],
-                        "metrics": val_result["scalars"],
-                        "per_class": val_result["per_class"],
-                        "confusion": {
-                            k: v.tolist() for k, v in val_result["confusion"].items()
+                        "epoch": epoch + 1,
+                        "optimizer_step": optimizer_step,
+                        "datasets": {
+                            name: {
+                                "seconds": result["seconds"],
+                                "losses": result["losses"],
+                                "metrics": result["scalars"],
+                                "per_class": result["per_class"],
+                                "confusion": {
+                                    key: value.tolist()
+                                    for key, value
+                                    in result["confusion"].items()
+                                },
+                            }
+                            for name, result in results_by_dataset.items()
                         },
+                        "macro": macro,
                     }
                     write_jsonl(val_json, record)
-                    log_tensorboard_val(writer, val_result, optimizer_step)
 
-                    metric_value = val_result["scalars"].get(best_metric)
+                    metric_value = macro.get(best_metric)
                     if metric_value is None:
-                        metric_value = val_result["scalars"].get("change/F1", -float("inf"))
+                        # Also allow explicit dataset metric paths such as
+                        # SECOND/scd/F_scd.
+                        if "/" in best_metric:
+                            prefix, _, metric_key = best_metric.partition("/")
+                            if prefix in results_by_dataset:
+                                metric_value = results_by_dataset[
+                                    prefix
+                                ]["scalars"].get(metric_key)
+
+                    if metric_value is None:
+                        metric_value = macro.get(
+                            "macro/change/F1", -float("inf")
+                        )
+
                     if metric_value > best_value:
                         best_value = float(metric_value)
                         save_checkpoint(
-                            args.output_dir / "best.pt", model, optimizer, scheduler,
-                            epoch + 1, 0, optimizer_step, args, best_metric, best_value,
+                            settings.output_dir / "best.pt",
+                            model, optimizer, scheduler,
+                            epoch + 1, 0, optimizer_step,
+                            settings, experiment, resolved_config,
+                            best_metric, best_value,
                         )
-                        print(f"Best checkpoint: {best_metric}={best_value:.6f}")
+                        print(
+                            f"Best checkpoint: "
+                            f"{best_metric}={best_value:.6f}"
+                        )
 
                 if runtime["distributed"]:
                     dist.barrier()
 
-            if runtime["is_main"] and (epoch + 1) % args.save_every_epochs == 0:
+            if (
+                runtime["is_main"]
+                and (epoch + 1) % settings.save_every_epochs == 0
+            ):
                 save_checkpoint(
-                    args.output_dir / f"epoch_{epoch+1:03d}.pt", model, optimizer, scheduler,
-                    epoch + 1, 0, optimizer_step, args, best_metric, best_value,
+                    settings.output_dir / f"epoch_{epoch+1:03d}.pt",
+                    model, optimizer, scheduler,
+                    epoch + 1, 0, optimizer_step,
+                    settings, experiment, resolved_config,
+                    best_metric, best_value,
                 )
 
             if runtime["is_main"]:
                 save_checkpoint(
-                    args.output_dir / "last.pt", model, optimizer, scheduler,
-                    epoch + 1, 0, optimizer_step, args, best_metric, best_value,
+                    settings.output_dir / "last.pt",
+                    model, optimizer, scheduler,
+                    epoch + 1, 0, optimizer_step,
+                    settings, experiment, resolved_config,
+                    best_metric, best_value,
                 )
                 if writer is not None:
                     writer.flush()
 
         if runtime["is_main"]:
-            print(f"Training complete. Best {best_metric}={best_value:.6f}")
+            print(
+                f"Training complete. Best "
+                f"{best_metric}={best_value:.6f}"
+            )
 
     finally:
         if writer is not None:

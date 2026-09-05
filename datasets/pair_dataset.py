@@ -1,43 +1,52 @@
 """
-Unified dataset interface for PAIR.
+PAIR standard dataset interface.
 
-Canonical semantic-change target
---------------------------------
-PAIR treats every change dataset as semantic change detection, but source
-supervision can have different information completeness:
+Directory is schema
+-------------------
+Every dataset must be prepared into one of the canonical layouts below.
 
-    A -> B              full semantic change
-    Unknown -> B        only post-change semantics are known
-    Unknown -> Unknown  binary/all-category change
-    Unchanged           no change
+2D semantic pair:
+    root/
+    ├── images_t1/
+    ├── images_t2/
+    ├── semantic_t1/
+    ├── semantic_t2/
+    └── manifests/
+        ├── train.jsonl
+        ├── val.jsonl      (optional)
+        └── test.jsonl     (optional)
 
-Instead of creating a huge transition-class vocabulary, every target is
-factorized into:
-
-    change       : 0 / 1
-    semantic_t1  : class id or UNKNOWN_CLASS_ID
-    semantic_t2  : class id or UNKNOWN_CLASS_ID
-
-This lets datasets have different class vocabularies and avoids a global
-num_classes requirement.
-
-Spatial policy
---------------
-2D:
-    T1/T2 must describe the same footprint. Georeferenced rasters should be
-    aligned to one CRS/GSD/affine grid before training. Optional resizing is
-    applied to the PAIR, never independently.
-
-3D:
-    point clouds are not resized. T1/T2 are cropped by the same metric XY
-    bounds and translated into a shared local coordinate frame.
+3D semantic pair:
+    root/
+    ├── points_t1/
+    ├── points_t2/
+    ├── semantic_t1/
+    ├── semantic_t2/
+    └── manifests/
 
 2D+3D:
-    all four inputs must refer to the same world-space bounds. Spatial
-    metadata is returned for future pixel<->point projection/fusion.
+    root/
+    ├── images_t1/
+    ├── images_t2/
+    ├── points_t1/
+    ├── points_t2/
+    ├── semantic_t1/
+    ├── semantic_t2/
+    └── manifests/
 
-This is a generic first-pass layer. Individual public datasets should use thin
-record builders and, when needed, dataset-specific target/feature builders.
+Supervision is inferred from directories:
+    semantic_t1 + semantic_t2  -> semantic_pair
+    change + semantic_t2       -> post_semantic
+    change                     -> binary
+
+Canonical labels:
+    change      : 0 unchanged, 1 changed, -100 ignore
+    semantic    : raw dataset class ID, -100 ignore
+    UNKNOWN=-1  : internal only, meaning semantic class is not supervised
+
+The training JSON does not repeat modality, manifest path, label mode, image
+size, changed/unchanged values, ignore values, alignment policy, or prompt.
+Those are either inferred from the prepared directory or fixed PAIR protocol.
 """
 
 from __future__ import annotations
@@ -49,178 +58,82 @@ import json
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from PIL import Image
 
 
 UNKNOWN_CLASS_ID = -1
 IGNORE_CLASS_ID = -100
+VALID_MODALITIES = {"image", "point"}
 
 
-@dataclass
+def normalize_class_name(name: str) -> str:
+    return " ".join(
+        str(name).strip().lower().replace("_", " ").replace("-", " ").split()
+    )
+
+
+def infer_unchanged_raw_id(class_names: Dict[int, str]) -> Optional[int]:
+    """
+    Infer an explicit semantic 'unchanged' class by NAME only.
+
+    Intentionally does NOT treat 'background' as unchanged.
+    """
+    aliases = {"unchanged", "no change", "non change"}
+    matches = [
+        int(raw_id)
+        for raw_id, name in class_names.items()
+        if normalize_class_name(name) in aliases
+    ]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple unchanged-like classes found: {matches}. "
+            "Use one explicit unchanged/no-change class name."
+        )
+    return matches[0] if matches else None
+
+
+def route_from_modalities(modalities: Sequence[str]) -> str:
+    m = set(modalities)
+    if m == {"image"}:
+        return "2d"
+    if m == {"point"}:
+        return "3d"
+    if m == {"image", "point"}:
+        return "2d3d"
+    raise ValueError(f"Unsupported modality set: {sorted(m)}")
+
+
+@dataclass(frozen=True)
 class DatasetSpec:
+    """
+    Internal normalized dataset description.
+
+    Users do not create this in config. config_loader builds it automatically
+    from the prepared PAIR directory and the dataset's class_names.
+    """
     name: str
-    task_mode: str                 # 2d | 3d | 2d3d
-    label_mode: str = "semantic_pair"  # semantic_pair | post_semantic | binary | custom
-    class_names: Optional[Dict[int, str]] = None
-
-    # Optional paired raster output size (H, W). This is not registration.
-    image_size: Optional[Tuple[int, int]] = None
-
-    # Metric PTv3 grid size.
+    modalities: Tuple[str, ...]
+    label_mode: str
+    class_names: Dict[int, str]
     point_grid_size: float = 0.10
+    unchanged_raw_id: Optional[int] = None
 
-    changed_value: int = 1
-    unchanged_value: int = 0
-    ignore_value: Optional[int] = None
+    @property
+    def route(self) -> str:
+        return route_from_modalities(self.modalities)
 
-    # Reject misregistered GeoTIFF pairs instead of silently stretching them.
-    strict_geo_alignment: bool = True
+    @property
+    def has_image(self) -> bool:
+        return "image" in self.modalities
 
-    prompt: Optional[str] = None
+    @property
+    def has_point(self) -> bool:
+        return "point" in self.modalities
 
 
 @dataclass
 class CanonicalChangeTarget:
-    """
-    Canonical change target definition.
-
-    Semantic class IDs used in this example:
-
-        UNKNOWN_CLASS_ID = -1
-        IGNORE_CLASS_ID  = -100
-
-        UNCHANGED    = 0
-        BUILDING = 1
-        ROAD     = 2
-        WATER    = 3
-        GROUND   = 4
-        TREE     = 5
-
-    Each spatial location (pixel / point) is represented by six fields:
-
-    1. change
-    Binary change state:
-        0 = Unchanged
-        1 = Changed
-        -100 = Ignore / invalid
-
-    2. semantic_t1
-    Semantic class ID at Time 1.
-    If the source dataset does not provide the T1 semantic class,
-    use UNKNOWN_CLASS_ID = -1.
-
-    3. semantic_t2
-    Semantic class ID at Time 2.
-    If the source dataset does not provide the T2 semantic class,
-    use UNKNOWN_CLASS_ID = -1.
-
-    4. change_valid
-    Whether the change label is valid and can be used for change loss.
-
-    5. semantic_valid_t1
-    Whether semantic_t1 is a known ground-truth semantic class and can
-    participate in T1 semantic loss.
-
-    6. semantic_valid_t2
-    Whether semantic_t2 is a known ground-truth semantic class and can
-    participate in T2 semantic loss.
-
-
-    Examples
-    ========
-
-    Example 1: Tree -> Building
-
-        T1 = TREE     = 5
-        T2 = BUILDING = 1
-
-        change             = 1
-        semantic_t1        = 5
-        semantic_t2        = 1
-
-        change_valid       = True
-        semantic_valid_t1  = True
-        semantic_valid_t2  = True
-
-
-    Example 2: Unknown -> Building
-
-        T1 class is unavailable.
-        T2 = BUILDING = 1
-
-        change             = 1
-        semantic_t1        = -1
-        semantic_t2        = 1
-
-        change_valid       = True
-        semantic_valid_t1  = False
-        semantic_valid_t2  = True
-
-
-    Example 3: Unknown -> Unknown
-
-        The source dataset only provides a binary change mask.
-        It tells us that this location changed, but does not provide either
-        the T1 or T2 semantic class.
-
-        change             = 1
-        semantic_t1        = -1
-        semantic_t2        = -1
-
-        change_valid       = True
-        semantic_valid_t1  = False
-        semantic_valid_t2  = False
-
-
-    Example 4: Unchanged Tree
-
-        T1 = TREE = 5
-        T2 = TREE = 5
-
-        change             = 0
-        semantic_t1        = 5
-        semantic_t2        = 5
-
-        change_valid       = True
-        semantic_valid_t1  = True
-        semantic_valid_t2  = True
-
-
-    Example 5: Unchanged but semantic classes are unknown
-
-        The dataset only tells us that this location is unchanged.
-
-        change             = 0
-        semantic_t1        = -1
-        semantic_t2        = -1
-
-        change_valid       = True
-        semantic_valid_t1  = False
-        semantic_valid_t2  = False
-
-
-    Example 6: Invalid / ignored location
-
-        change             = -100
-        semantic_t1        = -100
-        semantic_t2        = -100
-
-        change_valid       = False
-        semantic_valid_t1  = False
-        semantic_valid_t2  = False
-
-
-    Important:
-        UNKNOWN_CLASS_ID = -1 means:
-            "the semantic class exists, but this dataset does not provide it."
-
-        IGNORE_CLASS_ID = -100 means:
-            "this spatial location itself should not participate in training."
-
-        Therefore UNKNOWN and IGNORE are different concepts.
-    """
     change: torch.Tensor
     semantic_t1: torch.Tensor
     semantic_t2: torch.Tensor
@@ -235,10 +148,14 @@ def _long(x):
     return torch.as_tensor(np.asarray(x), dtype=torch.long)
 
 
-def _ignore_mask(x: torch.Tensor, ignore_value: Optional[int]):
-    if ignore_value is None:
-        return torch.zeros_like(x, dtype=torch.bool)
-    return x == int(ignore_value)
+def _validate_change_values(raw: torch.Tensor):
+    valid_values = (raw == 0) | (raw == 1) | (raw == IGNORE_CLASS_ID)
+    if not valid_values.all():
+        bad = torch.unique(raw[~valid_values]).cpu().tolist()
+        raise ValueError(
+            "PAIR-prepared change masks must use only "
+            f"0=unchanged, 1=changed, {IGNORE_CLASS_ID}=ignore; found {bad}"
+        )
 
 
 def build_canonical_target(
@@ -247,15 +164,16 @@ def build_canonical_target(
     semantic_t1=None,
     semantic_t2=None,
     change=None,
-    changed_value: int = 1,
-    unchanged_value: int = 0,
-    ignore_value: Optional[int] = 255,
 ) -> CanonicalChangeTarget:
-    """Convert heterogeneous source supervision to PAIR's common SCD form."""
+    """
+    Convert PAIR-standard supervision into the common semantic-change target.
 
-    mode = label_mode.lower().strip()
+    No dataset-specific raw-value mapping happens here. Public datasets should
+    be converted to PAIR's canonical 0/1/-100 convention during preparation.
+    """
+    mode = str(label_mode).lower().strip()
     if mode not in {"semantic_pair", "post_semantic", "binary"}:
-        raise ValueError(f"Unsupported generic label_mode: {label_mode}")
+        raise ValueError(f"Unsupported label_mode: {label_mode}")
 
     if mode == "semantic_pair":
         if semantic_t1 is None or semantic_t2 is None:
@@ -264,23 +182,28 @@ def build_canonical_target(
         s1 = _long(semantic_t1)
         s2 = _long(semantic_t2)
         if s1.shape != s2.shape:
-            raise ValueError("semantic_t1 and semantic_t2 must have the same shape")
+            raise ValueError(
+                f"semantic_t1 and semantic_t2 shapes differ: "
+                f"{tuple(s1.shape)} vs {tuple(s2.shape)}"
+            )
 
-        invalid = _ignore_mask(s1, ignore_value) | _ignore_mask(s2, ignore_value)
+        semantic_invalid = (s1 == IGNORE_CLASS_ID) | (s2 == IGNORE_CLASS_ID)
 
         if change is None:
             ch = (s1 != s2).long()
+            change_invalid = semantic_invalid.clone()
         else:
             raw = _long(change)
             if raw.shape != s1.shape:
                 raise ValueError("change mask must match semantic label shape")
-            ch = torch.full_like(raw, IGNORE_CLASS_ID)
-            ch[raw == unchanged_value] = 0
-            ch[raw == changed_value] = 1
-            invalid |= _ignore_mask(raw, ignore_value)
-            invalid |= ~((raw == unchanged_value) | (raw == changed_value))
+            _validate_change_values(raw)
+            ch = raw.clone()
+            change_invalid = raw == IGNORE_CLASS_ID
 
-        s1, s2, ch = s1.clone(), s2.clone(), ch.clone()
+        invalid = semantic_invalid | change_invalid
+        s1 = s1.clone()
+        s2 = s2.clone()
+        ch = ch.clone()
         s1[invalid] = IGNORE_CLASS_ID
         s2[invalid] = IGNORE_CLASS_ID
         ch[invalid] = IGNORE_CLASS_ID
@@ -295,25 +218,20 @@ def build_canonical_target(
         )
 
     if change is None:
-        raise ValueError(f"{mode} requires a change mask")
+        raise ValueError(f"{mode} requires change supervision")
 
     raw = _long(change)
-    invalid = _ignore_mask(raw, ignore_value)
-    known = (raw == unchanged_value) | (raw == changed_value)
-    invalid |= ~known
-
-    ch = torch.full_like(raw, IGNORE_CLASS_ID)
-    ch[raw == unchanged_value] = 0
-    ch[raw == changed_value] = 1
-    ch[invalid] = IGNORE_CLASS_ID
+    _validate_change_values(raw)
+    invalid = raw == IGNORE_CLASS_ID
+    ch = raw.clone()
 
     if mode == "binary":
-        # changed = Unknown -> Unknown; unchanged remains simply Unchanged.
         s1 = torch.full_like(raw, UNKNOWN_CLASS_ID)
         s2 = torch.full_like(raw, UNKNOWN_CLASS_ID)
         s1[invalid] = IGNORE_CLASS_ID
         s2[invalid] = IGNORE_CLASS_ID
         sem_valid = torch.zeros_like(raw, dtype=torch.bool)
+
         return CanonicalChangeTarget(
             change=ch,
             semantic_t1=s1,
@@ -323,7 +241,7 @@ def build_canonical_target(
             semantic_valid_t2=sem_valid.clone(),
         )
 
-    # post_semantic: Unknown -> B
+    # post_semantic = Unknown -> B
     if semantic_t2 is None:
         raise ValueError("post_semantic requires semantic_t2")
 
@@ -331,14 +249,14 @@ def build_canonical_target(
     if s2_src.shape != raw.shape:
         raise ValueError("semantic_t2 must match change mask shape")
 
-    sem2_invalid = _ignore_mask(s2_src, ignore_value)
+    sem2_invalid = s2_src == IGNORE_CLASS_ID
     s1 = torch.full_like(raw, UNKNOWN_CLASS_ID)
     s2 = s2_src.clone()
 
     sem2_valid = (~invalid) & (~sem2_invalid)
-    s2[~sem2_valid] = UNKNOWN_CLASS_ID
     s1[invalid] = IGNORE_CLASS_ID
     s2[invalid] = IGNORE_CLASS_ID
+    s2[(~invalid) & sem2_invalid] = UNKNOWN_CLASS_ID
 
     return CanonicalChangeTarget(
         change=ch,
@@ -351,9 +269,6 @@ def build_canonical_target(
 
 
 def build_default_prompt(spec: DatasetSpec) -> str:
-    if spec.prompt:
-        return spec.prompt
-
     text = (
         "Perform semantic change detection between Time 1 and Time 2. "
         "Identify unchanged and changed regions."
@@ -361,46 +276,46 @@ def build_default_prompt(spec: DatasetSpec) -> str:
 
     if spec.label_mode == "semantic_pair":
         text += (
-            " For changed regions, infer the semantic class "
-            "before and after change."
+            " For changed regions, infer the semantic class before and after change."
         )
-
     elif spec.label_mode == "post_semantic":
         text += (
-            " The pre-change semantic class may be unknown, "
-            "while the post-change class is supervised."
+            " The pre-change semantic class may be unknown, while the "
+            "post-change class is supervised."
         )
-
     elif spec.label_mode == "binary":
         text += (
-            " The source dataset only supervises change; "
-            "semantic classes before and after change are unknown."
+            " The source dataset supervises change only; semantic classes "
+            "before and after change may be unknown."
         )
 
     if spec.class_names:
         classes = ", ".join(
-            f"{class_id}: {class_name}"
-            for class_id, class_name in spec.class_names.items()
+            f"{raw_id}: {name}"
+            for raw_id, name in spec.class_names.items()
         )
-
-        text += (
-            " Valid semantic classes are: "
-            + classes
-            + "."
-        )
+        text += " Valid semantic classes are: " + classes + "."
 
     return text
 
 
+# -----------------------------------------------------------------------------
+# Generic file readers
+# -----------------------------------------------------------------------------
+
 def read_label_array(path: Union[str, Path]) -> torch.Tensor:
     path = Path(path)
-    if path.suffix.lower() == ".npy":
+    suffix = path.suffix.lower()
+
+    if suffix == ".npy":
         arr = np.load(path, allow_pickle=False)
-    elif path.suffix.lower() == ".npz":
+    elif suffix == ".npz":
         z = np.load(path, allow_pickle=False)
         keys = list(z.keys())
         if len(keys) != 1:
-            raise ValueError(f"{path} has multiple arrays {keys}; use a custom target_builder")
+            raise ValueError(
+                f"{path} has multiple arrays {keys}; prepare one label array per file"
+            )
         arr = z[keys[0]]
     else:
         arr = np.asarray(Image.open(path))
@@ -409,17 +324,17 @@ def read_label_array(path: Union[str, Path]) -> torch.Tensor:
         if arr.shape[-1] == 1:
             arr = arr[..., 0]
         else:
-            raise ValueError(f"Expected single-channel label, got {arr.shape}: {path}")
+            raise ValueError(
+                f"Expected a single-channel label, got {arr.shape}: {path}"
+            )
 
-    return torch.as_tensor(
-        np.array(arr, copy=True),
-        dtype=torch.long,
-    )
+    return torch.as_tensor(np.array(arr, copy=True), dtype=torch.long)
 
 
 def _read_geotiff(path: Path):
     if path.suffix.lower() not in {".tif", ".tiff"}:
         return None
+
     try:
         import rasterio
     except ImportError:
@@ -436,6 +351,7 @@ def _read_geotiff(path: Path):
             "gsd_x": abs(float(src.transform.a)),
             "gsd_y": abs(float(src.transform.e)),
         }
+
     return np.moveaxis(arr, 0, -1), meta
 
 
@@ -461,7 +377,6 @@ def read_image(path: Union[str, Path]):
     if arr.ndim == 2:
         arr = arr[..., None]
 
-    # Convert before losing integer dtype information.
     if np.issubdtype(arr.dtype, np.integer):
         denom = float(np.iinfo(arr.dtype).max)
         arr = arr.astype(np.float32) / denom
@@ -485,23 +400,12 @@ def same_geo_grid(meta1: Dict[str, Any], meta2: Dict[str, Any], atol=1e-7) -> bo
         return True
     if crs1 != crs2 or tr1 is None or tr2 is None:
         return False
+
     return (
         np.allclose(np.asarray(tr1), np.asarray(tr2), atol=atol, rtol=0.0)
         and meta1["width"] == meta2["width"]
         and meta1["height"] == meta2["height"]
     )
-
-
-def resize_image(image: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
-    return F.interpolate(
-        image[None], size=size_hw, mode="bilinear", align_corners=False
-    )[0]
-
-
-def resize_label(label: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
-    return F.interpolate(
-        label[None, None].float(), size=size_hw, mode="nearest"
-    )[0, 0].long()
 
 
 PointFeatureBuilder = Callable[[Dict[str, np.ndarray]], np.ndarray]
@@ -516,8 +420,12 @@ def _read_las(path: Path):
 
     las = laspy.read(path)
     attrs: Dict[str, Any] = {
-        "coord": np.stack([np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)], axis=1).astype(np.float32)
+        "coord": np.stack(
+            [np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)],
+            axis=1,
+        ).astype(np.float32)
     }
+
     available = set(las.point_format.dimension_names)
     for name in (
         "intensity", "red", "green", "blue", "nir", "classification",
@@ -531,11 +439,14 @@ def _read_las(path: Path):
         attrs["_crs"] = None if crs is None else str(crs)
     except Exception:
         attrs["_crs"] = None
+
     return attrs
 
 
 def read_point_cloud(
-    path: Union[str, Path], *, feature_builder: Optional[PointFeatureBuilder] = None
+    path: Union[str, Path],
+    *,
+    feature_builder: Optional[PointFeatureBuilder] = None,
 ) -> Dict[str, Any]:
     path = Path(path)
     suffix = path.suffix.lower()
@@ -544,7 +455,9 @@ def read_point_cloud(
     if suffix == ".npz":
         z = np.load(path, allow_pickle=False)
         if "coord" not in z or "feat" not in z:
-            raise ValueError(f"{path} must contain coord and feat")
+            raise ValueError(
+                f"{path} must contain arrays named 'coord' [N,3] and 'feat' [N,C]"
+            )
         coord = np.asarray(z["coord"], dtype=np.float32)
         feat = np.asarray(z["feat"], dtype=np.float32)
         if "crs" in z:
@@ -563,8 +476,8 @@ def read_point_cloud(
         crs = attrs.get("_crs")
         if feature_builder is None:
             raise ValueError(
-                "LAS/LAZ requires a dataset-specific feature_builder. "
-                "PAIR will not guess whether RGB/NIR/intensity/etc. are features."
+                "LAS/LAZ input requires a feature_builder. For the final PAIR "
+                "standard, prefer preparing point files as NPZ with coord+feat."
             )
         feat = np.asarray(feature_builder(attrs), dtype=np.float32)
 
@@ -572,9 +485,11 @@ def read_point_cloud(
         raise ValueError(f"Unsupported point-cloud format: {path}")
 
     if coord.ndim != 2 or coord.shape[1] != 3:
-        raise ValueError("coord must be [N,3]")
+        raise ValueError(f"coord must be [N,3], got {coord.shape}")
     if feat.ndim != 2 or feat.shape[0] != coord.shape[0]:
-        raise ValueError("feat must be [N,C] matching coord")
+        raise ValueError(
+            f"feat must be [N,C] matching coord, got coord={coord.shape}, feat={feat.shape}"
+        )
 
     return {
         "coord": torch.from_numpy(np.ascontiguousarray(coord)).float(),
@@ -599,21 +514,24 @@ def crop_points_xy(point_data: Dict[str, Any], bounds):
 
 
 def make_ptv3_dict(
-    point_data: Dict[str, Any], *, grid_size: float, shared_xyz_origin=None
+    point_data: Dict[str, Any],
+    *,
+    grid_size: float,
+    shared_xyz_origin=None,
 ) -> Dict[str, torch.Tensor]:
     if grid_size <= 0:
-        raise ValueError("point_grid_size must be > 0")
+        raise ValueError("point grid size must be > 0")
 
     coord = point_data["coord"].clone()
     if shared_xyz_origin is None:
-        shared_xyz_origin = tuple(float(v) for v in coord.amin(dim=0).tolist())
+        shared_xyz_origin = tuple(
+            float(v) for v in coord.amin(dim=0).tolist()
+        )
 
     origin = torch.tensor(
         shared_xyz_origin, dtype=coord.dtype, device=coord.device
     ).view(1, 3)
 
-    # Both time steps use the SAME metric origin. This is important for
-    # temporal voxel/grid correspondence and future 2D<->3D projection.
     coord = coord - origin
     grid_coord = torch.floor(coord / float(grid_size)).long()
 
@@ -624,6 +542,10 @@ def make_ptv3_dict(
         "batch": torch.zeros(coord.shape[0], dtype=torch.long),
     }
 
+
+# -----------------------------------------------------------------------------
+# Manifest / dataset
+# -----------------------------------------------------------------------------
 
 def load_jsonl(path: Union[str, Path]) -> List[Dict[str, Any]]:
     records = []
@@ -639,62 +561,24 @@ def load_jsonl(path: Union[str, Path]) -> List[Dict[str, Any]]:
     return records
 
 
-
 def resolve_dataset_path(
     path: Union[str, Path],
     dataset_root: Optional[Union[str, Path]],
 ) -> Path:
-    """
-    Resolve a manifest file path.
-
-    Canonical PAIR manifests store portable relative paths, e.g.:
-
-        images_t1/train_000001.png
-
-    When the dataset is created from:
-        <dataset_root>/manifests/train.jsonl
-
-    the loader automatically resolves those paths against <dataset_root>.
-    Absolute paths remain supported for backward compatibility.
-    """
     path = Path(path)
-
     if path.is_absolute():
         return path
-
     if dataset_root is None:
-        raise ValueError(
-            f"Relative path {path} requires dataset_root."
-        )
-
-    return (
-        Path(dataset_root)
-        .expanduser()
-        .resolve()
-        / path
-    )
+        raise ValueError(f"Relative path {path} requires dataset_root")
+    return Path(dataset_root).expanduser().resolve() / path
 
 
 class UnifiedPAIRDataset(Dataset):
     """
-    Manifest-driven PAIR dataset.
+    Manifest-driven reader for an already prepared PAIR-standard dataset.
 
-    Standard record keys
-    --------------------
-    2D:   image_t1, image_t2
-    3D:   point_t1, point_t2
-    2D3D: all four
-
-    Optional common spatial key:
-        bounds = [xmin, ymin, xmax, ymax]
-
-    Generic label keys:
-        semantic_pair: semantic_t1, semantic_t2, optional change
-        post_semantic: change, semantic_t2
-        binary:        change
-
-    Irregular 3D labels/non-corresponding point sets can use label_mode=custom
-    with a small dataset-specific target_builder.
+    The directory layout decides route and supervision; manifest records only
+    map sample IDs to concrete files.
     """
 
     def __init__(
@@ -711,69 +595,61 @@ class UnifiedPAIRDataset(Dataset):
         self.dataset_root = None
 
         if isinstance(records, (str, Path)):
-            self.manifest_path = (
-                Path(records)
-                .expanduser()
-                .resolve()
-            )
-
-            # Canonical layout:
-            # <dataset_root>/manifests/train.jsonl
-            self.dataset_root = (
-                self.manifest_path
-                .parent
-                .parent
-            )
-
-            self.records = load_jsonl(
-                self.manifest_path
-            )
+            self.manifest_path = Path(records).expanduser().resolve()
+            self.dataset_root = self.manifest_path.parent.parent
+            self.records = load_jsonl(self.manifest_path)
         else:
             self.records = list(records)
 
         self.spec = spec
+        self.route = spec.route
         self.point_feature_builder = point_feature_builder
         self.target_builder = target_builder
-        self.task_mode = spec.task_mode.lower().strip()
-
-        if self.task_mode not in {"2d", "3d", "2d3d"}:
-            raise ValueError("task_mode must be 2d, 3d, or 2d3d")
-        if spec.label_mode == "custom" and target_builder is None:
-            raise ValueError("label_mode=custom requires target_builder")
-
         self.prompt = build_default_prompt(spec)
+
+        if not self.records:
+            raise ValueError(
+                f"Dataset {spec.name} contains no records: {self.manifest_path}"
+            )
 
     def __len__(self):
         return len(self.records)
 
     def _path(self, value: Union[str, Path]) -> Path:
-        return resolve_dataset_path(
-            value,
-            self.dataset_root,
-        )
+        return resolve_dataset_path(value, self.dataset_root)
 
     def _load_2d(self, record):
         im1, geo1 = read_image(self._path(record["image_t1"]))
         im2, geo2 = read_image(self._path(record["image_t2"]))
 
-        if self.spec.strict_geo_alignment and not same_geo_grid(geo1, geo2):
+        # PAIR-standard data must already be temporally aligned.
+        if not same_geo_grid(geo1, geo2):
             raise ValueError(
-                "T1/T2 rasters are not on one geospatial grid. Reproject them "
-                "to a common CRS/GSD/affine grid before PAIR training."
+                "T1/T2 rasters are not on one geospatial grid. "
+                "PAIR data preparation must align CRS/GSD/affine first."
+            )
+        if im1.shape[-2:] != im2.shape[-2:]:
+            raise ValueError(
+                f"T1/T2 image sizes differ: {tuple(im1.shape[-2:])} vs "
+                f"{tuple(im2.shape[-2:])}. Prepare aligned pairs before training."
             )
 
-        if im1.shape[-2:] != im2.shape[-2:] and self.spec.image_size is None:
-            raise ValueError("T1/T2 image sizes differ; align or set a paired image_size")
-
-        if self.spec.image_size is not None:
-            im1 = resize_image(im1, self.spec.image_size)
-            im2 = resize_image(im2, self.spec.image_size)
-
-        return {"images_t1": im1, "images_t2": im2, "geo_t1": geo1, "geo_t2": geo2}
+        return {
+            "images_t1": im1,
+            "images_t2": im2,
+            "geo_t1": geo1,
+            "geo_t2": geo2,
+        }
 
     def _load_3d(self, record):
-        p1 = read_point_cloud(self._path(record["point_t1"]), feature_builder=self.point_feature_builder)
-        p2 = read_point_cloud(self._path(record["point_t2"]), feature_builder=self.point_feature_builder)
+        p1 = read_point_cloud(
+            self._path(record["point_t1"]),
+            feature_builder=self.point_feature_builder,
+        )
+        p2 = read_point_cloud(
+            self._path(record["point_t2"]),
+            feature_builder=self.point_feature_builder,
+        )
 
         bounds = record.get("bounds")
         if bounds is not None:
@@ -781,30 +657,38 @@ class UnifiedPAIRDataset(Dataset):
                 raise ValueError("bounds must be [xmin,ymin,xmax,ymax]")
             p1 = crop_points_xy(p1, bounds)
             p2 = crop_points_xy(p2, bounds)
+
         if p1["coord"].shape[0] == 0 or p2["coord"].shape[0] == 0:
             raise ValueError("Empty T1/T2 point cloud after common spatial crop")
 
-        # Shared XYZ origin for both time steps. If a common tile bound exists,
-        # use its XY origin and the common minimum Z. Otherwise use the common
-        # XYZ minimum of the two clouds.
         common_z0 = min(
             float(p1["coord"][:, 2].min().item()),
             float(p2["coord"][:, 2].min().item()),
         )
+
         if bounds is not None:
-            shared_xyz_origin = (float(bounds[0]), float(bounds[1]), common_z0)
+            shared_xyz_origin = (
+                float(bounds[0]), float(bounds[1]), common_z0
+            )
         else:
             common_min = torch.minimum(
-                p1["coord"].amin(dim=0), p2["coord"].amin(dim=0)
+                p1["coord"].amin(dim=0),
+                p2["coord"].amin(dim=0),
             )
-            shared_xyz_origin = tuple(float(v) for v in common_min.tolist())
+            shared_xyz_origin = tuple(
+                float(v) for v in common_min.tolist()
+            )
 
         return {
             "point_dict_t1": make_ptv3_dict(
-                p1, grid_size=self.spec.point_grid_size, shared_xyz_origin=shared_xyz_origin
+                p1,
+                grid_size=self.spec.point_grid_size,
+                shared_xyz_origin=shared_xyz_origin,
             ),
             "point_dict_t2": make_ptv3_dict(
-                p2, grid_size=self.spec.point_grid_size, shared_xyz_origin=shared_xyz_origin
+                p2,
+                grid_size=self.spec.point_grid_size,
+                shared_xyz_origin=shared_xyz_origin,
             ),
             "point_crs_t1": p1.get("crs"),
             "point_crs_t2": p2.get("crs"),
@@ -812,29 +696,28 @@ class UnifiedPAIRDataset(Dataset):
             "shared_xyz_origin": shared_xyz_origin,
         }
 
-    def _load_targets(self, record, raster_size=None):
-        if self.spec.label_mode == "custom":
+    def _load_targets(self, record):
+        if self.target_builder is not None:
             return self.target_builder(record, self.spec)
 
-        s1 = read_label_array(self._path(record["semantic_t1"])) if "semantic_t1" in record else None
-        s2 = read_label_array(self._path(record["semantic_t2"])) if "semantic_t2" in record else None
-        ch = read_label_array(self._path(record["change"])) if "change" in record else None
-
-        if raster_size is not None:
-            def fit(x):
-                if x is None or tuple(x.shape[-2:]) == tuple(raster_size):
-                    return x
-                return resize_label(x, raster_size)
-            s1, s2, ch = fit(s1), fit(s2), fit(ch)
+        s1 = (
+            read_label_array(self._path(record["semantic_t1"]))
+            if "semantic_t1" in record else None
+        )
+        s2 = (
+            read_label_array(self._path(record["semantic_t2"]))
+            if "semantic_t2" in record else None
+        )
+        ch = (
+            read_label_array(self._path(record["change"]))
+            if "change" in record else None
+        )
 
         target = build_canonical_target(
             label_mode=self.spec.label_mode,
             semantic_t1=s1,
             semantic_t2=s2,
             change=ch,
-            changed_value=self.spec.changed_value,
-            unchanged_value=self.spec.unchanged_value,
-            ignore_value=self.spec.ignore_value,
         )
 
         return {
@@ -848,47 +731,53 @@ class UnifiedPAIRDataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
+
         sample: Dict[str, Any] = {
             "sample_id": record.get("id", str(index)),
             "dataset_name": self.spec.name,
-            "task_mode": self.task_mode,
+            "route": self.route,
+            # Internal backward-compatible alias. Users no longer configure it.
+            "task_mode": self.route,
             "prompt": self.prompt,
-            "class_names": list(self.spec.class_names or []),
+            "class_names": dict(self.spec.class_names),
         }
 
-        raster_size = None
-        if self.task_mode in {"2d", "2d3d"}:
-            d2 = self._load_2d(record)
-            sample.update(d2)
-            raster_size = tuple(d2["images_t1"].shape[-2:])
+        if self.spec.has_image:
+            sample.update(self._load_2d(record))
 
-        if self.task_mode in {"3d", "2d3d"}:
+        if self.spec.has_point:
             sample.update(self._load_3d(record))
 
-        if self.spec.label_mode == "custom" or any(
-            k in record for k in ("semantic_t1", "semantic_t2", "change")
-        ):
-            sample["target"] = self._load_targets(
-                record,
-                raster_size=raster_size if self.task_mode in {"2d", "2d3d"} else None,
+        sample["target"] = self._load_targets(record)
+
+        # Prepared raster labels must already match the raster topology.
+        if self.spec.has_image:
+            h, w = sample["images_t1"].shape[-2:]
+            for key in ("change", "semantic_t1", "semantic_t2"):
+                target = sample["target"][key]
+                if target.ndim >= 2 and tuple(target.shape[-2:]) != (h, w):
+                    raise ValueError(
+                        f"{self.spec.name}/{sample['sample_id']}: {key} shape "
+                        f"{tuple(target.shape)} does not match image {(h, w)}"
+                    )
+
+        if self.route == "2d3d":
+            raster_crs = (
+                sample["geo_t1"].get("crs")
+                if sample.get("geo_t1") is not None else None
             )
-
-        if self.task_mode == "2d3d":
-            raster_crs = None
-            if sample.get("geo_t1") is not None:
-                raster_crs = sample["geo_t1"].get("crs")
-            point_crs1 = sample.get("point_crs_t1")
-            point_crs2 = sample.get("point_crs_t2")
-
-            # When CRS metadata exists, do not silently fuse incompatible
-            # coordinate systems. Missing CRS is allowed for already prepared
-            # local benchmark data, but then alignment responsibility belongs
-            # to the dataset-specific adapter.
-            known_crs = [c for c in (raster_crs, point_crs1, point_crs2) if c]
+            known_crs = [
+                c for c in (
+                    raster_crs,
+                    sample.get("point_crs_t1"),
+                    sample.get("point_crs_t2"),
+                )
+                if c
+            ]
             if known_crs and any(c != known_crs[0] for c in known_crs[1:]):
                 raise ValueError(
-                    "2D+3D sample contains mismatched CRS metadata. Reproject "
-                    "imagery and point clouds to one common CRS before training."
+                    "2D+3D sample contains mismatched CRS metadata. "
+                    "Prepare all modalities in one CRS before training."
                 )
 
         sample["spatial_meta"] = {
@@ -904,29 +793,37 @@ class UnifiedPAIRDataset(Dataset):
 
 
 def _self_test():
-    # Full A->B
     s1 = torch.tensor([[0, 1], [2, 3]])
     s2 = torch.tensor([[0, 4], [2, 5]])
     out = build_canonical_target(
-        label_mode="semantic_pair", semantic_t1=s1, semantic_t2=s2, ignore_value=None
+        label_mode="semantic_pair",
+        semantic_t1=s1,
+        semantic_t2=s2,
     )
     assert torch.equal(out.change, torch.tensor([[0, 1], [0, 1]]))
 
-    # Unknown->B
     ch = torch.tensor([[0, 1], [1, 0]])
     out = build_canonical_target(
-        label_mode="post_semantic", change=ch, semantic_t2=s2, ignore_value=None
+        label_mode="post_semantic",
+        change=ch,
+        semantic_t2=s2,
     )
     assert (out.semantic_t1 == UNKNOWN_CLASS_ID).all()
 
-    # Unknown->Unknown
-    out = build_canonical_target(label_mode="binary", change=ch, ignore_value=None)
+    out = build_canonical_target(
+        label_mode="binary",
+        change=ch,
+    )
     assert (out.semantic_t1 == UNKNOWN_CLASS_ID).all()
-    assert (out.semantic_t2 == UNKNOWN_CLASS_ID).all()
-    assert not out.semantic_valid_t1.any()
-    assert not out.semantic_valid_t2.any()
 
-    print("pair_dataset.py canonical target self-test: PASS")
+    assert infer_unchanged_raw_id(
+        {0: "unchanged", 1: "building"}
+    ) == 0
+    assert infer_unchanged_raw_id(
+        {0: "background", 1: "building"}
+    ) is None
+
+    print("pair_dataset.py self-test: PASS")
 
 
 if __name__ == "__main__":
