@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from collections import Counter
 import json
 import math
 import os
 import random
+import re
 import time
 from pathlib import Path
 
@@ -36,6 +38,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+from tqdm.auto import tqdm
 
 from datasets.config_loader import ExperimentConfig, load_experiment_config
 from datasets.multi_dataset import DatasetRegistry, MultiDatasetScheduler
@@ -120,7 +123,6 @@ def build_settings(experiment: ExperimentConfig, cli):
         change_threshold=float(v.get("change_threshold", 0.5)),
         val_every_epochs=int(v.get("every_epochs", 1)),
         val_max_samples=int(v.get("max_samples", 0)),
-        best_metric=str(v.get("best_metric", "macro/scd/F_scd")),
         log_every=int(lg.get("log_every", 20)),
         save_every_epochs=int(lg.get("save_every_epochs", 1)),
         output_dir=Path(output_dir),
@@ -512,26 +514,26 @@ def save_checkpoint(
     path, model, optimizer, scheduler,
     epoch, update_in_epoch, optimizer_step,
     settings, experiment, resolved_config,
-    best_metric, best_value,
+    dataset_best_values=None,
+    dataset_best_epochs=None,
+    validation_selection=None,
+    validation_metrics=None,
 ):
     base = unwrap(model)
     checkpoint = {
         "epoch": int(epoch),
         "update_in_epoch": int(update_in_epoch),
         "optimizer_step": int(optimizer_step),
-
         "decoder": base.decoder.state_dict(),
         "image_adapter": base.image_adapter.state_dict(),
         "lora": lora_state_dict(base.pair.qwen_backbone.model),
         "pair_trainable": non_qwen_pair_state(model),
-
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-
-        "best_metric": best_metric,
-        "best_value": best_value,
-
-        # Full self-describing training configuration.
+        "dataset_best_values": dict(dataset_best_values or {}),
+        "dataset_best_epochs": dict(dataset_best_epochs or {}),
+        "validation_selection": validation_selection,
+        "validation_metrics": validation_metrics,
         "config": resolved_config,
         "config_hash": experiment.hash_resolved(resolved_config),
         "selected_datasets": list(experiment.selected_names),
@@ -546,20 +548,107 @@ def load_checkpoint(path, model, optimizer, scheduler):
     base.decoder.load_state_dict(ckpt["decoder"])
     base.image_adapter.load_state_dict(ckpt["image_adapter"])
     load_lora_state_dict(base.pair.qwen_backbone.model, ckpt.get("lora", {}))
-
     pair_state = ckpt.get("pair_trainable", {})
     if pair_state:
         state = base.pair.state_dict()
         state.update(pair_state)
         base.pair.load_state_dict(state, strict=False)
-
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return (
-        int(ckpt.get("epoch", 0)), int(ckpt.get("update_in_epoch", 0)),
+        int(ckpt.get("epoch", 0)),
+        int(ckpt.get("update_in_epoch", 0)),
         int(ckpt.get("optimizer_step", 0)),
-        ckpt.get("best_metric"), ckpt.get("best_value"),
+        {str(k): float(v) for k, v in ckpt.get("dataset_best_values", {}).items()},
+        {str(k): int(v) for k, v in ckpt.get("dataset_best_epochs", {}).items()},
     )
+
+
+def selection_metric_for_spec(spec):
+    """Automatic per-dataset ValBest metric selection."""
+    route = str(spec.route)
+    label_mode = str(spec.label_mode)
+
+    if route == "2d" and label_mode == "semantic_pair":
+        return "scd/F_scd", "Fscd"
+    if route in {"3d", "2d3d"} and label_mode == "semantic_pair":
+        return "semantic/mIoU", "mIoU"
+    if label_mode in {"binary", "post_semantic"}:
+        return "change/IoU", "IoU"
+
+    raise ValueError(
+        f"No checkpoint selection rule for route={route!r}, "
+        f"label_mode={label_mode!r}"
+    )
+
+
+def selection_from_results(experiment, results_by_dataset):
+    selection = {}
+    for name in experiment.selected_names:
+        if name not in results_by_dataset:
+            continue
+        spec = experiment.datasets[name].spec
+        metric_key, metric_label = selection_metric_for_spec(spec)
+        scalars = results_by_dataset[name]["scalars"]
+        if metric_key not in scalars:
+            raise KeyError(
+                f"{name}: required validation metric {metric_key!r} missing; "
+                f"available={sorted(scalars)}"
+            )
+        selection[name] = {
+            "metric_key": metric_key,
+            "metric_label": metric_label,
+            "value": float(scalars[metric_key]),
+        }
+    return selection
+
+
+def safe_checkpoint_token(value):
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
+    value = value.strip("-_.")
+    return value or "Dataset"
+
+
+def epoch_checkpoint_name(epoch, experiment, selection):
+    parts = [f"Ep{int(epoch):03d}"]
+    for name in experiment.selected_names:
+        item = selection.get(name)
+        if item is None:
+            continue
+        parts.append(
+            f"{safe_checkpoint_token(name)}"
+            f"{item['metric_label']}{item['value']:.4f}"
+        )
+    if len(parts) == 1:
+        parts.append("NoVal")
+    return "_".join(parts) + ".pt"
+
+
+def valbest_checkpoint_name(dataset_name, epoch_name):
+    return f"ValBest_{safe_checkpoint_token(dataset_name)}_{epoch_name}"
+
+
+def remove_old_current_checkpoints(output_dir, keep_path):
+    keep_path = Path(keep_path).resolve()
+    removed = []
+    for path in Path(output_dir).glob("Ep*.pt"):
+        if path.resolve() == keep_path:
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(path.name)
+    return removed
+
+
+def replace_dataset_valbest(output_dir, dataset_name, keep_path):
+    keep_path = Path(keep_path).resolve()
+    prefix = f"ValBest_{safe_checkpoint_token(dataset_name)}_"
+    removed = []
+    for path in Path(output_dir).glob(f"{prefix}*.pt"):
+        if path.resolve() == keep_path:
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(path.name)
+    return removed
 
 
 # =============================================================================
@@ -607,7 +696,15 @@ def validate(model, criterion, loader, spec, runtime, args):
     sums, count = {}, 0
     start = time.time()
 
-    for samples in loader:
+    progress = tqdm(
+        loader,
+        total=len(loader),
+        desc=f"VAL {spec.name}",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not runtime["is_main"],
+    )
+    for samples in progress:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec)
 
@@ -616,6 +713,8 @@ def validate(model, criterion, loader, spec, runtime, args):
         for key, value in loss_output.as_dict().items():
             sums[key] = sums.get(key, 0.0) + float(value.detach().cpu()) * batch_n
         count += batch_n
+        if runtime["is_main"]:
+            progress.set_postfix(samples=count, refresh=False)
 
         if args.val_max_samples > 0 and count >= args.val_max_samples:
             break
@@ -758,20 +857,27 @@ def main():
         start_epoch = 0
         start_update_in_epoch = 0
         optimizer_step = 0
-        best_metric = settings.best_metric
-        best_value = -float("inf")
+        dataset_best_values = {
+            name: -float("inf")
+            for name in experiment.selected_names
+        }
+        dataset_best_epochs = {
+            name: 0
+            for name in experiment.selected_names
+        }
 
         if settings.resume is not None:
             (
-                start_epoch, start_update_in_epoch, optimizer_step,
-                old_metric, old_value,
+                start_epoch,
+                start_update_in_epoch,
+                optimizer_step,
+                loaded_best_values,
+                loaded_best_epochs,
             ) = load_checkpoint(
                 settings.resume, model, optimizer, scheduler
             )
-            if old_metric is not None:
-                best_metric = old_metric
-            if old_value is not None:
-                best_value = float(old_value)
+            dataset_best_values.update(loaded_best_values)
+            dataset_best_epochs.update(loaded_best_epochs)
 
         # Runtime-resolved config is deliberately separate from the source JSON.
         dataset_runtime = registry.runtime_summary(settings.grad_accum)
@@ -848,6 +954,8 @@ def main():
         val_json = settings.output_dir / "val_log.jsonl"
         model.train()
 
+        log_window_dataset_counts = Counter()
+
         for epoch in range(start_epoch, settings.epochs):
             registry.reset_epoch(epoch)
             schedule = dataset_scheduler.epoch_schedule(
@@ -921,6 +1029,7 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer_step += 1
+                log_window_dataset_counts[dataset_name] += 1
 
                 means = {
                     key: value / accumulation_steps
@@ -955,26 +1064,32 @@ def main():
                     "lr_lora": lrs.get("lora", 0.0),
                 }
 
-                if runtime["is_main"] and (
-                    optimizer_step % settings.log_every == 0
-                ):
-                    print(
-                        f"E{epoch+1:03d} U{optimizer_step:06d} "
-                        f"[{dataset_name} x{accumulation_steps}] | "
-                        f"loss={means['loss']:.4f} "
-                        f"sem1={means['loss_semantic_t1']:.4f} "
-                        f"sem2={means['loss_semantic_t2']:.4f} "
-                        f"bce={means['loss_change_bce']:.4f} "
-                        f"dice={means['loss_change_dice']:.4f} | "
-                        f"grad={grad_norm:.3f} "
-                        f"lr={lrs.get('pair', 0):.2e}/"
-                        f"{lrs.get('lora', 0):.2e} | "
-                        f"{update_log['samples_per_sec']:.2f} sample/s"
-                    )
-                    write_jsonl(train_json, update_log)
-                    log_tensorboard_train(
-                        writer, update_log, optimizer_step, dataset_name
-                    )
+                if optimizer_step % settings.log_every == 0:
+                    if runtime["is_main"]:
+                        mix = " ".join(
+                            f"{name} x{log_window_dataset_counts[name]}"
+                            for name in experiment.selected_names
+                            if log_window_dataset_counts[name] > 0
+                        )
+                        print(
+                            f"E{epoch+1:03d} U{optimizer_step:06d} "
+                            f"[{mix}] | current={dataset_name} "
+                            f"accu={accumulation_steps} | "
+                            f"loss={means['loss']:.4f} "
+                            f"sem1={means['loss_semantic_t1']:.4f} "
+                            f"sem2={means['loss_semantic_t2']:.4f} "
+                            f"bce={means['loss_change_bce']:.4f} "
+                            f"dice={means['loss_change_dice']:.4f} | "
+                            f"grad={grad_norm:.3f} "
+                            f"lr={lrs.get('pair', 0):.2e}/"
+                            f"{lrs.get('lora', 0):.2e} | "
+                            f"{update_log['samples_per_sec']:.2f} sample/s"
+                        )
+                        write_jsonl(train_json, update_log)
+                        log_tensorboard_train(
+                            writer, update_log, optimizer_step, dataset_name
+                        )
+                    log_window_dataset_counts.clear()
 
             start_update_in_epoch = 0
 
@@ -988,9 +1103,11 @@ def main():
                 )
 
             # ----------------------------------------------------------
-            # Validation: each dataset owns an independent metric space.
+            # Validation: each dataset owns its own metric and ValBest.
             # ----------------------------------------------------------
             results_by_dataset = {}
+            selection = {}
+
             if (epoch + 1) % settings.val_every_epochs == 0:
                 if runtime["distributed"]:
                     dist.barrier()
@@ -1015,10 +1132,12 @@ def main():
                         )
 
                 macro = compute_macro_metrics(results_by_dataset)
+                selection = selection_from_results(
+                    experiment, results_by_dataset
+                )
 
                 if runtime["is_main"] and results_by_dataset:
                     log_tensorboard_macro(writer, macro, optimizer_step)
-
                     record = {
                         "epoch": epoch + 1,
                         "optimizer_step": optimizer_step,
@@ -1027,6 +1146,7 @@ def main():
                                 "seconds": result["seconds"],
                                 "losses": result["losses"],
                                 "metrics": result["scalars"],
+                                "selection": selection.get(name),
                                 "per_class": result["per_class"],
                                 "confusion": {
                                     key: value.tolist()
@@ -1040,67 +1160,117 @@ def main():
                     }
                     write_jsonl(val_json, record)
 
-                    metric_value = macro.get(best_metric)
-                    if metric_value is None:
-                        # Also allow explicit dataset metric paths such as
-                        # SECOND/scd/F_scd.
-                        if "/" in best_metric:
-                            prefix, _, metric_key = best_metric.partition("/")
-                            if prefix in results_by_dataset:
-                                metric_value = results_by_dataset[
-                                    prefix
-                                ]["scalars"].get(metric_key)
+                    improved = []
+                    for dataset_name, item in selection.items():
+                        value = float(item["value"])
+                        if value > dataset_best_values.get(
+                            dataset_name, -float("inf")
+                        ):
+                            dataset_best_values[dataset_name] = value
+                            dataset_best_epochs[dataset_name] = epoch + 1
+                            improved.append(dataset_name)
 
-                    if metric_value is None:
-                        metric_value = macro.get(
-                            "macro/change/F1", -float("inf")
+                    epoch_name = epoch_checkpoint_name(
+                        epoch + 1, experiment, selection
+                    )
+                    full_validation_metrics = {
+                        name: result["scalars"]
+                        for name, result in results_by_dataset.items()
+                    }
+
+                    for dataset_name in improved:
+                        best_path = (
+                            settings.output_dir
+                            / valbest_checkpoint_name(dataset_name, epoch_name)
                         )
-
-                    if metric_value > best_value:
-                        best_value = float(metric_value)
                         save_checkpoint(
-                            settings.output_dir / "best.pt",
+                            best_path,
                             model, optimizer, scheduler,
                             epoch + 1, 0, optimizer_step,
                             settings, experiment, resolved_config,
-                            best_metric, best_value,
+                            dataset_best_values=dataset_best_values,
+                            dataset_best_epochs=dataset_best_epochs,
+                            validation_selection=selection,
+                            validation_metrics=full_validation_metrics,
                         )
+                        removed = replace_dataset_valbest(
+                            settings.output_dir, dataset_name, best_path
+                        )
+                        item = selection[dataset_name]
                         print(
-                            f"Best checkpoint: "
-                            f"{best_metric}={best_value:.6f}"
+                            f"ValBest [{dataset_name}] "
+                            f"{item['metric_label']}={item['value']:.4f} "
+                            f"@ Ep{epoch+1:03d}"
                         )
+                        for old_name in removed:
+                            print(f"  removed old ValBest: {old_name}")
 
                 if runtime["distributed"]:
                     dist.barrier()
 
-            if (
-                runtime["is_main"]
-                and (epoch + 1) % settings.save_every_epochs == 0
-            ):
-                save_checkpoint(
-                    settings.output_dir / f"epoch_{epoch+1:03d}.pt",
-                    model, optimizer, scheduler,
-                    epoch + 1, 0, optimizer_step,
-                    settings, experiment, resolved_config,
-                    best_metric, best_value,
-                )
+            # ----------------------------------------------------------
+            # Current/resume checkpoint.
+            # No last.pt. Only one ordinary EpXXX_*.pt checkpoint is kept.
+            # ----------------------------------------------------------
+            save_current = (
+                (epoch + 1) % settings.save_every_epochs == 0
+                or (epoch + 1) == settings.epochs
+            )
 
-            if runtime["is_main"]:
+            if runtime["is_main"] and save_current:
+                current_name = epoch_checkpoint_name(
+                    epoch + 1, experiment, selection
+                )
+                current_path = settings.output_dir / current_name
+                full_validation_metrics = {
+                    name: result["scalars"]
+                    for name, result in results_by_dataset.items()
+                }
+
                 save_checkpoint(
-                    settings.output_dir / "last.pt",
+                    current_path,
                     model, optimizer, scheduler,
                     epoch + 1, 0, optimizer_step,
                     settings, experiment, resolved_config,
-                    best_metric, best_value,
+                    dataset_best_values=dataset_best_values,
+                    dataset_best_epochs=dataset_best_epochs,
+                    validation_selection=selection,
+                    validation_metrics=full_validation_metrics,
                 )
-                if writer is not None:
-                    writer.flush()
+                removed = remove_old_current_checkpoints(
+                    settings.output_dir, current_path
+                )
+                print(f"Current checkpoint: {current_name}")
+                for old_name in removed:
+                    print(f"  removed old current: {old_name}")
+
+            if runtime["is_main"] and writer is not None:
+                writer.flush()
 
         if runtime["is_main"]:
-            print(
-                f"Training complete. Best "
-                f"{best_metric}={best_value:.6f}"
-            )
+            print("Training complete.")
+            for dataset_name in experiment.selected_names:
+                handle = registry.handles[dataset_name]
+                if handle.val_loader is None:
+                    continue
+                metric_key, metric_label = selection_metric_for_spec(
+                    handle.config.spec
+                )
+                best_value = dataset_best_values.get(
+                    dataset_name, -float("inf")
+                )
+                best_epoch = dataset_best_epochs.get(dataset_name, 0)
+                if best_epoch > 0:
+                    print(
+                        f"  {dataset_name}: ValBest "
+                        f"{metric_label}={best_value:.4f} "
+                        f"@ Ep{best_epoch:03d}"
+                    )
+                else:
+                    print(
+                        f"  {dataset_name}: no validation best recorded "
+                        f"({metric_key})"
+                    )
 
     finally:
         if writer is not None:
