@@ -33,6 +33,7 @@ import json
 
 from datasets.pair_dataset import (
     DatasetSpec,
+    infer_binary_class_ids,
     infer_unchanged_raw_id,
     route_from_modalities,
 )
@@ -308,6 +309,11 @@ def _dataset_from_json(
         data.get("class_names"), name
     )
     unchanged_raw_id = infer_unchanged_raw_id(class_names)
+
+    # For binary datasets, raw label semantics are fully declared by class_names.
+    # Example: {0: "unchanged", 255: "changed"}. Nothing extra is stored.
+    if schema["label_mode"] == "binary":
+        infer_binary_class_ids(class_names)
 
     batch = int(data.get("per_gpu_batch_size", 1))
     if batch <= 0:

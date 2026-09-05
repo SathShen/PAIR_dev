@@ -39,14 +39,19 @@ Supervision is inferred from directories:
     change + semantic_t2       -> post_semantic
     change                     -> binary
 
-Canonical labels:
+Canonical labels inside PAIR:
     change      : 0 unchanged, 1 changed, -100 ignore
     semantic    : raw dataset class ID, -100 ignore
     UNKNOWN=-1  : internal only, meaning semantic class is not supervised
 
+For binary datasets, physical change-mask values are inferred from class_names.
+Example:
+    {"0": "unchanged", "255": "changed"}
+means disk labels 0/255 are mapped internally to 0/1.
+
 The training JSON does not repeat modality, manifest path, label mode, image
 size, changed/unchanged values, ignore values, alignment policy, or prompt.
-Those are either inferred from the prepared directory or fixed PAIR protocol.
+Those are inferred from the directory, class_names, or fixed internal protocol.
 """
 
 from __future__ import annotations
@@ -91,6 +96,46 @@ def infer_unchanged_raw_id(class_names: Dict[int, str]) -> Optional[int]:
             "Use one explicit unchanged/no-change class name."
         )
     return matches[0] if matches else None
+
+
+def infer_binary_class_ids(class_names: Dict[int, str]) -> Tuple[int, int]:
+    """
+    Infer physical unchanged/changed raw IDs from class_names.
+
+    No changed_raw_id field is stored in DatasetSpec.
+
+    Examples:
+        {0: "unchanged", 255: "changed"} -> (0, 255)
+        {0: "unchanged", 1: "changed"}   -> (0, 1)
+    """
+    unchanged_aliases = {"unchanged", "no change", "non change"}
+    changed_aliases = {"changed", "change"}
+
+    unchanged = [
+        int(raw_id)
+        for raw_id, name in class_names.items()
+        if normalize_class_name(name) in unchanged_aliases
+    ]
+    changed = [
+        int(raw_id)
+        for raw_id, name in class_names.items()
+        if normalize_class_name(name) in changed_aliases
+    ]
+
+    if len(unchanged) != 1:
+        raise ValueError(
+            "Binary class_names must contain exactly one unchanged/no-change "
+            f"class; found raw IDs {unchanged}."
+        )
+    if len(changed) != 1:
+        raise ValueError(
+            "Binary class_names must contain exactly one changed/change "
+            f"class; found raw IDs {changed}."
+        )
+    if unchanged[0] == changed[0]:
+        raise ValueError("Binary unchanged and changed raw IDs must differ.")
+
+    return unchanged[0], changed[0]
 
 
 def route_from_modalities(modalities: Sequence[str]) -> str:
@@ -148,14 +193,42 @@ def _long(x):
     return torch.as_tensor(np.asarray(x), dtype=torch.long)
 
 
-def _validate_change_values(raw: torch.Tensor):
+def _validate_canonical_change_values(raw: torch.Tensor):
     valid_values = (raw == 0) | (raw == 1) | (raw == IGNORE_CLASS_ID)
     if not valid_values.all():
         bad = torch.unique(raw[~valid_values]).cpu().tolist()
         raise ValueError(
-            "PAIR-prepared change masks must use only "
+            "Canonical PAIR change targets must use only "
             f"0=unchanged, 1=changed, {IGNORE_CLASS_ID}=ignore; found {bad}"
         )
+
+
+def _normalize_binary_change_values(
+    raw: torch.Tensor,
+    class_names: Dict[int, str],
+) -> torch.Tensor:
+    """
+    Convert physical binary labels to PAIR internal 0/1 using class_names.
+    """
+    unchanged_raw_id, changed_raw_id = infer_binary_class_ids(class_names)
+
+    valid_values = (
+        (raw == unchanged_raw_id)
+        | (raw == changed_raw_id)
+        | (raw == IGNORE_CLASS_ID)
+    )
+    if not valid_values.all():
+        bad = torch.unique(raw[~valid_values]).cpu().tolist()
+        raise ValueError(
+            f"Binary change target contains undeclared raw IDs {bad}; "
+            f"class_names declares unchanged={unchanged_raw_id}, "
+            f"changed={changed_raw_id}."
+        )
+
+    out = torch.full_like(raw, IGNORE_CLASS_ID)
+    out[raw == unchanged_raw_id] = 0
+    out[raw == changed_raw_id] = 1
+    return out
 
 
 def build_canonical_target(
@@ -164,6 +237,7 @@ def build_canonical_target(
     semantic_t1=None,
     semantic_t2=None,
     change=None,
+    class_names: Optional[Dict[int, str]] = None,
 ) -> CanonicalChangeTarget:
     """
     Convert PAIR-standard supervision into the common semantic-change target.
@@ -196,7 +270,7 @@ def build_canonical_target(
             raw = _long(change)
             if raw.shape != s1.shape:
                 raise ValueError("change mask must match semantic label shape")
-            _validate_change_values(raw)
+            _validate_canonical_change_values(raw)
             ch = raw.clone()
             change_invalid = raw == IGNORE_CLASS_ID
 
@@ -221,11 +295,12 @@ def build_canonical_target(
         raise ValueError(f"{mode} requires change supervision")
 
     raw = _long(change)
-    _validate_change_values(raw)
-    invalid = raw == IGNORE_CLASS_ID
-    ch = raw.clone()
 
     if mode == "binary":
+        if class_names is None:
+            raise ValueError("binary target normalization requires class_names")
+        ch = _normalize_binary_change_values(raw, class_names)
+        invalid = ch == IGNORE_CLASS_ID
         s1 = torch.full_like(raw, UNKNOWN_CLASS_ID)
         s2 = torch.full_like(raw, UNKNOWN_CLASS_ID)
         s1[invalid] = IGNORE_CLASS_ID
@@ -240,6 +315,12 @@ def build_canonical_target(
             semantic_valid_t1=sem_valid,
             semantic_valid_t2=sem_valid.clone(),
         )
+
+    # post_semantic class_names describe semantic classes, so its explicit
+    # change target remains canonical 0/1 internally.
+    _validate_canonical_change_values(raw)
+    invalid = raw == IGNORE_CLASS_ID
+    ch = raw.clone()
 
     # post_semantic = Unknown -> B
     if semantic_t2 is None:
@@ -718,6 +799,7 @@ class UnifiedPAIRDataset(Dataset):
             semantic_t1=s1,
             semantic_t2=s2,
             change=ch,
+            class_names=self.spec.class_names,
         )
 
         return {
@@ -810,11 +892,20 @@ def _self_test():
     )
     assert (out.semantic_t1 == UNKNOWN_CLASS_ID).all()
 
+    raw_bcd = torch.tensor([[0, 255], [255, 0]])
     out = build_canonical_target(
         label_mode="binary",
-        change=ch,
+        change=raw_bcd,
+        class_names={0: "unchanged", 255: "changed"},
     )
+    assert torch.equal(out.change, torch.tensor([[0, 1], [1, 0]]))
     assert (out.semantic_t1 == UNKNOWN_CLASS_ID).all()
+
+    assert infer_binary_class_ids(
+        {0: "unchanged", 255: "changed"}
+    ) == (0, 255)
+
+    assert "changed_raw_id" not in DatasetSpec.__dataclass_fields__
 
     assert infer_unchanged_raw_id(
         {0: "unchanged", 1: "building"}

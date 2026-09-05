@@ -63,6 +63,25 @@
         "5": "building",
         "6": "sports field"
       }
+    },
+    "LEVIR-CD": {
+      "root": "/home/sht/Datasets/LEVIR-CDpair",
+      "per_gpu_batch_size": 4,
+      "class_names": {
+        "0": "unchanged",
+        "255": "changed"
+      }
+    },
+    "LandsatSCD": {
+      "root": "/home/sht/Datasets/LandsatSCDpair",
+      "per_gpu_batch_size": 4,
+      "class_names": {
+        "0": "unchanged",
+        "1": "farmland",
+        "2": "desert",
+        "3": "building",
+        "4": "water"
+      }
     }
   }
 }
