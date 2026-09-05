@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_multidataset_v2",
+    "name": "PAIR_multidataset_v3",
     "default_datasets": [
       "SECOND"
     ],
@@ -37,8 +37,7 @@
   },
   "training": {
     "grad_accum": 1,
-    "num_workers": 4,
-    "steps_per_epoch": null
+    "num_workers": 4
   },
   "validation": {
     "every_epochs": 1,
@@ -50,7 +49,7 @@
     "log_every": 20,
     "save_every_epochs": 1,
     "tensorboard": true,
-    "output_dir": "outputs/pair_multidataset_v2"
+    "output_dir": "outputs/pair_multidataset_v3"
   },
   "datasets": {
     "SECOND": {
