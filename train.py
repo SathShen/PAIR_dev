@@ -1073,8 +1073,7 @@ def main():
                         )
                         print(
                             f"E{epoch+1:03d} U{optimizer_step:06d} "
-                            f"[{mix}] | current={dataset_name} "
-                            f"accu={accumulation_steps} | "
+                            f"[{mix}] | "
                             f"loss={means['loss']:.4f} "
                             f"sem1={means['loss_semantic_t1']:.4f} "
                             f"sem2={means['loss_semantic_t2']:.4f} "
