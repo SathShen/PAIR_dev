@@ -729,36 +729,61 @@ def validate(model, criterion, loader, spec, runtime, args):
 
 
 def log_tensorboard_train(writer, values, step, dataset_name):
+    """
+    Keep TensorBoard train logs intentionally minimal.
+
+    Only log the training losses. Do not log epoch/update counters, gradient
+    norm, learning rates, throughput, or GPU memory; those remain available
+    in train_log.jsonl and the terminal output.
+    """
     if writer is None:
         return
-    for key, value in values.items():
+
+    loss_keys = (
+        "loss",
+        "loss_semantic_t1",
+        "loss_semantic_t2",
+        "loss_change_bce",
+        "loss_change_dice",
+    )
+
+    for key in loss_keys:
+        value = values.get(key)
         if isinstance(value, (int, float)):
-            writer.add_scalar(f"train/{dataset_name}/{key}", value, step)
+            writer.add_scalar(
+                f"train/{dataset_name}/{key}",
+                value,
+                step,
+            )
 
 
 def log_tensorboard_val(writer, result, step, dataset_name):
+    """
+    Keep TensorBoard validation logs compact:
+      - one total validation loss
+      - every aggregate scalar metric produced by PAIRMetrics
+
+    Per-class metrics and confusion-matrix images are intentionally omitted
+    from TensorBoard. They are still preserved in val_log.jsonl.
+    """
     if writer is None:
         return
 
-    for key, value in result["losses"].items():
-        writer.add_scalar(f"val/{dataset_name}/loss/{key}", value, step)
-    for key, value in result["scalars"].items():
-        writer.add_scalar(f"val/{dataset_name}/{key}", value, step)
-
-    for class_name, values in result["per_class"].items():
-        safe = class_name.replace("/", "_")
-        for metric in ("IoU", "F1", "Precision", "Recall"):
-            writer.add_scalar(
-                f"val/{dataset_name}/per_class/{safe}/{metric}",
-                values[metric], step,
-            )
-
-    for name, cm in result["confusion"].items():
-        writer.add_image(
-            f"val/{dataset_name}/confusion/{name}",
-            normalized_confusion_image(cm),
-            step, dataformats="CHW",
+    total_loss = result["losses"].get("loss")
+    if isinstance(total_loss, (int, float)):
+        writer.add_scalar(
+            f"val/{dataset_name}/loss",
+            total_loss,
+            step,
         )
+
+    for key, value in result["scalars"].items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar(
+                f"val/{dataset_name}/{key}",
+                value,
+                step,
+            )
 
 
 def log_tensorboard_macro(writer, macro, step):
@@ -1136,7 +1161,6 @@ def main():
                 )
 
                 if runtime["is_main"] and results_by_dataset:
-                    log_tensorboard_macro(writer, macro, optimizer_step)
                     record = {
                         "epoch": epoch + 1,
                         "optimizer_step": optimizer_step,
