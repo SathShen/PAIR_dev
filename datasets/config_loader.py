@@ -157,7 +157,6 @@ class DatasetConfig:
     name: str
     root: Path
     per_gpu_batch_size: int
-    sampling_weight: float
     class_names: Dict[int, str]
 
     modalities: Tuple[str, ...]
@@ -176,7 +175,6 @@ class DatasetConfig:
             "name": self.name,
             "root": str(self.root),
             "per_gpu_batch_size": self.per_gpu_batch_size,
-            "sampling_weight": self.sampling_weight,
             "class_names": {
                 str(k): v for k, v in self.class_names.items()
             },
@@ -291,7 +289,6 @@ def _dataset_from_json(
     allowed = {
         "root",
         "per_gpu_batch_size",
-        "sampling_weight",
         "class_names",
     }
     unknown = sorted(set(data) - allowed)
@@ -318,11 +315,6 @@ def _dataset_from_json(
             f"{name}.per_gpu_batch_size must be > 0"
         )
 
-    weight = float(data.get("sampling_weight", 1.0))
-    if weight <= 0:
-        raise ValueError(
-            f"{name}.sampling_weight must be > 0"
-        )
 
     spec = DatasetSpec(
         name=name,
@@ -337,7 +329,6 @@ def _dataset_from_json(
         name=name,
         root=root,
         per_gpu_batch_size=batch,
-        sampling_weight=weight,
         class_names=class_names,
         modalities=schema["modalities"],
         route=schema["route"],
