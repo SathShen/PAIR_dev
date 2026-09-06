@@ -44,7 +44,7 @@ from datasets.config_loader import ExperimentConfig, load_experiment_config
 from datasets.multi_dataset import DatasetRegistry, MultiDatasetScheduler
 
 from loss import PAIRSemanticChangeLoss
-from metrics import PAIRMetrics, normalized_confusion_image
+from metrics import PAIRMetrics
 from models.change_decoder import UnifiedChangeDecoder, UnifiedTokenSet, build_identity_temporal_links
 from models.lora import apply_qwen_lora, is_peft_model, lora_parameter_count, lora_state_dict, load_lora_state_dict
 from models.pair import PAIRModel
@@ -730,41 +730,72 @@ def validate(model, criterion, loader, spec, runtime, args):
 
 def log_tensorboard_train(writer, values, step, dataset_name):
     """
-    Keep TensorBoard train logs intentionally minimal.
-
-    Only log the training losses. Do not log epoch/update counters, gradient
-    norm, learning rates, throughput, or GPU memory; those remain available
-    in train_log.jsonl and the terminal output.
+    TensorBoard train view: only total loss per dataset.
+    Detailed component losses and runtime diagnostics stay in JSONL/terminal.
     """
     if writer is None:
         return
 
-    loss_keys = (
-        "loss",
-        "loss_semantic_t1",
-        "loss_semantic_t2",
-        "loss_change_bce",
-        "loss_change_dice",
-    )
-
-    for key in loss_keys:
-        value = values.get(key)
-        if isinstance(value, (int, float)):
-            writer.add_scalar(
-                f"train/{dataset_name}/{key}",
-                value,
-                step,
-            )
+    value = values.get("loss")
+    if isinstance(value, (int, float)):
+        writer.add_scalar(
+            f"train/{dataset_name}/loss",
+            value,
+            step,
+        )
 
 
-def log_tensorboard_val(writer, result, step, dataset_name):
+def validation_metric_layout(spec, scalars):
     """
-    Keep TensorBoard validation logs compact:
-      - one total validation loss
-      - every aggregate scalar metric produced by PAIRMetrics
+    TensorBoard/terminal validation metrics.
 
-    Per-class metrics and confusion-matrix images are intentionally omitted
-    from TensorBoard. They are still preserved in val_log.jsonl.
+    SCD:
+        OA, SeK, F_scd, mIoU
+
+    BCD:
+        OA, IoU, Recall, Precision, F1
+
+    Future semantic-pair datasets without SECOND-style SCD metrics fall back
+    to semantic OA + mIoU instead of logging meaningless zeros.
+    """
+    if spec.label_mode in {"binary", "post_semantic"}:
+        return (
+            ("OA", "change/OA"),
+            ("IoU", "change/IoU"),
+            ("Recall", "change/Recall"),
+            ("Precision", "change/Precision"),
+            ("F1", "change/F1"),
+        )
+
+    if spec.label_mode == "semantic_pair":
+        scd_metrics = (
+            ("OA", "scd/OA"),
+            ("SeK", "scd/SeK"),
+            ("F_scd", "scd/F_scd"),
+            ("mIoU", "scd/mIoU"),
+        )
+        if all(key in scalars for _, key in scd_metrics):
+            return scd_metrics
+
+        return tuple(
+            item
+            for item in (
+                ("OA", "semantic/OA"),
+                ("mIoU", "semantic/mIoU"),
+            )
+            if item[1] in scalars
+        )
+
+    return ()
+
+
+def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
+    """
+    Validation x-axis is epoch, not optimizer step.
+
+    TensorBoard only records:
+      SCD: loss, OA, SeK, F_scd, mIoU
+      BCD: loss, OA, IoU, Recall, Precision, F1
     """
     if writer is None:
         return
@@ -774,23 +805,19 @@ def log_tensorboard_val(writer, result, step, dataset_name):
         writer.add_scalar(
             f"val/{dataset_name}/loss",
             total_loss,
-            step,
+            epoch,
         )
 
-    for key, value in result["scalars"].items():
+    scalars = result["scalars"]
+    for display_name, key in validation_metric_layout(spec, scalars):
+        value = scalars.get(key)
         if isinstance(value, (int, float)):
             writer.add_scalar(
-                f"val/{dataset_name}/{key}",
+                f"val/{dataset_name}/{display_name}",
                 value,
-                step,
+                epoch,
             )
 
-
-def log_tensorboard_macro(writer, macro, step):
-    if writer is None:
-        return
-    for key, value in macro.items():
-        writer.add_scalar(f"val/{key}", value, step)
 
 
 def compute_macro_metrics(results_by_dataset):
@@ -806,22 +833,29 @@ def compute_macro_metrics(results_by_dataset):
     }
 
 
-def print_val(dataset_name, result):
-    s = result["scalars"]
+def print_val(dataset_name, result, spec):
+    """
+    Print only task-relevant validation metrics.
+    """
+    scalars = result["scalars"]
     loss = result["losses"].get("loss", float("nan"))
-    print(
-        f"VAL [{dataset_name}] | loss={loss:.4f} | "
-        f"change F1={s['change/F1']:.4f} IoU={s['change/IoU']:.4f} | "
-        f"sem mIoU={s['semantic/mIoU']:.4f} mF1={s['semantic/mF1']:.4f}",
-        end="",
-    )
-    if "scd/F_scd" in s:
+
+    fields = [
+        f"{name}={scalars[key]:.4f}"
+        for name, key in validation_metric_layout(spec, scalars)
+        if key in scalars
+    ]
+
+    metrics_text = " ".join(fields)
+    if metrics_text:
         print(
-            f" | F_scd={s['scd/F_scd']:.4f} SeK={s['scd/SeK']:.4f} "
-            f"mIoU_scd={s['scd/mIoU']:.4f} OA={s['scd/OA']:.4f}"
+            f"VAL [{dataset_name}] | loss={loss:.4f} | "
+            f"{metrics_text}"
         )
     else:
-        print()
+        print(
+            f"VAL [{dataset_name}] | loss={loss:.4f}"
+        )
 
 
 def write_jsonl(path, record):
@@ -1150,9 +1184,17 @@ def main():
                     results_by_dataset[dataset_name] = result
 
                     if runtime["is_main"]:
-                        print_val(dataset_name, result)
+                        print_val(
+                            dataset_name,
+                            result,
+                            handle.config.spec,
+                        )
                         log_tensorboard_val(
-                            writer, result, optimizer_step, dataset_name
+                            writer,
+                            result,
+                            epoch + 1,
+                            dataset_name,
+                            handle.config.spec,
                         )
 
                 macro = compute_macro_metrics(results_by_dataset)
