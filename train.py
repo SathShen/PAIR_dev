@@ -134,18 +134,27 @@ def build_settings(experiment: ExperimentConfig, cli):
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
+
     if distributed:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
+        )
+
         rank = dist.get_rank()
     else:
         local_rank, rank = 0, 0
         torch.cuda.set_device(0)
 
     return {
-        "distributed": distributed, "world_size": world_size, "rank": rank,
-        "local_rank": local_rank, "device": torch.device("cuda", local_rank),
+        "distributed": distributed,
+        "world_size": world_size,
+        "rank": rank,
+        "local_rank": local_rank,
+        "device": torch.device("cuda", local_rank),
         "is_main": rank == 0,
     }
 
