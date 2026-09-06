@@ -27,6 +27,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -170,6 +171,41 @@ def make_writer(output_dir, is_main):
     except ImportError as exc:
         raise ImportError("TensorBoard logging requires: pip install tensorboard") from exc
     return SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+
+
+class TeeStdout:
+    """Mirror explicit stdout prints to terminal and one run.log file."""
+    def __init__(self, terminal, logfile):
+        self.terminal = terminal
+        self.logfile = logfile
+
+    def write(self, data):
+        self.terminal.write(data)
+        self.logfile.write(data)
+        return len(data)
+
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+
+def format_duration(seconds):
+    seconds = max(float(seconds), 0.0)
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def write_log_only(log_file, line):
+    """Write one detailed line to run.log without printing it to the terminal."""
+    if log_file is None:
+        return
+    log_file.write(str(line) + "\n")
+    log_file.flush()
 
 
 # =============================================================================
@@ -858,22 +894,21 @@ def print_val(dataset_name, result, spec):
         )
 
 
-def write_jsonl(path, record):
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
+    run_start = time.time()
     cli = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
     runtime = setup_distributed()
     writer = None
+    log_file = None
+    original_stdout = sys.stdout
+    run_completed = False
 
     try:
         experiment = load_experiment_config(cli.config, cli.datasets)
@@ -883,6 +918,22 @@ def main():
             raise ValueError("training.grad_accum must be >= 1")
 
         set_seed(settings.seed, runtime["rank"])
+
+        if runtime["is_main"]:
+            settings.output_dir.mkdir(parents=True, exist_ok=True)
+            log_path = settings.output_dir / "run.log"
+            log_file = log_path.open("a", encoding="utf-8", buffering=1)
+            sys.stdout = TeeStdout(original_stdout, log_file)
+
+            print()
+            print("=" * 96)
+            print("PAIR RUN LOG")
+            print("=" * 96)
+            print("Started:", time.strftime("%Y-%m-%d %H:%M:%S"))
+            print("Log file:", log_path)
+            if settings.resume is not None:
+                print("Resume:", settings.resume)
+            print()
 
         registry = DatasetRegistry(
             experiment, runtime, num_workers=settings.num_workers
@@ -958,7 +1009,6 @@ def main():
         resolved_config = experiment.resolved_dict(runtime=runtime_config)
 
         if runtime["is_main"]:
-            settings.output_dir.mkdir(parents=True, exist_ok=True)
             writer = make_writer(
                 settings.output_dir,
                 bool(experiment.logging.get("tensorboard", True)),
@@ -1009,13 +1059,15 @@ def main():
             print("TensorBoard:", settings.output_dir / "tensorboard")
             print()
 
-        train_json = settings.output_dir / "train_log.jsonl"
-        val_json = settings.output_dir / "val_log.jsonl"
         model.train()
 
         log_window_dataset_counts = Counter()
+        log_window_sums = {}
+        log_window_count = 0
+        log_window_dataset_loss_sums = Counter()
 
         for epoch in range(start_epoch, settings.epochs):
+            epoch_start = time.time()
             registry.reset_epoch(epoch)
             schedule = dataset_scheduler.epoch_schedule(
                 epoch, runtime
@@ -1123,8 +1175,49 @@ def main():
                     "lr_lora": lrs.get("lora", 0.0),
                 }
 
+                # Save EVERY optimizer iteration to run.log, but do not print
+                # these detailed lines to the terminal.
+                if runtime["is_main"]:
+                    write_log_only(
+                        log_file,
+                        (
+                            f"ITER E{epoch+1:03d} U{optimizer_step:06d} "
+                            f"dataset={dataset_name} route={handle.config.route} "
+                            f"update_in_epoch={update_idx+1} "
+                            f"accu={accumulation_steps} "
+                            f"loss={means['loss']:.6f} "
+                            f"sem1={means['loss_semantic_t1']:.6f} "
+                            f"sem2={means['loss_semantic_t2']:.6f} "
+                            f"bce={means['loss_change_bce']:.6f} "
+                            f"dice={means['loss_change_dice']:.6f} "
+                            f"grad={grad_norm:.6f} "
+                            f"lr_pair={lrs.get('pair', 0.0):.8e} "
+                            f"lr_lora={lrs.get('lora', 0.0):.8e} "
+                            f"sample_per_s={update_log['samples_per_sec']:.4f} "
+                            f"gpu_alloc_GiB={update_log['gpu_alloc_GiB']:.4f} "
+                            f"gpu_reserved_GiB={update_log['gpu_reserved_GiB']:.4f}"
+                        ),
+                    )
+
+                # Accumulate the whole logging window. The terminal line below
+                # therefore reports an interval mean instead of the final
+                # update in the interval.
+                log_window_count += 1
+                for key, value in means.items():
+                    log_window_sums[key] = (
+                        log_window_sums.get(key, 0.0)
+                        + float(value)
+                    )
+                log_window_dataset_loss_sums[dataset_name] += float(
+                    means["loss"]
+                )
+
                 if optimizer_step % settings.log_every == 0:
                     if runtime["is_main"]:
+                        window_means = {
+                            key: value / max(log_window_count, 1)
+                            for key, value in log_window_sums.items()
+                        }
                         mix = " ".join(
                             f"{name} x{log_window_dataset_counts[name]}"
                             for name in experiment.selected_names
@@ -1133,21 +1226,34 @@ def main():
                         print(
                             f"E{epoch+1:03d} U{optimizer_step:06d} "
                             f"[{mix}] | "
-                            f"loss={means['loss']:.4f} "
-                            f"sem1={means['loss_semantic_t1']:.4f} "
-                            f"sem2={means['loss_semantic_t2']:.4f} "
-                            f"bce={means['loss_change_bce']:.4f} "
-                            f"dice={means['loss_change_dice']:.4f} | "
-                            f"grad={grad_norm:.3f} "
-                            f"lr={lrs.get('pair', 0):.2e}/"
-                            f"{lrs.get('lora', 0):.2e} | "
-                            f"{update_log['samples_per_sec']:.2f} sample/s"
+                            f"avg_loss={window_means['loss']:.4f} "
+                            f"avg_sem1={window_means['loss_semantic_t1']:.4f} "
+                            f"avg_sem2={window_means['loss_semantic_t2']:.4f} "
+                            f"avg_bce={window_means['loss_change_bce']:.4f} "
+                            f"avg_dice={window_means['loss_change_dice']:.4f}"
                         )
-                        write_jsonl(train_json, update_log)
-                        log_tensorboard_train(
-                            writer, update_log, optimizer_step, dataset_name
-                        )
+
+                        # TensorBoard keeps one loss curve per dataset. Each
+                        # point is that dataset's mean loss inside this window.
+                        for name in experiment.selected_names:
+                            count = log_window_dataset_counts[name]
+                            if count <= 0:
+                                continue
+                            avg_dataset_loss = (
+                                log_window_dataset_loss_sums[name]
+                                / count
+                            )
+                            log_tensorboard_train(
+                                writer,
+                                {"loss": avg_dataset_loss},
+                                optimizer_step,
+                                name,
+                            )
+
                     log_window_dataset_counts.clear()
+                    log_window_sums.clear()
+                    log_window_count = 0
+                    log_window_dataset_loss_sums.clear()
 
             start_update_in_epoch = 0
 
@@ -1203,28 +1309,6 @@ def main():
                 )
 
                 if runtime["is_main"] and results_by_dataset:
-                    record = {
-                        "epoch": epoch + 1,
-                        "optimizer_step": optimizer_step,
-                        "datasets": {
-                            name: {
-                                "seconds": result["seconds"],
-                                "losses": result["losses"],
-                                "metrics": result["scalars"],
-                                "selection": selection.get(name),
-                                "per_class": result["per_class"],
-                                "confusion": {
-                                    key: value.tolist()
-                                    for key, value
-                                    in result["confusion"].items()
-                                },
-                            }
-                            for name, result in results_by_dataset.items()
-                        },
-                        "macro": macro,
-                    }
-                    write_jsonl(val_json, record)
-
                     improved = []
                     for dataset_name, item in selection.items():
                         value = float(item["value"])
@@ -1312,6 +1396,15 @@ def main():
             if runtime["is_main"] and writer is not None:
                 writer.flush()
 
+            if runtime["is_main"]:
+                epoch_elapsed = time.time() - epoch_start
+                print(
+                    f"Epoch {epoch+1} time: "
+                    f"{format_duration(epoch_elapsed)} "
+                    f"({epoch_elapsed:.1f} s)"
+                )
+                print()
+
         if runtime["is_main"]:
             print("Training complete.")
             for dataset_name in experiment.selected_names:
@@ -1337,9 +1430,34 @@ def main():
                         f"({metric_key})"
                     )
 
+            run_completed = True
+            total_elapsed = time.time() - run_start
+            print()
+            print(
+                f"Total run time: {format_duration(total_elapsed)} "
+                f"({total_elapsed:.1f} s)"
+            )
+            print("Finished:", time.strftime("%Y-%m-%d %H:%M:%S"))
+            print("=" * 96)
+
     finally:
+        if runtime.get("is_main", False) and log_file is not None and not run_completed:
+            elapsed = time.time() - run_start
+            print()
+            print(
+                f"Run stopped after: {format_duration(elapsed)} "
+                f"({elapsed:.1f} s)"
+            )
+            print("Stopped:", time.strftime("%Y-%m-%d %H:%M:%S"))
+
         if writer is not None:
             writer.close()
+
+        if log_file is not None:
+            sys.stdout.flush()
+            sys.stdout = original_stdout
+            log_file.close()
+
         cleanup_distributed()
 
 
