@@ -766,19 +766,30 @@ def validate(model, criterion, loader, spec, runtime, args):
 
 def log_tensorboard_train(writer, values, step, dataset_name):
     """
-    TensorBoard train view: only total loss per dataset.
-    Detailed component losses and runtime diagnostics stay in JSONL/terminal.
+    TensorBoard train view: separate loss curves per dataset.
+
+    Each point is the mean of that dataset's updates inside the current
+    log_every interval. Runtime diagnostics stay in run.log / terminal.
     """
     if writer is None:
         return
 
-    value = values.get("loss")
-    if isinstance(value, (int, float)):
-        writer.add_scalar(
-            f"train/{dataset_name}/loss",
-            value,
-            step,
-        )
+    loss_keys = (
+        "loss",
+        "loss_semantic_t1",
+        "loss_semantic_t2",
+        "loss_change_bce",
+        "loss_change_dice",
+    )
+
+    for key in loss_keys:
+        value = values.get(key)
+        if isinstance(value, (int, float)):
+            writer.add_scalar(
+                f"train/{dataset_name}/{key}",
+                value,
+                step,
+            )
 
 
 def validation_metric_layout(spec, scalars):
@@ -1064,7 +1075,7 @@ def main():
         log_window_dataset_counts = Counter()
         log_window_sums = {}
         log_window_count = 0
-        log_window_dataset_loss_sums = Counter()
+        log_window_dataset_sums = {}
 
         for epoch in range(start_epoch, settings.epochs):
             epoch_start = time.time()
@@ -1208,9 +1219,14 @@ def main():
                         log_window_sums.get(key, 0.0)
                         + float(value)
                     )
-                log_window_dataset_loss_sums[dataset_name] += float(
-                    means["loss"]
+                dataset_sums = log_window_dataset_sums.setdefault(
+                    dataset_name, {}
                 )
+                for key, value in means.items():
+                    dataset_sums[key] = (
+                        dataset_sums.get(key, 0.0)
+                        + float(value)
+                    )
 
                 if optimizer_step % settings.log_every == 0:
                     if runtime["is_main"]:
@@ -1233,19 +1249,26 @@ def main():
                             f"avg_dice={window_means['loss_change_dice']:.4f}"
                         )
 
-                        # TensorBoard keeps one loss curve per dataset. Each
-                        # point is that dataset's mean loss inside this window.
+                        # TensorBoard keeps separate loss curves per dataset.
+                        # Each point averages only that dataset's updates in
+                        # this log_every interval, so BCD semantic zeros do not
+                        # dilute SCD semantic-loss curves.
                         for name in experiment.selected_names:
                             count = log_window_dataset_counts[name]
                             if count <= 0:
                                 continue
-                            avg_dataset_loss = (
-                                log_window_dataset_loss_sums[name]
-                                / count
+
+                            dataset_sums = log_window_dataset_sums.get(
+                                name, {}
                             )
+                            dataset_means = {
+                                key: value / count
+                                for key, value in dataset_sums.items()
+                            }
+
                             log_tensorboard_train(
                                 writer,
-                                {"loss": avg_dataset_loss},
+                                dataset_means,
                                 optimizer_step,
                                 name,
                             )
@@ -1253,7 +1276,7 @@ def main():
                     log_window_dataset_counts.clear()
                     log_window_sums.clear()
                     log_window_count = 0
-                    log_window_dataset_loss_sums.clear()
+                    log_window_dataset_sums.clear()
 
             start_update_in_epoch = 0
 
