@@ -1398,10 +1398,14 @@ def main():
 
             if runtime["is_main"]:
                 epoch_elapsed = time.time() - epoch_start
+                total_elapsed = time.time() - run_start
+
                 print(
                     f"Epoch {epoch+1} time: "
                     f"{format_duration(epoch_elapsed)} "
-                    f"({epoch_elapsed:.1f} s)"
+                    f"({epoch_elapsed:.1f} s) | "
+                    f"Total time: {format_duration(total_elapsed)} "
+                    f"({total_elapsed:.1f} s)"
                 )
                 print()
 
