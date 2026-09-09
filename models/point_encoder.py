@@ -403,7 +403,7 @@ class UtoniaPointEncoder(nn.Module):
             )
 
         try:
-            from utonia.model import (
+            from models.utonia.model import (
                 PointTransformerV3,
             )
         except ImportError as exc:
