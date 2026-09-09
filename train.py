@@ -52,9 +52,6 @@ from models.pair import PAIRModel
 from models.qwen3vl_backbone import Qwen3VLBackbone
 
 
-DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
-
-
 # =============================================================================
 # CLI / runtime
 # =============================================================================

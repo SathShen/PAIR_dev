@@ -1,9 +1,6 @@
 {
   "experiment": {
     "name": "PAIR_multidataset_v4",
-    "default_datasets": [
-      "SECOND"
-    ],
     "seed": 42,
     "epochs": 10
   },
@@ -23,7 +20,8 @@
       ]
     },
     "point_encoder": {
-      "grid_size": 0.1
+      "checkpoint": "/data2/sht/checkpoints/Utonia/utonia.pth",
+      "voxel_size": 0.5
     },
     "max_point_reasoning_tokens": 512
   },
@@ -54,6 +52,7 @@
     "SECOND": {
       "root": "/home/sht/Datasets/SECONDpair",
       "per_gpu_batch_size": 8,
+      "ignored_id": null,
       "class_names": {
         "0": "unchanged",
         "1": "water",
@@ -67,6 +66,7 @@
     "LEVIR-CD": {
       "root": "/home/sht/Datasets/LEVIR-CDpair",
       "per_gpu_batch_size": 8,
+      "ignored_id": null,
       "class_names": {
         "0": "unchanged",
         "255": "changed"
@@ -75,12 +75,24 @@
     "LandsatSCD": {
       "root": "/home/sht/Datasets/LandsatSCDpair",
       "per_gpu_batch_size": 8,
+      "ignored_id": null,
       "class_names": {
         "0": "unchanged",
         "1": "farmland",
         "2": "desert",
         "3": "building",
         "4": "water"
+      }
+    },
+    "NYC-SCD": {
+      "root": "/home/sht/Datasets/NYC-SCDpair",
+      "per_gpu_batch_size": 1,
+      "ignored_id": null,
+      "class_names": {
+        "0": "ground",
+        "1": "building",
+        "2": "vegetation",
+        "3": "clutter"
       }
     }
   }

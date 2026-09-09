@@ -20,12 +20,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-
-DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
-
-
 class Qwen3VLBackbone(nn.Module):
-    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR,
+    def __init__(self, model_dir: str = None,
                  dtype: torch.dtype = torch.bfloat16,
                  device: Union[str, torch.device] = "cuda",
                  device_map: Optional[Union[str, Dict[str, Any]]] = "cuda",
