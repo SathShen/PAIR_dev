@@ -2,17 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-Smoke test: NYC-SCD prepared data -> frozen Utonia point encoder.
+PAIR NYC-SCD -> Utonia -> PointAdapter smoke test.
 
-Run from PAIR project root:
+This test uses a REAL prepared NYC-SCD sample and creates a deterministic
+FAKE intensity channel only for testing the optional intensity path.
 
-    python test_utonia_nycs.py \
+It checks:
+1. Prepared NYC-SCD point/label topology.
+2. Frozen Utonia forward for T1/T2.
+3. Fake intensity survives PointEncoder unchanged.
+4. PointAdapter produces:
+       dense_features [N, 256]
+       reasoning tokens [K, 2560], K <= 512
+5. Geometry-only path also works.
+6. With a freshly initialized PointAdapter, fake-intensity and geometry-only
+   dense features are initially equal because the residual intensity fusion
+   final layer is zero-initialized.
+
+Run from PAIR root:
+
+    CUDA_VISIBLE_DEVICES=2 python test_utonia_adapter_nycs.py \
         --config configs/pair_train.json \
         --split val \
         --device cuda:0
-
-This test intentionally stops BEFORE PointAdapter/Qwen/UnifiedDecoder.
-It validates the current data + Utonia boundary first.
 """
 
 from __future__ import annotations
@@ -28,6 +40,10 @@ import torch
 from models.point_encoder import (
     UtoniaPointEncoder,
     UtoniaPointEncoderConfig,
+)
+from models.point_adapter import (
+    PointAdapter,
+    PointAdapterConfig,
 )
 
 
@@ -91,52 +107,35 @@ def resolve(root: Path, value: str):
 
 def load_point(path: Path):
     with np.load(path, allow_pickle=False) as z:
-        keys = set(z.keys())
-        if "coord" not in keys:
+        if "coord" not in z:
             raise RuntimeError(
-                f"{path}: missing 'coord'; available={sorted(keys)}"
+                f"{path}: missing 'coord'; available={sorted(z.keys())}"
             )
         coord = np.asarray(z["coord"], dtype=np.float32)
-
-        feat = (
-            np.asarray(z["feat"], dtype=np.float32)
-            if "feat" in keys
-            else None
-        )
 
     if coord.ndim != 2 or coord.shape[1] != 3:
         raise RuntimeError(
             f"{path}: coord must be [N,3], got {coord.shape}"
         )
 
+    if coord.shape[0] == 0:
+        raise RuntimeError(f"{path}: empty point cloud")
+
     if not np.isfinite(coord).all():
         raise RuntimeError(f"{path}: coord contains NaN/Inf")
 
-    if feat is not None:
-        if feat.ndim != 2 or feat.shape[0] != coord.shape[0]:
-            raise RuntimeError(
-                f"{path}: feat topology mismatch: "
-                f"coord={coord.shape}, feat={feat.shape}"
-            )
-
-    return coord, feat
+    return coord
 
 
 def load_supervision(path: Path):
-    if path.suffix.lower() != ".npz":
-        raise RuntimeError(
-            f"{path}: current 3D supervision must be an NPZ bundle"
-        )
-
     with np.load(path, allow_pickle=False) as z:
-        keys = set(z.keys())
         required = {"semantic", "change"}
-        missing = required - keys
+        missing = required - set(z.keys())
 
         if missing:
             raise RuntimeError(
                 f"{path}: missing {sorted(missing)}; "
-                f"available={sorted(keys)}"
+                f"available={sorted(z.keys())}"
             )
 
         semantic = np.asarray(z["semantic"], dtype=np.int64)
@@ -144,14 +143,12 @@ def load_supervision(path: Path):
 
     if semantic.ndim != 1 or change.ndim != 1:
         raise RuntimeError(
-            f"{path}: semantic/change must both be 1D; "
-            f"got {semantic.shape}, {change.shape}"
+            f"{path}: semantic/change must be 1D"
         )
 
     if semantic.shape != change.shape:
         raise RuntimeError(
-            f"{path}: semantic/change shape mismatch: "
-            f"{semantic.shape} vs {change.shape}"
+            f"{path}: semantic/change topology mismatch"
         )
 
     return semantic, change
@@ -165,98 +162,97 @@ def unique_counts(x: np.ndarray):
     }
 
 
-def validate_semantic(
+def validate_labels(
     semantic: np.ndarray,
+    change: np.ndarray,
     *,
     class_names: dict[int, str],
     ignored_id,
-    label: str,
+    name: str,
 ):
-    observed = set(map(int, np.unique(semantic).tolist()))
-    allowed = set(class_names)
+    semantic_ids = set(map(int, np.unique(semantic).tolist()))
+    allowed_semantic = set(class_names)
 
     if ignored_id is not None:
-        allowed.add(int(ignored_id))
+        allowed_semantic.add(int(ignored_id))
 
-    unknown = sorted(observed - allowed)
+    unknown_semantic = sorted(
+        semantic_ids - allowed_semantic
+    )
 
-    if unknown:
+    if unknown_semantic:
         raise RuntimeError(
-            f"{label}: unknown semantic IDs {unknown}. "
-            f"class_names={sorted(class_names)}, ignored_id={ignored_id}. "
-            "Prepared data must not silently contain undeclared labels."
+            f"{name}: unknown semantic IDs {unknown_semantic}; "
+            f"class_names={sorted(class_names)}, ignored_id={ignored_id}"
+        )
+
+    change_ids = set(map(int, np.unique(change).tolist()))
+    allowed_change = {0, 1}
+
+    if ignored_id is not None:
+        allowed_change.add(int(ignored_id))
+
+    unknown_change = sorted(
+        change_ids - allowed_change
+    )
+
+    if unknown_change:
+        raise RuntimeError(
+            f"{name}: invalid change IDs {unknown_change}"
         )
 
 
-def validate_change(
-    change: np.ndarray,
+def make_fake_intensity(
+    coord: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Deterministic synthetic intensity in [0,1].
+
+    This is NOT intended to model real LiDAR radiometry.
+    It only provides a non-constant per-point signal for testing the
+    optional PAIR intensity branch.
+
+    We combine normalized x/y/z so the test exercises a varied intensity
+    tensor without relying on randomness.
+    """
+    xyz = coord.float()
+
+    xyz_min = xyz.amin(
+        dim=0,
+        keepdim=True,
+    )
+
+    xyz_max = xyz.amax(
+        dim=0,
+        keepdim=True,
+    )
+
+    span = (
+        xyz_max - xyz_min
+    ).clamp_min(1e-6)
+
+    norm = (
+        xyz - xyz_min
+    ) / span
+
+    intensity = (
+        0.50 * norm[:, 2:3]
+        + 0.30 * norm[:, 0:1]
+        + 0.20 * norm[:, 1:2]
+    )
+
+    return intensity.clamp(
+        0.0,
+        1.0,
+    )
+
+
+def point_dict_from_numpy(
+    coord_np: np.ndarray,
     *,
-    ignored_id,
-    label: str,
+    device: torch.device,
+    with_fake_intensity: bool,
 ):
-    observed = set(map(int, np.unique(change).tolist()))
-    allowed = {0, 1}
-
-    if ignored_id is not None:
-        allowed.add(int(ignored_id))
-
-    unknown = sorted(observed - allowed)
-
-    if unknown:
-        raise RuntimeError(
-            f"{label}: invalid change IDs {unknown}. "
-            "PAIR binary change must be 0/1"
-            + (
-                f" plus ignored_id={ignored_id}."
-                if ignored_id is not None
-                else " and ignored_id is None."
-            )
-        )
-
-
-def inspect_checkpoint(path: Path):
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Utonia checkpoint not found: {path}"
-        )
-
-    try:
-        ckpt = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=True,
-        )
-    except TypeError:
-        ckpt = torch.load(
-            path,
-            map_location="cpu",
-        )
-
-    if not isinstance(ckpt, dict):
-        raise RuntimeError(
-            "Unexpected Utonia checkpoint: top-level object is not a dict"
-        )
-
-    config = ckpt.get("config")
-
-    if not isinstance(config, dict):
-        raise RuntimeError(
-            "Utonia checkpoint has no dict-valued 'config'"
-        )
-
-    print("\n[Checkpoint]")
-    print(" path        :", path)
-    print(" in_channels :", config.get("in_channels"))
-    print(" enc_channels:", config.get("enc_channels"))
-    print(" enc_depths  :", config.get("enc_depths"))
-    print(" enc_num_head:", config.get("enc_num_head"))
-    print(" enc_mode    :", config.get("enc_mode"))
-    print(" enable_flash:", config.get("enable_flash"))
-
-    return config
-
-
-def to_point_dict(coord_np: np.ndarray, device: torch.device):
     coord = torch.from_numpy(
         np.ascontiguousarray(coord_np)
     ).to(
@@ -264,7 +260,7 @@ def to_point_dict(coord_np: np.ndarray, device: torch.device):
         dtype=torch.float32,
     )
 
-    return {
+    point_dict = {
         "coord": coord,
         "batch": torch.zeros(
             coord.shape[0],
@@ -273,8 +269,25 @@ def to_point_dict(coord_np: np.ndarray, device: torch.device):
         ),
     }
 
+    if with_fake_intensity:
+        point_dict["intensity"] = make_fake_intensity(
+            coord
+        )
 
-def run_encoder(
+    return point_dict
+
+
+def tensor_stats(x: torch.Tensor):
+    x = x.float()
+    return {
+        "min": float(x.min().item()),
+        "max": float(x.max().item()),
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()),
+    }
+
+
+def run_utonia(
     encoder,
     point_dict,
     *,
@@ -287,50 +300,157 @@ def run_encoder(
 
     start = time.perf_counter()
 
-    output = encoder(point_dict)
+    encoded = encoder(
+        point_dict
+    )
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
     elapsed = time.perf_counter() - start
 
-    features = output.features
-
-    if features.ndim != 2:
+    if encoded.features.shape != (
+        point_dict["coord"].shape[0],
+        encoder.output_dim,
+    ):
         raise RuntimeError(
-            f"{name}: output features must be [N,D], "
-            f"got {tuple(features.shape)}"
+            f"{name}: unexpected Utonia output "
+            f"{tuple(encoded.features.shape)}"
         )
 
-    if features.shape[0] != point_dict["coord"].shape[0]:
+    if not torch.isfinite(
+        encoded.features
+    ).all():
         raise RuntimeError(
-            f"{name}: dense topology was not restored: "
-            f"input N={point_dict['coord'].shape[0]}, "
-            f"output N={features.shape[0]}"
+            f"{name}: Utonia produced NaN/Inf"
         )
 
-    if features.shape[1] != encoder.output_dim:
+    print(f"\n[{name} / Utonia]")
+    print(" input points :", f"{point_dict['coord'].shape[0]:,}")
+    print(" features     :", tuple(encoded.features.shape))
+    print(" frozen       :", all(
+        not p.requires_grad
+        for p in encoder.parameters()
+    ))
+    print(" elapsed      :", f"{elapsed:.3f} s")
+
+    if encoded.intensity is None:
+        print(" intensity    : None")
+    else:
+        print(" intensity    :", tuple(encoded.intensity.shape))
+        print(" intensity stat:", tensor_stats(encoded.intensity))
+
+        source_intensity = point_dict["intensity"]
+
+        if not torch.equal(
+            encoded.intensity,
+            source_intensity,
+        ):
+            max_error = (
+                encoded.intensity
+                - source_intensity
+            ).abs().max().item()
+
+            raise RuntimeError(
+                f"{name}: PointEncoder altered intensity; "
+                f"max error={max_error}"
+            )
+
+        if (
+            encoded.intensity_mask is None
+            or not encoded.intensity_mask.all()
+        ):
+            raise RuntimeError(
+                f"{name}: expected all fake intensity points to be valid"
+            )
+
+    if device.type == "cuda":
+        peak = (
+            torch.cuda.max_memory_allocated(device)
+            / (1024 ** 3)
+        )
+        print(" peak allocated:", f"{peak:.3f} GiB")
+
+    return encoded
+
+
+def run_adapter(
+    adapter,
+    encoded,
+    *,
+    name: str,
+    device: torch.device,
+):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+    start = time.perf_counter()
+
+    output = adapter.forward_with_metadata(
+        encoded
+    )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    elapsed = time.perf_counter() - start
+
+    n = encoded.coord.shape[0]
+
+    if output.dense_features.shape != (
+        n,
+        adapter.dense_dim,
+    ):
         raise RuntimeError(
-            f"{name}: output D={features.shape[1]} "
-            f"but encoder.output_dim={encoder.output_dim}"
+            f"{name}: dense feature shape mismatch: "
+            f"{tuple(output.dense_features.shape)}"
         )
 
-    if not torch.isfinite(features).all():
+    tokens = output.tokens
+
+    if not torch.is_tensor(tokens):
         raise RuntimeError(
-            f"{name}: output contains NaN/Inf"
+            f"{name}: single-cloud test expected Tensor tokens"
         )
 
-    print(f"\n[{name} Utonia forward]")
-    print(" input points :", point_dict["coord"].shape[0])
-    print(" output       :", tuple(features.shape))
-    print(" dtype        :", features.dtype)
+    if (
+        tokens.ndim != 2
+        or tokens.shape[1] != adapter.out_dim
+        or tokens.shape[0] > adapter.num_tokens
+    ):
+        raise RuntimeError(
+            f"{name}: bad token shape {tuple(tokens.shape)}"
+        )
+
+    if not torch.isfinite(
+        output.dense_features
+    ).all():
+        raise RuntimeError(
+            f"{name}: dense features contain NaN/Inf"
+        )
+
+    if not torch.isfinite(
+        tokens
+    ).all():
+        raise RuntimeError(
+            f"{name}: tokens contain NaN/Inf"
+        )
+
+    print(f"\n[{name} / PointAdapter]")
+    print(" dense        :", tuple(output.dense_features.shape))
+    print(" tokens       :", tuple(tokens.shape))
+    print(" pooled voxels:", output.pooled_voxel_count)
+    print(" token voxel  :", output.effective_voxel_size)
+    print(" intensity_used:", output.intensity_used)
     print(" elapsed      :", f"{elapsed:.3f} s")
 
     if device.type == "cuda":
-        peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        peak = (
+            torch.cuda.max_memory_allocated(device)
+            / (1024 ** 3)
+        )
         print(" peak allocated:", f"{peak:.3f} GiB")
-        print(" peak reserved :", f"{reserved:.3f} GiB")
 
     return output
 
@@ -339,67 +459,73 @@ def main():
     args = parse_args()
 
     config_path = args.config.expanduser().resolve()
-    config = load_json(config_path)
+    config = load_json(
+        config_path
+    )
 
     if args.dataset not in config["datasets"]:
         raise KeyError(
-            f"Dataset {args.dataset!r} not found in {config_path}"
+            f"{args.dataset!r} is not configured"
         )
 
-    ds_cfg = config["datasets"][args.dataset]
-    root = Path(ds_cfg["root"]).expanduser().resolve()
+    ds_cfg = config["datasets"][
+        args.dataset
+    ]
 
-    if not root.is_dir():
-        raise FileNotFoundError(
-            f"Dataset root does not exist: {root}"
-        )
+    root = Path(
+        ds_cfg["root"]
+    ).expanduser().resolve()
 
-    ignored_id = ds_cfg.get("ignored_id", None)
     class_names = {
         int(k): str(v)
-        for k, v in ds_cfg["class_names"].items()
+        for k, v in ds_cfg[
+            "class_names"
+        ].items()
     }
 
-    model_cfg = config["model"]["point_encoder"]
-    checkpoint = Path(
-        model_cfg["checkpoint"]
-    ).expanduser().resolve()
-    voxel_size = float(
-        model_cfg["voxel_size"]
+    ignored_id = ds_cfg.get(
+        "ignored_id",
+        None,
     )
 
-    print("=" * 78)
-    print("PAIR NYC-SCD -> Utonia smoke test")
-    print("=" * 78)
-    print(" config      :", config_path)
-    print(" dataset     :", args.dataset)
-    print(" root        :", root)
-    print(" split       :", args.split)
-    print(" ignored_id  :", ignored_id)
-    print(" class_names :", class_names)
-    print(" voxel_size  :", voxel_size)
+    model_cfg = config["model"]
+    encoder_cfg = model_cfg[
+        "point_encoder"
+    ]
 
-    ckpt_cfg = inspect_checkpoint(checkpoint)
+    checkpoint = Path(
+        encoder_cfg["checkpoint"]
+    ).expanduser().resolve()
 
-    manifest_path = root / "manifests" / f"{args.split}.jsonl"
+    voxel_size = float(
+        encoder_cfg["voxel_size"]
+    )
 
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            f"Manifest not found: {manifest_path}"
-        )
+    max_tokens = int(
+        model_cfg[
+            "max_point_reasoning_tokens"
+        ]
+    )
 
-    records = load_manifest(manifest_path)
+    manifest_path = (
+        root
+        / "manifests"
+        / f"{args.split}.jsonl"
+    )
+
+    records = load_manifest(
+        manifest_path
+    )
 
     if not 0 <= args.index < len(records):
         raise IndexError(
-            f"--index {args.index} outside [0, {len(records)-1}]"
+            f"--index {args.index} outside "
+            f"[0,{len(records)-1}]"
         )
 
-    record = records[args.index]
-
-    print("\n[Manifest]")
-    print(" samples :", len(records))
-    print(" selected:", record.get("id", args.index))
+    record = records[
+        args.index
+    ]
 
     required = (
         "point_t1",
@@ -409,7 +535,8 @@ def main():
     )
 
     missing = [
-        key for key in required
+        key
+        for key in required
         if key not in record
     ]
 
@@ -418,93 +545,127 @@ def main():
             f"Manifest record missing keys: {missing}"
         )
 
-    point_t1_path = resolve(root, record["point_t1"])
-    point_t2_path = resolve(root, record["point_t2"])
-    sem_t1_path = resolve(root, record["semantic_t1"])
-    sem_t2_path = resolve(root, record["semantic_t2"])
+    t1_path = resolve(
+        root,
+        record["point_t1"],
+    )
 
-    coord_t1, feat_t1 = load_point(point_t1_path)
-    coord_t2, feat_t2 = load_point(point_t2_path)
+    t2_path = resolve(
+        root,
+        record["point_t2"],
+    )
 
-    semantic_t1, change_t1 = load_supervision(sem_t1_path)
-    semantic_t2, change_t2 = load_supervision(sem_t2_path)
+    s1_path = resolve(
+        root,
+        record["semantic_t1"],
+    )
 
-    if coord_t1.shape[0] != semantic_t1.shape[0]:
+    s2_path = resolve(
+        root,
+        record["semantic_t2"],
+    )
+
+    coord_t1 = load_point(
+        t1_path
+    )
+
+    coord_t2 = load_point(
+        t2_path
+    )
+
+    semantic_t1, change_t1 = (
+        load_supervision(
+            s1_path
+        )
+    )
+
+    semantic_t2, change_t2 = (
+        load_supervision(
+            s2_path
+        )
+    )
+
+    if (
+        coord_t1.shape[0]
+        != semantic_t1.shape[0]
+    ):
         raise RuntimeError(
-            f"T1 topology mismatch: points={coord_t1.shape[0]}, "
-            f"labels={semantic_t1.shape[0]}"
+            "T1 point/label topology mismatch"
         )
 
-    if coord_t2.shape[0] != semantic_t2.shape[0]:
+    if (
+        coord_t2.shape[0]
+        != semantic_t2.shape[0]
+    ):
         raise RuntimeError(
-            f"T2 topology mismatch: points={coord_t2.shape[0]}, "
-            f"labels={semantic_t2.shape[0]}"
+            "T2 point/label topology mismatch"
         )
 
-    validate_semantic(
+    validate_labels(
         semantic_t1,
-        class_names=class_names,
-        ignored_id=ignored_id,
-        label="semantic_t1",
-    )
-    validate_semantic(
-        semantic_t2,
-        class_names=class_names,
-        ignored_id=ignored_id,
-        label="semantic_t2",
-    )
-    validate_change(
         change_t1,
+        class_names=class_names,
         ignored_id=ignored_id,
-        label="change_t1",
-    )
-    validate_change(
-        change_t2,
-        ignored_id=ignored_id,
-        label="change_t2",
+        name="T1",
     )
 
-    print("\n[Prepared sample]")
+    validate_labels(
+        semantic_t2,
+        change_t2,
+        class_names=class_names,
+        ignored_id=ignored_id,
+        name="T2",
+    )
+
+    print("=" * 78)
+    print("PAIR NYC-SCD -> Utonia -> PointAdapter smoke test")
+    print("=" * 78)
+    print(" config      :", config_path)
+    print(" dataset     :", args.dataset)
+    print(" split       :", args.split)
+    print(" sample      :", record.get("id", args.index))
+    print(" ignored_id  :", ignored_id)
+    print(" Utonia ckpt :", checkpoint)
+    print(" Utonia voxel:", voxel_size)
+    print(" token budget:", max_tokens)
+
+    print("\n[Prepared data]")
     print(
         " T1:",
         f"N={coord_t1.shape[0]:,}",
-        f"feat={None if feat_t1 is None else feat_t1.shape}",
-    )
-    print(
-        "     semantic:",
+        "semantic=",
         unique_counts(semantic_t1),
-    )
-    print(
-        "     change  :",
+        "change=",
         unique_counts(change_t1),
     )
+
     print(
         " T2:",
         f"N={coord_t2.shape[0]:,}",
-        f"feat={None if feat_t2 is None else feat_t2.shape}",
-    )
-    print(
-        "     semantic:",
+        "semantic=",
         unique_counts(semantic_t2),
-    )
-    print(
-        "     change  :",
+        "change=",
         unique_counts(change_t2),
     )
 
-    device = torch.device(args.device)
+    device = torch.device(
+        args.device
+    )
 
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "CUDA requested but torch.cuda.is_available() is False"
+                "CUDA requested but unavailable"
             )
+
         print("\n[CUDA]")
         print(" torch      :", torch.__version__)
         print(" cuda       :", torch.version.cuda)
         print(
             " gpu        :",
-            torch.cuda.get_device_name(device),
+            torch.cuda.get_device_name(
+                device
+            ),
         )
 
     encoder = UtoniaPointEncoder(
@@ -516,80 +677,198 @@ def main():
 
     encoder.eval()
 
-    total_params = sum(
-        p.numel()
+    if any(
+        p.requires_grad
         for p in encoder.parameters()
-    )
-    trainable_params = sum(
-        p.numel()
-        for p in encoder.parameters()
-        if p.requires_grad
-    )
-
-    print("\n[Encoder]")
-    print(" params      :", f"{total_params:,}")
-    print(" trainable   :", f"{trainable_params:,}")
-    print(" output_dim  :", encoder.output_dim)
-    print(" stage dims  :", encoder.stage_channels)
-
-    if trainable_params != 0:
+    ):
         raise RuntimeError(
-            "Utonia is supposed to be frozen, "
-            f"but {trainable_params:,} parameters are trainable"
+            "Utonia must be fully frozen"
         )
 
-    expected_dim = sum(
-        int(x)
-        for x in ckpt_cfg["enc_channels"]
+    adapter = PointAdapter(
+        PointAdapterConfig(
+            in_dim=encoder.output_dim,
+            dense_dim=int(
+                model_cfg[
+                    "decoder_dim"
+                ]
+            ),
+            out_dim=2560,
+            num_tokens=max_tokens,
+        )
+    ).to(device)
+
+    adapter.eval()
+
+    print("\n[PointAdapter]")
+    print(
+        " trainable params:",
+        f"{adapter.trainable_parameter_count():,}",
+    )
+    print(
+        " dims:",
+        f"{encoder.output_dim}"
+        f" -> {adapter.dense_dim}"
+        f" -> {adapter.out_dim}",
     )
 
-    if encoder.output_dim != expected_dim:
-        raise RuntimeError(
-            f"Encoder output_dim={encoder.output_dim}, "
-            f"but checkpoint enc_channels sum to {expected_dim}"
-        )
-
-    p1 = to_point_dict(
+    # ------------------------------------------------------------------
+    # T1: geometry-only reference
+    # ------------------------------------------------------------------
+    t1_geo_input = point_dict_from_numpy(
         coord_t1,
-        device,
+        device=device,
+        with_fake_intensity=False,
     )
-    p2 = to_point_dict(
+
+    t1_encoded_geo = run_utonia(
+        encoder,
+        t1_geo_input,
+        name="T1 geometry-only",
+        device=device,
+    )
+
+    t1_adapter_geo = run_adapter(
+        adapter,
+        t1_encoded_geo,
+        name="T1 geometry-only",
+        device=device,
+    )
+
+    if t1_adapter_geo.intensity_used:
+        raise RuntimeError(
+            "Geometry-only path incorrectly reports intensity_used=True"
+        )
+
+    # ------------------------------------------------------------------
+    # T1: same points + deterministic fake intensity
+    # ------------------------------------------------------------------
+    t1_fake_input = point_dict_from_numpy(
+        coord_t1,
+        device=device,
+        with_fake_intensity=True,
+    )
+
+    t1_encoded_fake = run_utonia(
+        encoder,
+        t1_fake_input,
+        name="T1 fake-intensity",
+        device=device,
+    )
+
+    # Utonia must be identical: fake intensity bypasses Utonia entirely.
+    utonia_diff = (
+        t1_encoded_geo.features
+        - t1_encoded_fake.features
+    ).abs().max().item()
+
+    print(
+        "\n[T1 Utonia geometry vs fake-I]"
+    )
+    print(
+        " max feature difference:",
+        f"{utonia_diff:.9g}",
+    )
+
+    if not torch.allclose(
+        t1_encoded_geo.features,
+        t1_encoded_fake.features,
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise RuntimeError(
+            "Fake intensity changed frozen Utonia features beyond "
+            f"floating-point tolerance; max difference={utonia_diff}"
+        )
+
+    t1_adapter_fake = run_adapter(
+        adapter,
+        t1_encoded_fake,
+        name="T1 fake-intensity",
+        device=device,
+    )
+
+    if not t1_adapter_fake.intensity_used:
+        raise RuntimeError(
+            "Fake intensity path reports intensity_used=False"
+        )
+
+    # Fresh adapter starts geometry-only because residual intensity fusion's
+    # final layer is zero initialized.
+    dense_diff = (
+        t1_adapter_geo.dense_features
+        - t1_adapter_fake.dense_features
+    ).abs().max().item()
+
+    print(
+        "\n[T1 adapter initial geometry vs fake-I]"
+    )
+    print(
+        " max dense difference:",
+        f"{dense_diff:.9g}",
+    )
+
+    if not torch.allclose(
+        t1_adapter_geo.dense_features,
+        t1_adapter_fake.dense_features,
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise RuntimeError(
+            "Fresh intensity residual branch should start from the "
+            "geometry-only representation within floating-point tolerance; "
+            f"max dense difference={dense_diff}"
+        )
+
+    # ------------------------------------------------------------------
+    # T2: full fake-intensity path
+    # ------------------------------------------------------------------
+    t2_fake_input = point_dict_from_numpy(
         coord_t2,
-        device,
+        device=device,
+        with_fake_intensity=True,
     )
 
-    out1 = run_encoder(
+    t2_encoded_fake = run_utonia(
         encoder,
-        p1,
-        name="T1",
+        t2_fake_input,
+        name="T2 fake-intensity",
         device=device,
     )
 
-    del p1
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    out2 = run_encoder(
-        encoder,
-        p2,
-        name="T2",
+    t2_adapter_fake = run_adapter(
+        adapter,
+        t2_encoded_fake,
+        name="T2 fake-intensity",
         device=device,
     )
+
+    if not t2_adapter_fake.intensity_used:
+        raise RuntimeError(
+            "T2 fake intensity was not used"
+        )
 
     print("\n" + "=" * 78)
     print("PASS")
     print("=" * 78)
     print(
-        "Data topology, label IDs, frozen Utonia loading, "
-        "and dense inverse mapping all passed."
+        "Real NYC-SCD -> frozen Utonia -> PointAdapter passed."
+    )
+    print(
+        "Fake intensity was carried correctly and entered only "
+        "the PAIR intensity branch, not Utonia."
     )
     print(
         "T1 dense:",
-        tuple(out1.features.shape),
+        tuple(t1_adapter_fake.dense_features.shape),
+        "tokens:",
+        tuple(t1_adapter_fake.tokens.shape),
     )
     print(
         "T2 dense:",
-        tuple(out2.features.shape),
+        tuple(t2_adapter_fake.dense_features.shape),
+        "tokens:",
+        tuple(t2_adapter_fake.tokens.shape),
     )
 
 

@@ -91,6 +91,11 @@ class PointEncoderOutput:
     batch: torch.Tensor
     offset: torch.Tensor
 
+    # Optional LiDAR radiometry. Utonia itself does not consume intensity;
+    # it is carried unchanged to PointAdapter for PAIR-side fusion.
+    intensity: Optional[torch.Tensor] = None
+    intensity_mask: Optional[torch.Tensor] = None
+
 
 def _load_checkpoint(path: Path):
     try:
@@ -1108,6 +1113,89 @@ class UtoniaPointEncoder(nn.Module):
         return point
 
     # ------------------------------------------------------------------
+    # Optional LiDAR intensity
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_optional_intensity(
+        point_dict: Dict[str, torch.Tensor],
+        *,
+        num_points: int,
+        device: torch.device,
+    ):
+        """
+        Carry optional per-point LiDAR intensity through the frozen Utonia
+        backbone without feeding it into Utonia.
+
+        intensity:
+            Optional [N] or [N,1] tensor.
+
+        intensity_mask:
+            Optional [N] or [N,1] bool / 0-1 tensor. If intensity exists and
+            no mask is supplied, all points are considered valid.
+
+        Intensity normalization deliberately belongs to dataset preparation,
+        not to Utonia. Different LiDAR sensors should use one consistent
+        train-split normalization policy rather than per-tile min-max scaling.
+        """
+        intensity = point_dict.get("intensity")
+
+        if intensity is None:
+            if point_dict.get("intensity_mask") is not None:
+                raise ValueError(
+                    "intensity_mask was provided but intensity is absent"
+                )
+            return None, None
+
+        if not torch.is_tensor(intensity):
+            intensity = torch.as_tensor(
+                intensity, dtype=torch.float32, device=device
+            )
+        else:
+            intensity = intensity.to(device=device, dtype=torch.float32)
+
+        if intensity.ndim == 1:
+            intensity = intensity.unsqueeze(1)
+
+        if intensity.shape != (num_points, 1):
+            raise ValueError(
+                f"intensity must be [N] or [N,1], got "
+                f"{tuple(intensity.shape)} for N={num_points}"
+            )
+
+        if not torch.isfinite(intensity).all():
+            raise ValueError("intensity contains NaN/Inf")
+
+        mask = point_dict.get("intensity_mask")
+        if mask is None:
+            mask = torch.ones(
+                (num_points, 1), dtype=torch.bool, device=device
+            )
+        else:
+            if not torch.is_tensor(mask):
+                mask = torch.as_tensor(mask, device=device)
+            else:
+                mask = mask.to(device=device)
+
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(1)
+
+            if mask.shape != (num_points, 1):
+                raise ValueError(
+                    f"intensity_mask must be [N] or [N,1], got "
+                    f"{tuple(mask.shape)} for N={num_points}"
+                )
+
+            if mask.dtype != torch.bool:
+                if not torch.all((mask == 0) | (mask == 1)):
+                    raise ValueError(
+                        "intensity_mask must contain only bool or 0/1"
+                    )
+                mask = mask.bool()
+
+        return intensity, mask
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -1197,9 +1285,17 @@ class UtoniaPointEncoder(nn.Module):
                 f"got {dense_features.shape[1]}"
             )
 
+        intensity, intensity_mask = self._extract_optional_intensity(
+            point_dict,
+            num_points=original_coord.shape[0],
+            device=original_coord.device,
+        )
+
         return PointEncoderOutput(
             features=dense_features,
             coord=original_coord,
             batch=original_batch,
             offset=original_offset,
+            intensity=intensity,
+            intensity_mask=intensity_mask,
         )
