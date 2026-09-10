@@ -6,6 +6,7 @@ The user JSON is intentionally minimal for each dataset:
     "SECOND": {
         "root": "/home/sht/Datasets/SECONDpair",
         "per_gpu_batch_size": 4,
+        "ignored_id": null,
         "class_names": {
             "0": "unchanged",
             "1": "water",
@@ -31,12 +32,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import hashlib
 import json
 
-from datasets.pair_dataset import (
-    DatasetSpec,
-    infer_binary_class_ids,
-    infer_unchanged_raw_id,
-    route_from_modalities,
-)
+from datasets.pair_dataset import DatasetSpec, infer_binary_class_ids, infer_unchanged_raw_id, route_from_modalities
 
 
 IMAGE_DIRS = ("images_t1", "images_t2")
@@ -52,41 +48,42 @@ def _require_dict(value, name):
 
 def _normalize_class_names(value, dataset_name) -> Dict[int, str]:
     if not isinstance(value, dict) or not value:
-        raise TypeError(
-            f"{dataset_name}.class_names must be a non-empty object"
-        )
+        raise TypeError(f"{dataset_name}.class_names must be a non-empty object")
 
     result = {}
     for raw_id, class_name in value.items():
         try:
             raw_id = int(raw_id)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{dataset_name}: class id {raw_id!r} is not an integer"
-            ) from exc
+            raise ValueError(f"{dataset_name}: class id {raw_id!r} is not an integer") from exc
 
         if raw_id in result:
-            raise ValueError(
-                f"{dataset_name}: duplicate class id {raw_id}"
-            )
+            raise ValueError(f"{dataset_name}: duplicate class id {raw_id}")
 
         name = str(class_name).strip()
         if not name:
-            raise ValueError(
-                f"{dataset_name}: empty class name for id {raw_id}"
-            )
+            raise ValueError(f"{dataset_name}: empty class name for id {raw_id}")
         result[raw_id] = name
 
     return dict(sorted(result.items()))
+
+
+def _normalize_ignored_id(value, dataset_name) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{dataset_name}.ignored_id must be an integer or null")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{dataset_name}.ignored_id must be an integer or null") from exc
 
 
 def _paired_directory(root: Path, left: str, right: str) -> bool:
     a = (root / left).is_dir()
     b = (root / right).is_dir()
     if a != b:
-        raise ValueError(
-            f"{root}: {left}/ and {right}/ must either both exist or both be absent"
-        )
+        raise ValueError(f"{root}: {left}/ and {right}/ must either both exist or both be absent")
     return a and b
 
 
@@ -116,8 +113,7 @@ def infer_dataset_schema(root: Path) -> Dict[str, Any]:
     if sem1 != sem2 and not (change and sem2 and not sem1):
         raise ValueError(
             f"{root}: incomplete semantic supervision directories. "
-            "PAIR expects semantic_t1+semantic_t2, or change+semantic_t2, "
-            "or change only."
+            "PAIR expects semantic_t1+semantic_t2, or change+semantic_t2, or change only."
         )
 
     if sem1 and sem2:
@@ -128,20 +124,16 @@ def infer_dataset_schema(root: Path) -> Dict[str, Any]:
         label_mode = "binary"
     else:
         raise ValueError(
-            f"{root}: no PAIR supervision found. Expected "
-            "semantic_t1/semantic_t2 or change/."
+            f"{root}: no PAIR supervision found. Expected semantic_t1/semantic_t2 or change/."
         )
 
     manifest_dir = root / "manifests"
     train_manifest = manifest_dir / "train.jsonl"
     if not train_manifest.is_file():
-        raise FileNotFoundError(
-            f"{root}: required manifest missing: {train_manifest}"
-        )
+        raise FileNotFoundError(f"{root}: required manifest missing: {train_manifest}")
 
     val_manifest = manifest_dir / "val.jsonl"
     test_manifest = manifest_dir / "test.jsonl"
-
     return {
         "modalities": tuple(modalities),
         "route": route_from_modalities(modalities),
@@ -159,6 +151,7 @@ class DatasetConfig:
     root: Path
     per_gpu_batch_size: int
     class_names: Dict[int, str]
+    ignored_id: Optional[int]
 
     modalities: Tuple[str, ...]
     route: str
@@ -176,27 +169,18 @@ class DatasetConfig:
             "name": self.name,
             "root": str(self.root),
             "per_gpu_batch_size": self.per_gpu_batch_size,
-            "class_names": {
-                str(k): v for k, v in self.class_names.items()
-            },
-
-            # Inferred PAIR schema:
+            "class_names": {str(k): v for k, v in self.class_names.items()},
+            "ignored_id": self.ignored_id,
+            # Inferred PAIR schema/runtime metadata:
             "modalities": list(self.modalities),
             "route": self.route,
             "label_mode": self.label_mode,
             "unchanged_raw_id": self.unchanged_raw_id,
             "manifests": {
                 "train": str(self.train_manifest),
-                "val": (
-                    None if self.val_manifest is None
-                    else str(self.val_manifest)
-                ),
-                "test": (
-                    None if self.test_manifest is None
-                    else str(self.test_manifest)
-                ),
+                "val": None if self.val_manifest is None else str(self.val_manifest),
+                "test": None if self.test_manifest is None else str(self.test_manifest),
             },
-            "point_grid_size": self.spec.point_grid_size,
         }
 
 
@@ -231,10 +215,7 @@ class ExperimentConfig:
     def logging(self):
         return self.raw["logging"]
 
-    def resolved_dict(
-        self,
-        runtime: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    def resolved_dict(self, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         resolved = {
             "experiment": deepcopy(self.experiment),
             "model": deepcopy(self.model),
@@ -243,10 +224,7 @@ class ExperimentConfig:
             "validation": deepcopy(self.validation),
             "logging": deepcopy(self.logging),
             "selected_datasets": list(self.selected_names),
-            "datasets": {
-                name: self.datasets[name].resolved_dict()
-                for name in self.selected_names
-            },
+            "datasets": {name: self.datasets[name].resolved_dict() for name in self.selected_names},
         }
         if runtime is not None:
             resolved["runtime"] = deepcopy(runtime)
@@ -255,10 +233,7 @@ class ExperimentConfig:
     @staticmethod
     def hash_resolved(resolved: Dict[str, Any]) -> str:
         payload = json.dumps(
-            resolved,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+            resolved, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
@@ -270,28 +245,9 @@ def _resolve_path(value, config_dir: Path) -> Path:
     return path.resolve()
 
 
-def _global_point_grid_size(raw: Dict[str, Any]) -> float:
-    point_cfg = raw.get("model", {}).get("point_encoder", {})
-    grid_size = float(point_cfg.get("grid_size", 0.10))
-    if grid_size <= 0:
-        raise ValueError("model.point_encoder.grid_size must be > 0")
-    return grid_size
-
-
-def _dataset_from_json(
-    name: str,
-    data: Mapping[str, Any],
-    config_dir: Path,
-    *,
-    point_grid_size: float,
-) -> DatasetConfig:
+def _dataset_from_json(name: str, data: Mapping[str, Any], config_dir: Path) -> DatasetConfig:
     data = _require_dict(dict(data), f"datasets.{name}")
-
-    allowed = {
-        "root",
-        "per_gpu_batch_size",
-        "class_names",
-    }
+    allowed = {"root", "per_gpu_batch_size", "class_names", "ignored_id"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise KeyError(
@@ -304,31 +260,26 @@ def _dataset_from_json(
 
     root = _resolve_path(data["root"], config_dir)
     schema = infer_dataset_schema(root)
+    class_names = _normalize_class_names(data.get("class_names"), name)
+    ignored_id = _normalize_ignored_id(data.get("ignored_id"), name)
 
-    class_names = _normalize_class_names(
-        data.get("class_names"), name
-    )
+    # Runtime metadata only. It is derived by class name and is not stored in DatasetSpec.
     unchanged_raw_id = infer_unchanged_raw_id(class_names)
 
-    # For binary datasets, raw label semantics are fully declared by class_names.
-    # Example: {0: "unchanged", 255: "changed"}. Nothing extra is stored.
+    # Binary raw label semantics are declared only by class_names.
     if schema["label_mode"] == "binary":
         infer_binary_class_ids(class_names)
 
     batch = int(data.get("per_gpu_batch_size", 1))
     if batch <= 0:
-        raise ValueError(
-            f"{name}.per_gpu_batch_size must be > 0"
-        )
-
+        raise ValueError(f"{name}.per_gpu_batch_size must be > 0")
 
     spec = DatasetSpec(
         name=name,
         modalities=schema["modalities"],
         label_mode=schema["label_mode"],
         class_names=class_names,
-        point_grid_size=point_grid_size,
-        unchanged_raw_id=unchanged_raw_id,
+        ignored_id=ignored_id,
     )
 
     return DatasetConfig(
@@ -336,6 +287,7 @@ def _dataset_from_json(
         root=root,
         per_gpu_batch_size=batch,
         class_names=class_names,
+        ignored_id=ignored_id,
         modalities=schema["modalities"],
         route=schema["route"],
         label_mode=schema["label_mode"],
@@ -366,9 +318,7 @@ def load_experiment_config(
         "datasets",
     ):
         if section not in raw:
-            raise KeyError(
-                f"Missing top-level config section: {section}"
-            )
+            raise KeyError(f"Missing top-level config section: {section}")
         _require_dict(raw[section], section)
 
     catalog = raw["datasets"]
@@ -376,48 +326,26 @@ def load_experiment_config(
         raise ValueError("Config contains no datasets")
 
     if selected_names:
-        names = tuple(
-            dict.fromkeys(str(x) for x in selected_names)
-        )
+        names = tuple(dict.fromkeys(str(x) for x in selected_names))
     else:
-        defaults = raw["experiment"].get("default_datasets")
-        names = (
-            tuple(defaults)
-            if defaults
-            else tuple(catalog.keys())
-        )
+        names = tuple(catalog.keys())
 
-    missing = [
-        name for name in names
-        if name not in catalog
-    ]
+    missing = [name for name in names if name not in catalog]
     if missing:
-        raise KeyError(
-            f"Unknown datasets {missing}. "
-            f"Available: {list(catalog.keys())}"
-        )
+        raise KeyError(f"Unknown datasets {missing}. Available: {list(catalog.keys())}")
 
     if not names:
         raise ValueError("No datasets selected")
 
-    point_grid_size = _global_point_grid_size(raw)
-
     datasets = {
-        name: _dataset_from_json(
-            name,
-            catalog[name],
-            path.parent,
-            point_grid_size=point_grid_size,
-        )
+        name: _dataset_from_json(name, catalog[name], path.parent)
         for name in names
     }
 
     if int(raw["experiment"].get("epochs", 0)) <= 0:
         raise ValueError("experiment.epochs must be > 0")
-
     if int(raw["training"].get("grad_accum", 0)) <= 0:
         raise ValueError("training.grad_accum must be > 0")
-
     if int(raw["training"].get("num_workers", 0)) < 0:
         raise ValueError("training.num_workers must be >= 0")
 
