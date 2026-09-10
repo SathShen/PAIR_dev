@@ -4,7 +4,7 @@
 """
 PAIR multi-dataset training.
 
-Model construction lives in models/pair.py. This file only owns:
+Model construction lives in models/pair.py. This file owns only:
     config/runtime
     datasets + multi-dataset scheduling
     target collation
@@ -16,28 +16,36 @@ Model construction lives in models/pair.py. This file only owns:
 
 CLI:
     python train.py --config configs/pair_train.json --datasets SECOND NYC-SCD
+
+3D supervision:
+    semantic_t1 / semantic_t2
+    event_t1 / event_t2
+    event_valid_t1 / event_valid_t2
+
+There is no 3D binary change target/head. Traditional binary change metrics are
+derived in metrics.py from event != unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-from collections import Counter
-from pathlib import Path
-from types import SimpleNamespace
 import json
 import os
 import random
 import re
 import sys
 import time
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from tqdm.auto import tqdm
+from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from datasets.config_loader import ExperimentConfig, load_experiment_config
 from datasets.multi_dataset import DatasetRegistry, MultiDatasetScheduler
@@ -157,12 +165,10 @@ class TeeStdout:
 def make_writer(output_dir, enabled, is_main):
     if not enabled or not is_main:
         return None
-
     try:
         from torch.utils.tensorboard import SummaryWriter
     except ImportError as exc:
         raise ImportError("TensorBoard logging requires: pip install tensorboard") from exc
-
     return SummaryWriter(log_dir=str(output_dir / "tensorboard"))
 
 
@@ -185,6 +191,9 @@ def format_duration(seconds):
 # =============================================================================
 
 def _cat_target(samples, key):
+    missing = [i for i, sample in enumerate(samples) if key not in sample["target"]]
+    if missing:
+        raise KeyError(f"Target key {key!r} missing from samples {missing}")
     return torch.cat([sample["target"][key].reshape(-1) for sample in samples], dim=0)
 
 
@@ -193,23 +202,28 @@ def _cat_valid_or_true(samples, value_key, valid_key):
     for sample in samples:
         target = sample["target"]
         value = target[value_key]
-
-        if valid_key in target:
-            valid = target[valid_key]
-        else:
+        valid = target.get(valid_key)
+        if valid is None:
             valid = torch.ones_like(value, dtype=torch.bool)
-
         parts.append(valid.reshape(-1).bool())
-
     return torch.cat(parts, dim=0)
+
+
+def _cat_optional_valid(samples, value_key, valid_key):
+    if not any(valid_key in sample["target"] for sample in samples):
+        return None
+    return _cat_valid_or_true(samples, value_key, valid_key)
 
 
 def merge_targets(samples, route):
     """
-    Dataset files only carry valid masks when an explicit ignored_id exists.
-    loss.py / metrics.py currently consume a mask unconditionally, so fully
-    supervised samples receive an all-True mask here at the training boundary.
-    No magic ignore label is introduced into the dataset.
+    Collate prepared PAIR targets without inventing supervision.
+
+    2D stays on the existing semantic + binary-change protocol.
+
+    3D uses semantic + event. event_valid is mandatory because T1/T2 temporal
+    support is intentionally asymmetric. semantic_valid is emitted only when
+    the dataset actually supplies it (i.e. ignored_id is configured).
     """
     if route == "2d":
         return {
@@ -222,16 +236,21 @@ def merge_targets(samples, route):
         }
 
     if route == "3d":
-        return {
+        target = {
             "semantic_t1": _cat_target(samples, "semantic_t1"),
             "semantic_t2": _cat_target(samples, "semantic_t2"),
-            "change_t1": _cat_target(samples, "change_t1"),
-            "change_t2": _cat_target(samples, "change_t2"),
-            "semantic_valid_t1": _cat_valid_or_true(samples, "semantic_t1", "semantic_valid_t1"),
-            "semantic_valid_t2": _cat_valid_or_true(samples, "semantic_t2", "semantic_valid_t2"),
-            "change_valid_t1": _cat_valid_or_true(samples, "change_t1", "change_valid_t1"),
-            "change_valid_t2": _cat_valid_or_true(samples, "change_t2", "change_valid_t2"),
+            "event_t1": _cat_target(samples, "event_t1").long(),
+            "event_t2": _cat_target(samples, "event_t2").long(),
+            "event_valid_t1": _cat_target(samples, "event_valid_t1").bool(),
+            "event_valid_t2": _cat_target(samples, "event_valid_t2").bool(),
         }
+        semantic_valid_t1 = _cat_optional_valid(samples, "semantic_t1", "semantic_valid_t1")
+        semantic_valid_t2 = _cat_optional_valid(samples, "semantic_t2", "semantic_valid_t2")
+        if semantic_valid_t1 is not None:
+            target["semantic_valid_t1"] = semantic_valid_t1
+        if semantic_valid_t2 is not None:
+            target["semantic_valid_t2"] = semantic_valid_t2
+        return target
 
     raise NotImplementedError(
         "2D+3D target collation is deferred together with world-coordinate decoder wiring"
@@ -248,7 +267,6 @@ def forward_loss(model, criterion, samples, spec):
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
         prediction = model(
-            task_mode="2d",
             images_t1=[sample["images_t1"] for sample in samples],
             images_t2=[sample["images_t2"] for sample in samples],
             prompts=prompts,
@@ -257,7 +275,6 @@ def forward_loss(model, criterion, samples, spec):
         )
     elif spec.route == "3d":
         prediction = model(
-            task_mode="3d",
             point_dicts_t1=[sample["point_dict_t1"] for sample in samples],
             point_dicts_t2=[sample["point_dict_t2"] for sample in samples],
             prompts=prompts,
@@ -269,17 +286,20 @@ def forward_loss(model, criterion, samples, spec):
         )
 
     target = merge_targets(samples, spec.route)
-    loss_output = criterion(prediction=prediction, target=target, class_names=spec.class_names)
+    loss_output = criterion(
+        prediction=prediction,
+        target=target,
+        class_names=spec.class_names,
+        dataset_name=spec.name,
+    )
     return prediction, loss_output, target
 
 
 def all_reduce_loss_sums(sums, count, device):
     keys = sorted(sums)
     tensor = torch.tensor([sums[k] for k in keys] + [count], dtype=torch.float64, device=device)
-
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
     count = max(float(tensor[-1].item()), 1.0)
     return {key: float(tensor[i].item() / count) for i, key in enumerate(keys)}
 
@@ -287,12 +307,11 @@ def all_reduce_loss_sums(sums, count, device):
 @torch.no_grad()
 def validate(model, criterion, loader, spec, runtime, settings):
     model.eval()
-
     evaluator = PAIRMetrics(
         spec.class_names,
         runtime["device"],
         settings.change_threshold,
-        unchanged_raw_id=spec.unchanged_raw_id,
+        dataset_name=spec.name,
     )
 
     sums, count = {}, 0
@@ -312,14 +331,12 @@ def validate(model, criterion, loader, spec, runtime, settings):
 
         evaluator.update(prediction, merged_target)
         batch_n = len(samples)
-
         for key, value in loss_output.as_dict().items():
             sums[key] = sums.get(key, 0.0) + float(value.detach().cpu()) * batch_n
 
         count += batch_n
         if runtime["is_main"]:
             progress.set_postfix(samples=count, refresh=False)
-
         if settings.val_max_samples > 0 and count >= settings.val_max_samples:
             break
 
@@ -339,11 +356,9 @@ def validate(model, criterion, loader, spec, runtime, settings):
 
 def build_optimizer(model, settings):
     main, lora = [], []
-
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-
         if "lora_" in name:
             lora.append(parameter)
         else:
@@ -354,7 +369,6 @@ def build_optimizer(model, settings):
         groups.append({"params": main, "lr": settings.lr, "name": "pair"})
     if lora:
         groups.append({"params": lora, "lr": settings.lora_lr, "name": "lora"})
-
     if not groups:
         raise RuntimeError("PAIR has no trainable parameters")
 
@@ -364,17 +378,12 @@ def build_optimizer(model, settings):
 
 def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
     warmup = int(round(total_updates * warmup_ratio))
-
     if kind == "cosine":
         return get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup,
-            num_training_steps=total_updates,
+            optimizer, num_warmup_steps=warmup, num_training_steps=total_updates
         )
-
     if kind == "constant":
         return get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup)
-
     raise ValueError("optimizer.scheduler must be 'cosine' or 'constant'")
 
 
@@ -385,13 +394,11 @@ def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
 def non_qwen_trainable_state(model):
     base = unwrap(model)
     state = base.state_dict()
-
     names = {
         name
         for name, parameter in base.named_parameters()
         if parameter.requires_grad and not name.startswith("backbone.qwen_backbone.model.")
     }
-
     return {key: value.detach().cpu() for key, value in state.items() if key in names}
 
 
@@ -411,7 +418,6 @@ def save_checkpoint(
     validation_metrics=None,
 ):
     base = unwrap(model)
-
     checkpoint = {
         "epoch": int(epoch),
         "update_in_epoch": int(update_in_epoch),
@@ -428,7 +434,6 @@ def save_checkpoint(
         "config_hash": experiment.hash_resolved(resolved_config),
         "selected_datasets": list(experiment.selected_names),
     }
-
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
 
@@ -437,18 +442,18 @@ def load_checkpoint(path, model, optimizer, scheduler):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     base = unwrap(model)
 
-    # New unified checkpoint.
     trainable_state = ckpt.get("pair_trainable", {})
     if trainable_state:
         current = base.state_dict()
         current.update(trainable_state)
         base.load_state_dict(current, strict=False)
 
-    # Compatibility with older checkpoints where these lived outside PAIRModel.
+    # Compatibility with pre-PAIRModel checkpoints. strict=False is intentional:
+    # old decoder checkpoints do not contain the new 3D event_head.
     if "decoder" in ckpt:
-        base.decoder.load_state_dict(ckpt["decoder"])
+        base.decoder.load_state_dict(ckpt["decoder"], strict=False)
     if "image_adapter" in ckpt:
-        base.image_adapter.load_state_dict(ckpt["image_adapter"])
+        base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
 
     load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
     optimizer.load_state_dict(ckpt["optimizer"])
@@ -478,12 +483,13 @@ def selection_metric_for_spec(spec):
     if spec.label_mode in {"binary", "post_semantic"}:
         return "change/IoU", "IoU"
 
-    raise ValueError(f"No checkpoint selection rule for route={spec.route!r}, label_mode={spec.label_mode!r}")
+    raise ValueError(
+        f"No checkpoint selection rule for route={spec.route!r}, label_mode={spec.label_mode!r}"
+    )
 
 
 def selection_from_results(experiment, results_by_dataset):
     selection = {}
-
     for name in experiment.selected_names:
         if name not in results_by_dataset:
             continue
@@ -491,7 +497,6 @@ def selection_from_results(experiment, results_by_dataset):
         spec = experiment.datasets[name].spec
         metric_key, metric_label = selection_metric_for_spec(spec)
         scalars = results_by_dataset[name]["scalars"]
-
         if metric_key not in scalars:
             raise KeyError(
                 f"{name}: validation metric {metric_key!r} missing; available={sorted(scalars)}"
@@ -502,22 +507,17 @@ def selection_from_results(experiment, results_by_dataset):
             "metric_label": metric_label,
             "value": float(scalars[metric_key]),
         }
-
     return selection
 
 
 def epoch_checkpoint_name(epoch, experiment, selection):
     parts = [f"Ep{int(epoch):03d}"]
-
     for name in experiment.selected_names:
         item = selection.get(name)
-        if item is None:
-            continue
-        parts.append(f"{safe_checkpoint_token(name)}{item['metric_label']}{item['value']:.4f}")
-
+        if item is not None:
+            parts.append(f"{safe_checkpoint_token(name)}{item['metric_label']}{item['value']:.4f}")
     if len(parts) == 1:
         parts.append("NoVal")
-
     return "_".join(parts) + ".pt"
 
 
@@ -528,13 +528,11 @@ def valbest_checkpoint_name(dataset_name, epoch_name):
 def remove_old_current_checkpoints(output_dir, keep_path):
     keep_path = Path(keep_path).resolve()
     removed = []
-
     for path in Path(output_dir).glob("Ep*.pt"):
         if path.resolve() == keep_path:
             continue
         path.unlink(missing_ok=True)
         removed.append(path.name)
-
     return removed
 
 
@@ -542,13 +540,11 @@ def replace_dataset_valbest(output_dir, dataset_name, keep_path):
     keep_path = Path(keep_path).resolve()
     prefix = f"ValBest_{safe_checkpoint_token(dataset_name)}_"
     removed = []
-
     for path in Path(output_dir).glob(f"{prefix}*.pt"):
         if path.resolve() == keep_path:
             continue
         path.unlink(missing_ok=True)
         removed.append(path.name)
-
     return removed
 
 
@@ -557,6 +553,18 @@ def replace_dataset_valbest(output_dir, dataset_name, keep_path):
 # =============================================================================
 
 def validation_metric_layout(spec, scalars):
+    if spec.route == "3d":
+        candidates = (
+            ("SemOA", "semantic/OA"),
+            ("SemIoU", "semantic/mIoU"),
+            ("EvtOA", "event/OA"),
+            ("EvtF1", "event/mF1"),
+            ("EvtIoU", "event/mIoU"),
+            ("ChgF1", "change/F1"),
+            ("ChgIoU", "change/IoU"),
+        )
+        return tuple(item for item in candidates if item[1] in scalars)
+
     if spec.label_mode in {"binary", "post_semantic"}:
         return (
             ("OA", "change/OA"),
@@ -573,10 +581,8 @@ def validation_metric_layout(spec, scalars):
             ("F_scd", "scd/F_scd"),
             ("mIoU", "scd/mIoU"),
         )
-
         if all(key in scalars for _, key in scd_metrics):
             return scd_metrics
-
         return tuple(
             item
             for item in (("OA", "semantic/OA"), ("mIoU", "semantic/mIoU"))
@@ -596,6 +602,9 @@ def log_tensorboard_train(writer, values, step, dataset_name):
         "loss_semantic_t2",
         "loss_change_bce",
         "loss_change_dice",
+        "loss_event_t1",
+        "loss_event_t2",
+        "loss_event",
     ):
         value = values.get(key)
         if isinstance(value, (int, float)):
@@ -606,9 +615,9 @@ def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
     if writer is None:
         return
 
-    total_loss = result["losses"].get("loss")
-    if isinstance(total_loss, (int, float)):
-        writer.add_scalar(f"val/{dataset_name}/loss", total_loss, epoch)
+    for key, value in result["losses"].items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar(f"val/{dataset_name}/{key}", value, epoch)
 
     scalars = result["scalars"]
     for display_name, key in validation_metric_layout(spec, scalars):
@@ -625,9 +634,46 @@ def print_val(dataset_name, result, spec):
         for name, key in validation_metric_layout(spec, scalars)
         if key in scalars
     ]
-
     suffix = " | " + " ".join(fields) if fields else ""
     print(f"VAL [{dataset_name}] | loss={loss:.4f}{suffix}")
+
+
+def iteration_loss_string(means, route):
+    base = (
+        f"loss={means['loss']:.6f} "
+        f"sem1={means['loss_semantic_t1']:.6f} "
+        f"sem2={means['loss_semantic_t2']:.6f}"
+    )
+    if route == "3d":
+        return (
+            base
+            + f" event1={means['loss_event_t1']:.6f}"
+            + f" event2={means['loss_event_t2']:.6f}"
+            + f" event={means['loss_event']:.6f}"
+        )
+    return (
+        base
+        + f" bce={means['loss_change_bce']:.6f}"
+        + f" dice={means['loss_change_dice']:.6f}"
+    )
+
+
+def window_loss_string(means):
+    fields = [
+        f"avg_loss={means['loss']:.4f}",
+        f"avg_sem1={means['loss_semantic_t1']:.4f}",
+        f"avg_sem2={means['loss_semantic_t2']:.4f}",
+    ]
+
+    # A mixed 2D/3D window has zeros for inactive branches. Showing both keeps
+    # the global window truthful without guessing which route dominated.
+    if "loss_change_bce" in means:
+        fields.append(f"avg_bce={means['loss_change_bce']:.4f}")
+    if "loss_change_dice" in means:
+        fields.append(f"avg_dice={means['loss_change_dice']:.4f}")
+    if "loss_event" in means:
+        fields.append(f"avg_event={means['loss_event']:.4f}")
+    return " ".join(fields)
 
 
 # =============================================================================
@@ -650,7 +696,6 @@ def main():
     try:
         experiment = load_experiment_config(cli.config, cli.datasets)
         settings = build_settings(experiment, cli)
-
         if settings.grad_accum < 1:
             raise ValueError("training.grad_accum must be >= 1")
 
@@ -661,7 +706,6 @@ def main():
             log_path = settings.output_dir / "run.log"
             log_file = log_path.open("a", encoding="utf-8", buffering=1)
             sys.stdout = TeeStdout(original_stdout, log_file)
-
             print()
             print("=" * 96)
             print("PAIR RUN LOG")
@@ -674,13 +718,11 @@ def main():
 
         registry = DatasetRegistry(experiment, runtime, num_workers=settings.num_workers)
         dataset_scheduler = MultiDatasetScheduler(experiment, registry, settings.grad_accum)
-
         updates_per_epoch = dataset_scheduler.updates_per_epoch
         total_updates = updates_per_epoch * settings.epochs
 
         # Complete model construction is owned by models/pair.py.
         model = PAIRModel.from_config(experiment.model, runtime["device"])
-
         if runtime["distributed"]:
             model = DDP(
                 model,
@@ -693,10 +735,7 @@ def main():
         criterion = PAIRSemanticChangeLoss().to(runtime["device"])
         optimizer, _, _ = build_optimizer(model, settings)
         scheduler = build_scheduler(
-            optimizer,
-            total_updates,
-            settings.warmup_ratio,
-            settings.scheduler,
+            optimizer, total_updates, settings.warmup_ratio, settings.scheduler
         )
 
         start_epoch = 0
@@ -713,12 +752,10 @@ def main():
                 loaded_best_values,
                 loaded_best_epochs,
             ) = load_checkpoint(settings.resume, model, optimizer, scheduler)
-
             dataset_best_values.update(loaded_best_values)
             dataset_best_epochs.update(loaded_best_epochs)
 
         dataset_runtime = registry.runtime_summary(settings.grad_accum)
-
         for name, info in dataset_runtime.items():
             info["effective_global_batch"] = (
                 experiment.datasets[name].per_gpu_batch_size
@@ -734,7 +771,6 @@ def main():
             "dataset_epoch_plan": dataset_scheduler.summary(),
             "datasets": dataset_runtime,
         }
-
         resolved_config = experiment.resolved_dict(runtime=runtime_config)
 
         if runtime["is_main"]:
@@ -744,8 +780,7 @@ def main():
             source_config_text = experiment.path.read_text(encoding="utf-8")
             (settings.output_dir / "config.json").write_text(source_config_text, encoding="utf-8")
             (settings.output_dir / "config_resolved.json").write_text(
-                json.dumps(resolved_config, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                json.dumps(resolved_config, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
             base = unwrap(model)
@@ -779,13 +814,11 @@ def main():
                     f"updates={info['optimizer_updates_per_epoch']} "
                     f"fraction={info['update_fraction']:.3f}"
                 )
-
             if writer is not None:
                 print("TensorBoard:", settings.output_dir / "tensorboard")
             print()
 
         model.train()
-
         log_window_dataset_counts = Counter()
         log_window_sums = {}
         log_window_count = 0
@@ -795,12 +828,10 @@ def main():
             epoch_start = time.time()
             registry.reset_epoch(epoch)
             schedule = dataset_scheduler.epoch_schedule(epoch, runtime)
-
             schedule_counts = {
                 name: sum(1 for item in schedule if item.dataset_name == name)
                 for name in experiment.selected_names
             }
-
             first_update = start_update_in_epoch if epoch == start_epoch else 0
 
             if first_update > 0:
@@ -830,14 +861,12 @@ def main():
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             _, loss_output, _ = forward_loss(model, criterion, samples, spec)
                             loss = loss_output.total / accumulation_steps
-
                         loss.backward()
 
                     for key, value in loss_output.as_dict().items():
                         update_sums[key] = update_sums.get(key, 0.0) + float(value.detach().cpu())
 
                 trainable = [p for p in model.parameters() if p.requires_grad]
-
                 if settings.max_grad_norm > 0:
                     grad_norm = float(
                         torch.nn.utils.clip_grad_norm_(trainable, settings.max_grad_norm)
@@ -856,7 +885,6 @@ def main():
                     group.get("name", str(i)): group["lr"]
                     for i, group in enumerate(optimizer.param_groups)
                 }
-
                 elapsed = time.time() - update_start
                 samples_per_sec = update_samples * runtime["world_size"] / max(elapsed, 1e-6)
 
@@ -867,11 +895,7 @@ def main():
                             f"ITER E{epoch+1:03d} U{optimizer_step:06d} "
                             f"dataset={dataset_name} route={handle.config.route} "
                             f"update_in_epoch={update_idx+1} accu={accumulation_steps} "
-                            f"loss={means['loss']:.6f} "
-                            f"sem1={means['loss_semantic_t1']:.6f} "
-                            f"sem2={means['loss_semantic_t2']:.6f} "
-                            f"bce={means['loss_change_bce']:.6f} "
-                            f"dice={means['loss_change_dice']:.6f} "
+                            f"{iteration_loss_string(means, spec.route)} "
                             f"grad={grad_norm:.6f} "
                             f"lr_pair={lrs.get('pair', 0.0):.8e} "
                             f"lr_lora={lrs.get('lora', 0.0):.8e} "
@@ -883,7 +907,6 @@ def main():
 
                 log_window_dataset_counts[dataset_name] += 1
                 log_window_count += 1
-
                 for key, value in means.items():
                     log_window_sums[key] = log_window_sums.get(key, 0.0) + float(value)
 
@@ -902,21 +925,15 @@ def main():
                             for name in experiment.selected_names
                             if log_window_dataset_counts[name] > 0
                         )
-
                         print(
                             f"E{epoch+1:03d} U{optimizer_step:06d} [{mix}] | "
-                            f"avg_loss={window_means['loss']:.4f} "
-                            f"avg_sem1={window_means['loss_semantic_t1']:.4f} "
-                            f"avg_sem2={window_means['loss_semantic_t2']:.4f} "
-                            f"avg_bce={window_means['loss_change_bce']:.4f} "
-                            f"avg_dice={window_means['loss_change_dice']:.4f}"
+                            f"{window_loss_string(window_means)}"
                         )
 
                         for name in experiment.selected_names:
                             count = log_window_dataset_counts[name]
                             if count <= 0:
                                 continue
-
                             dataset_means = {
                                 key: value / count
                                 for key, value in log_window_dataset_sums.get(name, {}).items()
@@ -973,7 +990,6 @@ def main():
 
                 if runtime["is_main"] and results_by_dataset:
                     improved = []
-
                     for dataset_name, item in selection.items():
                         value = float(item["value"])
                         if value > dataset_best_values.get(dataset_name, -float("inf")):
@@ -1003,14 +1019,14 @@ def main():
                             validation_selection=selection,
                             validation_metrics=full_validation_metrics,
                         )
-
-                        removed = replace_dataset_valbest(settings.output_dir, dataset_name, best_path)
+                        removed = replace_dataset_valbest(
+                            settings.output_dir, dataset_name, best_path
+                        )
                         item = selection[dataset_name]
                         print(
                             f"ValBest [{dataset_name}] "
                             f"{item['metric_label']}={item['value']:.4f} @ Ep{epoch+1:03d}"
                         )
-
                         for old_name in removed:
                             print(f"  removed old ValBest: {old_name}")
 
@@ -1031,7 +1047,6 @@ def main():
                 full_validation_metrics = {
                     name: result["scalars"] for name, result in results_by_dataset.items()
                 }
-
                 save_checkpoint(
                     current_path,
                     model,
@@ -1047,10 +1062,8 @@ def main():
                     validation_selection=selection,
                     validation_metrics=full_validation_metrics,
                 )
-
                 removed = remove_old_current_checkpoints(settings.output_dir, current_path)
                 print(f"Current checkpoint: {current_name}")
-
                 for old_name in removed:
                     print(f"  removed old current: {old_name}")
 
@@ -1068,7 +1081,6 @@ def main():
 
         if runtime["is_main"]:
             print("Training complete.")
-
             for dataset_name in experiment.selected_names:
                 handle = registry.handles[dataset_name]
                 if handle.val_loader is None:
@@ -1077,7 +1089,6 @@ def main():
                 metric_key, metric_label = selection_metric_for_spec(handle.config.spec)
                 best_value = dataset_best_values.get(dataset_name, -float("inf"))
                 best_epoch = dataset_best_epochs.get(dataset_name, 0)
-
                 if best_epoch > 0:
                     print(
                         f"  {dataset_name}: ValBest {metric_label}={best_value:.4f} "
@@ -1102,7 +1113,6 @@ def main():
 
         if writer is not None:
             writer.close()
-
         if log_file is not None:
             sys.stdout.flush()
             sys.stdout = original_stdout
