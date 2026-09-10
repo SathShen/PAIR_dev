@@ -87,7 +87,7 @@
     "NYC-SCD": {
       "root": "/home/sht/Datasets/NYC-SCDpair",
       "per_gpu_batch_size": 1,
-      "ignored_id": null,
+      "ignored_id": -1,
       "class_names": {
         "0": "ground",
         "1": "building",
