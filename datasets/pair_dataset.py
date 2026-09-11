@@ -32,22 +32,22 @@ Semantic ignore:
     converted. With ignored_id configured, semantic_valid is generated.
 
 3D train crop:
-    Pure 3D training uses a ME-CPT-style change-aware crop sampler:
-      1. T2 is grouped into coarse 3D cells;
-      2. each cell receives its majority event label;
-      3. event classes are sampled with inverse-square-root frequency weights;
-      4. a center from that class is sampled;
-      5. both epochs receive the same 51.2 x 51.2 m XY crop.
+    Pure 3D training uses a ME-CPT-style change-aware crop sampler, adapted to
+    PAIR's temporally disentangled event supervision:
+      1. T1 valid removed points provide removed centers;
+      2. T2 valid unchanged/added points provide unchanged/added centers;
+      3. each source is grouped into coarse 3D cells;
+      4. event classes are sampled with inverse-square-root frequency weights;
+      5. a center from that class is sampled;
+      6. both epochs receive the same 51.2 x 51.2 m XY crop.
 
     ME-CPT uses radius=25 m and center cells radius/10=2.5 m. PAIR keeps its
     existing 51.2 m square window, therefore uses half-window/10 = 2.56 m
-    center cells. The sampling idea is retained while PAIR's spatial contract
-    stays unchanged.
+    center cells. The sampling idea is retained while PAIR's temporal-support
+    contract stays explicit.
 
-    T2 event labels are used for center selection. A T2 event that is invalid
-    only because its temporal support belongs to T1 (e.g. NYC removed) may still
-    be used as a crop-center label when the same event is valid on T1. Invalid
-    placeholder event=0 points are not promoted into sampling centers.
+    Canonical PAIR supervision is clean: event_valid=False entries must store
+    event=0. The sampler never relies on nonzero invalid event labels.
 
     If a sampled center yields an empty epoch, another center is tried. A
     jointly-occupied random-window fallback prevents the old one-epoch-empty
@@ -85,7 +85,7 @@ VALID_MODALITIES = {"image", "point"}
 PAIR_POINT_WINDOW_SIZE_M = 51.2
 PAIR_CHANGE_CENTER_CELL_M = PAIR_POINT_WINDOW_SIZE_M / 20.0
 PAIR_CHANGE_CROP_MAX_TRIES = 32
-PAIR_CHANGE_CENTER_CACHE_VERSION = 2
+PAIR_CHANGE_CENTER_CACHE_VERSION = 3
 
 PAIR_EVENT_NAMES = {
     0: "unchanged",
@@ -892,6 +892,21 @@ def build_bitemporal_point_target(
     if ev1.shape != e1.shape or ev2.shape != e2.shape:
         raise ValueError("3D event_valid must match its epoch event topology")
 
+    # Canonical PAIR protocol: invalid event supervision uses event=0 placeholder.
+    # Sampling metadata must never be smuggled through nonzero invalid events.
+    if ((~ev1) & (e1 != 0)).any():
+        bad = torch.unique(e1[(~ev1) & (e1 != 0)]).cpu().tolist()
+        raise ValueError(
+            f"3D T1 contains nonzero invalid event labels {bad}; "
+            "event_valid=False entries must store event=0"
+        )
+    if ((~ev2) & (e2 != 0)).any():
+        bad = torch.unique(e2[(~ev2) & (e2 != 0)]).cpu().tolist()
+        raise ValueError(
+            f"3D T2 contains nonzero invalid event labels {bad}; "
+            "event_valid=False entries must store event=0"
+        )
+
     target: Dict[str, torch.Tensor] = {
         "semantic_t1": s1,
         "semantic_t2": s2,
@@ -1166,45 +1181,37 @@ class UnifiedPAIRDataset(Dataset):
             )
         os.replace(tmp, path)
 
-    def _sampling_candidate_mask(self, supervision_t1, supervision_t2):
-        """
-        Select T2 points allowed to define coarse sampling centers.
-
-        Normally event_valid=True is required. For temporally asymmetric labels,
-        a nonzero T2 event with event_valid=False can still define a center when
-        that same event is valid on T1 in the same source pair. This recovers
-        NYC demolition/removed centers without treating invalid event=0
-        placeholders as unchanged.
-        """
-        semantic2 = supervision_t2["semantic"]
-        event1 = supervision_t1["event"]
-        event2 = supervision_t2["event"]
-
-        semantic_valid2 = torch.ones_like(semantic2, dtype=torch.bool)
-        if self.spec.ignored_id is not None:
-            semantic_valid2 &= semantic2 != int(self.spec.ignored_id)
-
-        valid1 = supervision_t1.get("event_valid")
-        valid2 = supervision_t2.get("event_valid")
-        if valid1 is None:
-            valid1 = torch.ones_like(event1, dtype=torch.bool)
+    def _event_valid_mask(self, supervision):
+        event = supervision["event"]
+        event_valid = supervision.get("event_valid")
+        if event_valid is None:
+            event_valid = torch.ones_like(event, dtype=torch.bool)
         else:
-            valid1 = valid1.bool()
-        if valid2 is None:
-            valid2 = torch.ones_like(event2, dtype=torch.bool)
-        else:
-            valid2 = valid2.bool()
+            event_valid = event_valid.bool()
 
-        active_t1 = torch.unique(event1[valid1])
-        asymmetric = torch.zeros_like(valid2)
-        for event_id in active_t1.tolist():
-            event_id = int(event_id)
-            if event_id != 0:
-                asymmetric |= (~valid2) & (event2 == event_id)
-
-        return semantic_valid2 & (valid2 | asymmetric)
+        if event_valid.shape != event.shape:
+            raise ValueError("event_valid must match event topology")
+        if ((~event_valid) & (event != 0)).any():
+            bad = torch.unique(event[(~event_valid) & (event != 0)]).cpu().tolist()
+            raise ValueError(
+                f"{self.spec.name}: nonzero invalid event labels {bad}; "
+                "re-prepare data with canonical event=0 placeholders"
+            )
+        return event_valid
 
     def _build_sampling_arrays(self):
+        """
+        Build one global change-aware center pool from temporally valid support.
+
+        Current PAIR/NYC protocol:
+            T1 removed centers   <- event=2 & event_valid
+            T2 unchanged centers <- event=0 & event_valid
+            T2 added centers     <- event=1 & event_valid
+
+        Unchanged is sourced from T2 only to avoid duplicating the overwhelmingly
+        large unchanged center pool. Every sampled center still defines one shared
+        XY crop that is applied to both T1 and T2.
+        """
         all_centers = []
         all_events = []
         all_records = []
@@ -1221,32 +1228,74 @@ class UnifiedPAIRDataset(Dataset):
         )
 
         for record_index, record in progress:
-            if "point_t2" not in record or "semantic_t1" not in record or "semantic_t2" not in record:
+            required = ("point_t1", "point_t2", "semantic_t1", "semantic_t2")
+            missing = [key for key in required if key not in record]
+            if missing:
                 raise KeyError(
-                    "3D change-aware sampling requires point_t2, semantic_t1 and "
-                    "semantic_t2 in every train manifest record"
+                    f"3D change-aware sampling requires {required}; "
+                    f"missing={missing} in {record.get('id')}"
                 )
 
+            p1 = read_point_cloud(self._path(record["point_t1"]))
             p2 = read_point_cloud(self._path(record["point_t2"]))
             s1 = read_point_supervision(self._path(record["semantic_t1"]))
             s2 = read_point_supervision(self._path(record["semantic_t2"]))
 
+            if s1["event"].shape[0] != p1["coord"].shape[0]:
+                raise ValueError(
+                    f"{self.spec.name}/{record.get('id')}: T1 point/event length mismatch "
+                    "during change-center construction"
+                )
             if s2["event"].shape[0] != p2["coord"].shape[0]:
                 raise ValueError(
                     f"{self.spec.name}/{record.get('id')}: T2 point/event length mismatch "
-                    f"during change-center construction"
+                    "during change-center construction"
                 )
 
-            candidate = self._sampling_candidate_mask(s1, s2)
-            centers, events = _center_majority_index(
-                p2["coord"],
-                s2["event"],
-                candidate,
+            valid1 = self._event_valid_mask(s1)
+            valid2 = self._event_valid_mask(s2)
+
+            # T1 contributes only physically supported removed centers.
+            removed_t1 = valid1 & (s1["event"] == 2)
+            c1, e1 = _center_majority_index(
+                p1["coord"],
+                s1["event"],
+                removed_t1,
                 cell_size=PAIR_CHANGE_CENTER_CELL_M,
             )
-            if centers.shape[0] == 0:
+
+            # T2 contributes unchanged + added centers.
+            t2_supported = valid2 & ((s2["event"] == 0) | (s2["event"] == 1))
+            c2, e2 = _center_majority_index(
+                p2["coord"],
+                s2["event"],
+                t2_supported,
+                cell_size=PAIR_CHANGE_CENTER_CELL_M,
+            )
+
+            scene_centers = []
+            scene_events = []
+            if c1.shape[0] > 0:
+                scene_centers.append(c1)
+                scene_events.append(e1)
+            if c2.shape[0] > 0:
+                scene_centers.append(c2)
+                scene_events.append(e2)
+
+            if not scene_centers:
                 progress.set_postfix_str(f"centers={center_count:,}")
                 continue
+
+            centers = np.concatenate(scene_centers, axis=0)
+            events = np.concatenate(scene_events, axis=0)
+
+            # With clean temporal support this pool must be exactly {0,1,2}.
+            if np.any(~np.isin(events, (0, 1, 2))):
+                bad = sorted(set(int(x) for x in events[~np.isin(events, (0, 1, 2))]))
+                raise RuntimeError(
+                    f"{self.spec.name}/{record.get('id')}: sampling pool contains "
+                    f"unsupported events {bad}"
+                )
 
             all_centers.append(centers)
             all_events.append(events)
@@ -1277,12 +1326,23 @@ class UnifiedPAIRDataset(Dataset):
         events = np.concatenate(all_events, axis=0)
         records = np.concatenate(all_records, axis=0)
 
-        valid = (events >= 0) & (events < PAIR_EVENT_NUM_CLASSES)
+        valid = np.isin(events, (0, 1, 2))
         centers, events, records = centers[valid], events[valid], records[valid]
         if centers.shape[0] == 0:
             raise RuntimeError(
-                f"{self.spec.name}: all change-aware centers had invalid event labels"
+                f"{self.spec.name}: all change-aware centers were filtered out"
             )
+
+        present = set(int(x) for x in np.unique(events))
+        required_events = {0, 1, 2}
+        missing_events = sorted(required_events - present)
+        if missing_events:
+            names = [PAIR_EVENT_NAMES[x] for x in missing_events]
+            raise RuntimeError(
+                f"{self.spec.name}: change-aware center pool is missing required "
+                f"NYC events {names}. Check prepared T1/T2 event_valid supervision."
+            )
+
         return centers, events, records
 
     def _set_sampling_arrays(self, centers, events, records):
@@ -1330,7 +1390,8 @@ class UnifiedPAIRDataset(Dataset):
             )
             print(
                 f"{self.spec.name}: scanning {len(self.records):,} training scenes to "
-                "build ME-CPT-style sampling centers. This is a first-run preprocessing "
+                "build ME-CPT-style sampling centers from T1 removed + T2 unchanged/added. "
+                "This is a first-run preprocessing "
                 "step; later runs will load the cached centers directly."
             )
             if distributed:
@@ -1941,6 +2002,25 @@ def _self_test():
     assert target["event_t2"].tolist() == [1, 0]
     assert "change_t1" not in target and "change_t2" not in target
 
+    try:
+        build_bitemporal_point_target(
+            {
+                "semantic": torch.tensor([0, 1]),
+                "event": torch.tensor([0, 1]),
+                "event_valid": torch.tensor([True, False]),
+            },
+            {
+                "semantic": torch.tensor([0]),
+                "event": torch.tensor([0]),
+                "event_valid": torch.tensor([True]),
+            },
+            class_names=classes,
+            ignored_id=-1,
+        )
+        raise AssertionError("nonzero invalid event should have been rejected")
+    except ValueError as exc:
+        assert "event_valid=False entries must store event=0" in str(exc)
+
     # Optional point attributes remain optional.
     point = {
         "coord": torch.tensor(
@@ -1997,6 +2077,7 @@ def _self_test():
     assert DatasetSpec.__dataclass_fields__["ignored_id"].default is None
     assert PAIR_EVENT_NUM_CLASSES == 6
     assert PAIR_POINT_WINDOW_SIZE_M == 51.2
+    assert PAIR_CHANGE_CENTER_CACHE_VERSION == 3
     assert abs(PAIR_CHANGE_CENTER_CELL_M - 2.56) < 1e-9
 
     print("pair_dataset.py self-test: PASS")
