@@ -39,6 +39,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -76,7 +77,10 @@ def build_settings(experiment: ExperimentConfig, cli):
 
     output_dir = cli.output_dir
     if output_dir is None:
-        output_dir = Path(lg.get("output_dir", f"outputs/{experiment.experiment['name']}"))
+        timestamp = datetime.now().strftime("%Y%m%d%H%M")
+        output_dir = Path(
+            lg.get("output_dir", f"/outputs/{timestamp}_{experiment.experiment['name']}")
+        )
 
     return SimpleNamespace(
         lr=float(o.get("lr", 1e-4)),

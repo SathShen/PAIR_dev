@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""NYC-SCD -> PAIR three-state event remapping v21.
+"""NYC-SCD -> PAIR three-state event remapping v22.
 
-v21 keeps the complete v20 pipeline and changes exactly one dataset-policy
-decision: vegetation is excluded from direct event supervision.
+v22 keeps the complete v21 event policy and fixes semantic canonicalization.
 
     T1: unchanged / removed, but vegetation is always unchanged
     T2: unchanged / added,   but vegetation is always unchanged
 
-This follows the source NYC-SCD protocol, whose change annotation does not
-attempt to exhaustively label vegetation dynamics.  Raw ``label_ch`` still
-defines the exact candidate XY cells.  Semantic ``label_mono`` remains
-point-for-point immutable.  There is no morphology or object expansion.
+Raw ``label_ch`` still defines the exact candidate XY cells.  Raw semantic
+``label_mono`` IDs 0..3 are preserved; every other semantic ID is canonicalized
+to -1 (ignore) before event generation and before prepared supervision is saved.
+Point topology is unchanged.  There is no morphology or object expansion.
 
 Examples:
 
@@ -36,8 +35,39 @@ import numpy as np
 import remap_nycs_pair_events_v20 as base
 
 
-REMAPPER_VERSION = "v21_three_state_ignore_vegetation_events"
+REMAPPER_VERSION = "v22_three_state_semantic_ignore_canonicalized"
 EVENT_SEMANTIC_IDS = (1, 3)  # building, clutter; vegetation (2) is excluded
+
+
+# Keep a stable reference before monkey-patching the v20 I/O framework.
+_BASE_READ_NYC_PLY = base.read_nyc_ply
+
+
+def read_nyc_ply_canonicalized(path: Path, *, vertex_name: str, require_change: bool):
+    """
+    Read one raw NYC-SCD point cloud and canonicalize semantic labels.
+
+    PAIR semantic protocol for NYC-SCD:
+        0 ground
+        1 building
+        2 vegetation
+        3 clutter
+       -1 ignored / unsupported raw semantic ID
+
+    Coordinates and point order are never changed.
+    """
+    out = _BASE_READ_NYC_PLY(
+        path,
+        vertex_name=vertex_name,
+        require_change=require_change,
+    )
+
+    semantic = np.asarray(out["semantic"], dtype=np.int64).copy()
+    invalid = (semantic < 0) | (semantic > 3)
+    semantic[invalid] = -1
+    out["semantic"] = semantic
+
+    return out
 
 
 def parse_args():
@@ -88,7 +118,7 @@ def remap_pair_events(
     source_change_t2: np.ndarray,
     cfg: base.RemapConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
-    """Apply v20 correspondence logic while excluding vegetation events."""
+    """Apply v21 event logic to already-canonicalized semantic labels."""
     coord_t1 = np.asarray(coord_t1, dtype=np.float32)
     coord_t2 = np.asarray(coord_t2, dtype=np.float32)
     semantic_t1 = np.asarray(semantic_t1, dtype=np.int64).reshape(-1)
@@ -163,7 +193,7 @@ def remap_pair_events(
 
     debug = {
         "remap_version": REMAPPER_VERSION,
-        "semantic_policy": "immutable_label_mono",
+        "semantic_policy": "raw_0_3_preserved_other_ids_to_minus1",
         "vegetation_event_policy": "semantic_2_always_unchanged",
         "event_protocol": base.EVENT_NAMES,
         "config": asdict(cfg),
@@ -196,7 +226,7 @@ def write_protocol(output_root: Path, cfg: base.RemapConfig):
         {
             "version": REMAPPER_VERSION,
             "semantic": base.SEMANTIC_NAMES,
-            "semantic_policy": "label_mono is immutable absolute ground truth",
+            "semantic_policy": "raw label_mono IDs 0..3 preserved; all other IDs canonicalized to -1 ignore",
             "event": base.EVENT_NAMES,
             "epoch_constraints": {
                 "t1": ["unchanged", "removed"],
@@ -218,6 +248,12 @@ def write_protocol(output_root: Path, cfg: base.RemapConfig):
 
 def run_self_test():
     cfg = base.RemapConfig(footprint_grid=0.5, match_xy=0.2, match_z=0.2)
+
+    # Semantic canonicalization itself is exercised without file I/O.
+    semantic = np.array([0, 1, 2, 3, 9, -5], dtype=np.int64)
+    invalid = (semantic < 0) | (semantic > 3)
+    semantic[invalid] = -1
+    assert semantic.tolist() == [0, 1, 2, 3, -1, -1]
 
     # A vegetation -> building transition: vegetation is deliberately not
     # supervised, while the new building remains added.
@@ -252,7 +288,7 @@ def run_self_test():
         coord_t1, semantic, coord_t2, semantic, np.array([3]), cfg
     )
     assert event_t1.tolist() == [0] and event_t2.tolist() == [0]
-    print("v21 self-test passed: vegetation events ignored; building add/remove retained")
+    print("v22 self-test passed: semantic IDs canonicalized; vegetation events ignored; building add/remove retained")
 
 
 def main():
@@ -302,15 +338,16 @@ def main():
         (output_root / name).mkdir(parents=True, exist_ok=True)
     write_protocol(output_root, cfg)
 
-    # remap_one lives in the stable v20 I/O framework and resolves this global
-    # at runtime.  Replacing it here keeps all file handling identical while
-    # applying only the v21 decision function above.
+    # remap_split/remap_one live in the stable v20 I/O framework and resolve
+    # these module globals at runtime. Canonicalize raw semantics at read time so
+    # both event generation and saved supervision see the same -1 ignore labels.
+    base.read_nyc_ply = read_nyc_ply_canonicalized
     base.remap_pair_events = remap_pair_events
 
-    base.banner("NYC-SCD -> PAIR THREE-STATE EVENT REMAPPING v21")
+    base.banner("NYC-SCD -> PAIR THREE-STATE EVENT REMAPPING v22")
     print("source root       :", source_root)
     print("output root       :", output_root)
-    print("semantic          : immutable", base.SEMANTIC_NAMES)
+    print("semantic          : 0..3 preserved; all other raw IDs -> -1", base.SEMANTIC_NAMES)
     print("event             :", base.EVENT_NAMES)
     print("T1 valid events   : unchanged / removed")
     print("T2 valid events   : unchanged / added")
@@ -336,7 +373,7 @@ def main():
                 manifest_suffix,
             )
         )
-    base.banner("V21 REMAPPING DONE")
+    base.banner("V22 REMAPPING DONE")
     print("samples:", len(all_records))
     print("elapsed:", f"{time.time() - start:.2f}s")
 

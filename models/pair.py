@@ -1252,7 +1252,7 @@ class PAIRModel(nn.Module):
         return restore_2d_prediction_batch(prediction, shapes1, shapes2, output_sizes)
 
     # -------------------------------------------------------------------------
-    # 3D: semantic + 6-class event path
+    # 3D: semantic + 3-class event path
     # -------------------------------------------------------------------------
 
     def forward_3d(self, point_dicts_t1, point_dicts_t2, prompts, class_names):
@@ -1333,9 +1333,9 @@ class PAIRModel(nn.Module):
             raise RuntimeError("3D decoder must not return binary change logits")
         if prediction.event_logits_t1 is None or prediction.event_logits_t2 is None:
             raise RuntimeError("3D decoder did not return event logits")
-        if prediction.event_logits_t1.shape != (dense_t1.features.shape[0], 6):
+        if prediction.event_logits_t1.shape != (dense_t1.features.shape[0], 3):
             raise RuntimeError(f"Unexpected T1 event shape: {tuple(prediction.event_logits_t1.shape)}")
-        if prediction.event_logits_t2.shape != (dense_t2.features.shape[0], 6):
+        if prediction.event_logits_t2.shape != (dense_t2.features.shape[0], 3):
             raise RuntimeError(f"Unexpected T2 event shape: {tuple(prediction.event_logits_t2.shape)}")
 
         return prediction
