@@ -1,18 +1,29 @@
 """
 PAIR point adapter for frozen Utonia + optional LiDAR intensity.
 
-3D path
--------
-Utonia dense feature [N,1386]
-    -> geometry projector 1386 -> 256
-    -> optional intensity residual adapter
-    -> PAIR dense feature [N,256]
-    -> per-cloud voxel pooling + FPS
-    -> token projector 256 -> 2560
-    -> <=512 Qwen reasoning tokens per cloud
+Revised 3D path
+---------------
+Frozen Utonia dense feature [N,1386]
+    |
+    |-- dense branch
+    |     -> geometry projector 1386 -> 256
+    |     -> optional intensity residual adapter
+    |     -> PAIR dense feature [N,256]
+    |
+    `-- reasoning branch (BEFORE dense adaptation)
+          -> per-cloud voxel pooling on raw Utonia [N,1386]
+          -> FPS to <=512 representatives
+          -> token projector 1386 -> 2560
+          -> + XYZ positional embedding
+          -> <=512 Qwen reasoning tokens per cloud
 
-Intensity never enters Utonia's pretrained 9-D input stem. Missing intensity
-is represented by absence/mask, not by pretending that intensity == 0.
+This deliberately decouples the dense-decoder bottleneck from the Qwen
+reasoning branch. The reasoning branch no longer has to pass through the
+1386 -> 256 geometry projector before spatial compression.
+
+Intensity never enters Utonia's pretrained 9-D input stem. In this version,
+intensity is fused only into the dense decoder branch. Missing intensity is
+represented by absence/mask, not by pretending that intensity == 0.
 """
 
 from __future__ import annotations
@@ -30,17 +41,28 @@ TensorOrList = Union[torch.Tensor, List[torch.Tensor]]
 
 @dataclass
 class PointAdapterConfig:
+    # Frozen Utonia output width.
     in_dim: int = 1386
+
+    # Unified decoder working width.
     dense_dim: int = 256
+
+    # Qwen hidden width.
     out_dim: int = 2560
+
+    # Maximum number of reasoning tokens per cloud.
     num_tokens: int = 512
+
+    # Optional intensity side branch.
     intensity_hidden_dim: int = 64
 
-    sampling: str = "voxel"
+    # Reasoning-token spatial sampling.
+    sampling: str = "voxel"  # "voxel" or "uniform"
     voxel_size: Optional[float] = None
     voxel_oversample_factor: float = 4.0
     max_fps_candidates: int = 8192
 
+    # Qwen-token XYZ positional encoding.
     use_xyz_pos: bool = True
     xyz_hidden_dim: int = 128
     use_layer_norm: bool = True
@@ -50,6 +72,9 @@ class PointAdapterConfig:
 class PointAdapterOutput:
     # Tensor for B=1, list[Tensor] for B>1.
     tokens: TensorOrList
+
+    # IMPORTANT: these are now sampled RAW Utonia features [K, in_dim],
+    # not sampled dense-decoder features [K, dense_dim].
     sampled_features: TensorOrList
     sampled_coord: TensorOrList
     sampled_indices: TensorOrList
@@ -81,10 +106,31 @@ def _offset_from_batch(batch: torch.Tensor) -> torch.Tensor:
     counts = torch.bincount(batch, minlength=num_batches)
     if (counts == 0).any():
         raise ValueError("batch IDs must be contiguous with no missing IDs")
+
     return torch.cumsum(counts, dim=0)
 
 
 class PointAdapter(nn.Module):
+    """
+    Two-branch adapter after frozen Utonia.
+
+    Dense branch:
+        raw Utonia [N,in_dim]
+          -> geometry_proj -> [N,dense_dim]
+          -> optional intensity residual fusion
+          -> UnifiedChangeDecoder
+
+    Reasoning branch:
+        raw Utonia [N,in_dim]
+          -> voxel pooling / FPS
+          -> [K,in_dim]
+          -> token_proj -> [K,out_dim]
+          -> + XYZ embedding
+          -> Qwen <POINT> tokens
+
+    The two branches split directly from the raw Utonia representation.
+    """
+
     def __init__(self, config: Optional[PointAdapterConfig] = None):
         super().__init__()
         self.config = config or PointAdapterConfig()
@@ -103,14 +149,16 @@ class PointAdapter(nn.Module):
         if cfg.max_fps_candidates < cfg.num_tokens:
             raise ValueError("max_fps_candidates must be >= num_tokens")
 
-        # Frozen Utonia representation -> PAIR working dimension.
+        # ------------------------------------------------------------------
+        # Dense branch: frozen Utonia representation -> PAIR decoder width.
+        # ------------------------------------------------------------------
         self.geometry_proj = nn.Sequential(
             nn.Linear(cfg.in_dim, cfg.dense_dim),
             nn.LayerNorm(cfg.dense_dim),
             nn.GELU(),
         )
 
-        # Optional LiDAR radiometry.
+        # Optional LiDAR radiometry for the dense branch.
         self.intensity_encoder = nn.Sequential(
             nn.Linear(1, 32),
             nn.GELU(),
@@ -119,7 +167,7 @@ class PointAdapter(nn.Module):
             nn.GELU(),
         )
 
-        # Residual intensity adapter. Its last layer starts at zero so even on
+        # Residual intensity adapter. The last layer starts at zero so even on
         # an intensity-equipped dataset training begins exactly geometry-only.
         self.intensity_fusion = nn.Sequential(
             nn.Linear(
@@ -132,8 +180,14 @@ class PointAdapter(nn.Module):
         nn.init.zeros_(self.intensity_fusion[-1].weight)
         nn.init.zeros_(self.intensity_fusion[-1].bias)
 
-        # Dense -> Qwen reasoning-token space.
-        self.token_proj = nn.Linear(cfg.dense_dim, cfg.out_dim)
+        # ------------------------------------------------------------------
+        # Reasoning branch: RAW Utonia feature -> Qwen hidden space.
+        #
+        # REVISION:
+        #   old:  [N,1386] -> geometry_proj -> [N,256] -> voxel/FPS -> 2560
+        #   new:  [N,1386] -> voxel/FPS -> [K,1386] -> 2560
+        # ------------------------------------------------------------------
+        self.token_proj = nn.Linear(cfg.in_dim, cfg.out_dim)
 
         if cfg.use_xyz_pos:
             self.xyz_mlp = nn.Sequential(
@@ -156,9 +210,8 @@ class PointAdapter(nn.Module):
         self.num_tokens = cfg.num_tokens
 
     # ------------------------------------------------------------------
-    # Input
+    # Input normalization / validation
     # ------------------------------------------------------------------
-
     def _extract(self, point_encoded: Any):
         if torch.is_tensor(point_encoded):
             features = point_encoded
@@ -175,6 +228,7 @@ class PointAdapter(nn.Module):
             features = getter("features", None)
             if features is None:
                 features = getter("feat", None)
+
             coord = getter("coord", None)
             batch = getter("batch", None)
             offset = getter("offset", None)
@@ -215,13 +269,17 @@ class PointAdapter(nn.Module):
                     or int(offset[-1].item()) != n
                 ):
                     raise ValueError("invalid offset")
+
                 starts = torch.cat([offset.new_zeros(1), offset[:-1]])
                 counts = offset - starts
                 if (counts <= 0).any():
                     raise ValueError("every batch item must contain points")
+
                 batch = torch.repeat_interleave(
                     torch.arange(
-                        offset.numel(), dtype=torch.long, device=device
+                        offset.numel(),
+                        dtype=torch.long,
+                        device=device,
                     ),
                     counts,
                 )
@@ -229,6 +287,7 @@ class PointAdapter(nn.Module):
             batch = torch.as_tensor(batch, dtype=torch.long, device=device)
             if batch.shape != (n,):
                 raise ValueError(f"batch must be [N], got {tuple(batch.shape)}")
+
             derived_offset = _offset_from_batch(batch)
             if offset is not None:
                 offset = torch.as_tensor(
@@ -280,24 +339,34 @@ class PointAdapter(nn.Module):
                     intensity_mask = intensity_mask.bool()
 
         return (
-            features, coord, batch, offset, intensity, intensity_mask
+            features,
+            coord,
+            batch,
+            offset,
+            intensity,
+            intensity_mask,
         )
 
     # ------------------------------------------------------------------
-    # Dense feature fusion
+    # Dense decoder branch
     # ------------------------------------------------------------------
-
     def make_dense_features(
         self,
         features: torch.Tensor,
         intensity: Optional[torch.Tensor],
         intensity_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, bool]:
+        # Utonia [N,1386] -> decoder feature [N,256].
         geometry = self.geometry_proj(features)
 
         # NYC-SCD and other XYZ-only datasets take this exact path.
         if intensity is None:
             return geometry, False
+
+        if intensity_mask is None:
+            raise RuntimeError(
+                "internal error: intensity exists but intensity_mask is None"
+            )
 
         mask = intensity_mask.to(dtype=geometry.dtype)
 
@@ -305,6 +374,8 @@ class PointAdapter(nn.Module):
             intensity.to(dtype=self.intensity_encoder[0].weight.dtype)
             * mask.to(dtype=self.intensity_encoder[0].weight.dtype)
         ).to(dtype=geometry.dtype)
+
+        # Keep invalid/missing intensity points exactly zero in the side branch.
         intensity_feature = intensity_feature * mask
 
         delta = self.intensity_fusion(
@@ -316,9 +387,8 @@ class PointAdapter(nn.Module):
         return dense, bool(intensity_mask.any().item())
 
     # ------------------------------------------------------------------
-    # Per-cloud spatial sampling
+    # Per-cloud spatial sampling for the reasoning branch
     # ------------------------------------------------------------------
-
     def _uniform_indices(self, n: int, device: torch.device):
         k = min(n, self.num_tokens)
         if k == n:
@@ -350,26 +420,46 @@ class PointAdapter(nn.Module):
         features: torch.Tensor,
         coord: torch.Tensor,
     ):
+        """
+        Mean-pool RAW Utonia features and XYZ inside spatial voxels.
+
+        features is intentionally [N,in_dim] here. This is the architectural
+        change: voxel compression happens before geometry_proj / dense_dim.
+        """
         voxel_size = self._estimate_voxel_size(coord)
 
+        # Pool in FP32 for numerical stability, then restore source dtype.
         feat_f = features.float()
         coord_f = coord.float()
+
         origin = coord_f.amin(0, keepdim=True)
         grid = torch.floor((coord_f - origin) / voxel_size).long()
 
         _, inverse = torch.unique(
-            grid, dim=0, sorted=True, return_inverse=True
+            grid,
+            dim=0,
+            sorted=True,
+            return_inverse=True,
         )
         m = int(inverse.max().item()) + 1
 
         pooled_feat = torch.zeros(
-            m, feat_f.shape[1], device=features.device, dtype=feat_f.dtype
+            m,
+            feat_f.shape[1],
+            device=features.device,
+            dtype=feat_f.dtype,
         )
         pooled_coord = torch.zeros(
-            m, 3, device=coord.device, dtype=coord_f.dtype
+            m,
+            3,
+            device=coord.device,
+            dtype=coord_f.dtype,
         )
         counts = torch.zeros(
-            m, 1, device=features.device, dtype=feat_f.dtype
+            m,
+            1,
+            device=features.device,
+            dtype=feat_f.dtype,
         )
 
         pooled_feat.index_add_(0, inverse, feat_f)
@@ -378,8 +468,10 @@ class PointAdapter(nn.Module):
             0,
             inverse,
             torch.ones(
-                features.shape[0], 1,
-                device=features.device, dtype=feat_f.dtype,
+                features.shape[0],
+                1,
+                device=features.device,
+                dtype=feat_f.dtype,
             ),
         )
         counts.clamp_min_(1.0)
@@ -398,8 +490,13 @@ class PointAdapter(nn.Module):
         limit = self.config.max_fps_candidates
         if n <= limit:
             return torch.arange(n, device=coord.device)
+
+        # Deterministic thinning before O(KN) FPS if the voxel set is huge.
         return torch.linspace(
-            0, n - 1, limit, device=coord.device
+            0,
+            n - 1,
+            limit,
+            device=coord.device,
         ).long()
 
     @staticmethod
@@ -409,13 +506,19 @@ class PointAdapter(nn.Module):
             return torch.arange(n, device=coord.device)
 
         xyz = coord.float()
-        selected = torch.empty(k, dtype=torch.long, device=coord.device)
+        selected = torch.empty(
+            k,
+            dtype=torch.long,
+            device=coord.device,
+        )
 
         centroid = xyz.mean(0, keepdim=True)
         current = torch.argmax(((xyz - centroid) ** 2).sum(1))
         min_dist = torch.full(
-            (n,), float("inf"),
-            device=coord.device, dtype=torch.float32,
+            (n,),
+            float("inf"),
+            device=coord.device,
+            dtype=torch.float32,
         )
 
         for i in range(k):
@@ -432,14 +535,15 @@ class PointAdapter(nn.Module):
         coord: torch.Tensor,
     ):
         pooled_feat, pooled_coord, voxel_size = self._voxel_pool(
-            features, coord
+            features,
+            coord,
         )
         pooled_count = int(pooled_feat.shape[0])
 
         candidates = self._preselect_candidates(pooled_coord)
         candidate_coord = pooled_coord[candidates]
-        k = min(self.num_tokens, int(candidate_coord.shape[0]))
 
+        k = min(self.num_tokens, int(candidate_coord.shape[0]))
         local_idx = self._fps_indices(candidate_coord, k)
         selected_idx = candidates[local_idx]
 
@@ -452,9 +556,8 @@ class PointAdapter(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Qwen token projection
+    # Qwen reasoning-token projection
     # ------------------------------------------------------------------
-
     @staticmethod
     def _normalize_xyz(
         sampled_coord: torch.Tensor,
@@ -473,6 +576,18 @@ class PointAdapter(nn.Module):
         sampled_coord: torch.Tensor,
         dense_coord: torch.Tensor,
     ):
+        if sampled_features.ndim != 2:
+            raise ValueError(
+                "sampled_features must be [K,C], got "
+                f"{tuple(sampled_features.shape)}"
+            )
+        if sampled_features.shape[1] != self.in_dim:
+            raise ValueError(
+                "reasoning branch must receive raw Utonia features with "
+                f"dim={self.in_dim}, got {sampled_features.shape[1]}"
+            )
+
+        # Raw Utonia feature [K,1386] -> Qwen hidden [K,2560].
         tokens = self.token_proj(sampled_features)
 
         if self.xyz_mlp is not None:
@@ -487,7 +602,6 @@ class PointAdapter(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-
     def forward_with_metadata(self, point_encoded: Any) -> PointAdapterOutput:
         (
             features,
@@ -498,10 +612,21 @@ class PointAdapter(nn.Module):
             intensity_mask,
         ) = self._extract(point_encoded)
 
+        # --------------------------------------------------------------
+        # Branch A: dense decoder feature.
+        # --------------------------------------------------------------
         dense_features, intensity_used = self.make_dense_features(
-            features, intensity, intensity_mask
+            features,
+            intensity,
+            intensity_mask,
         )
 
+        # --------------------------------------------------------------
+        # Branch B: Qwen reasoning tokens.
+        #
+        # IMPORTANT: sample RAW Utonia features, NOT dense_features.
+        # Voxel/FPS therefore happens before the 1386 -> 256 dense adapter.
+        # --------------------------------------------------------------
         num_batches = int(offset.numel())
 
         tokens_all = []
@@ -514,18 +639,22 @@ class PointAdapter(nn.Module):
         for batch_id in range(num_batches):
             mask = batch == batch_id
             if not mask.any():
-                raise RuntimeError(f"empty cloud at batch index {batch_id}")
+                raise RuntimeError(
+                    f"empty cloud at batch index {batch_id}"
+                )
 
-            local_features = dense_features[mask]
+            # THIS is the key architectural change.
+            local_reasoning_features = features[mask]  # [Nb,1386]
             local_coord = coord[mask]
 
             if self.config.sampling == "uniform":
                 idx = self._uniform_indices(
-                    local_features.shape[0], local_features.device
+                    local_reasoning_features.shape[0],
+                    local_reasoning_features.device,
                 )
-                sampled_features = local_features[idx]
+                sampled_features = local_reasoning_features[idx]
                 sampled_coord = local_coord[idx]
-                pooled_count = int(local_features.shape[0])
+                pooled_count = int(local_reasoning_features.shape[0])
                 voxel_size = None
             else:
                 (
@@ -534,10 +663,15 @@ class PointAdapter(nn.Module):
                     idx,
                     pooled_count,
                     voxel_size,
-                ) = self._voxel_resample(local_features, local_coord)
+                ) = self._voxel_resample(
+                    local_reasoning_features,
+                    local_coord,
+                )
 
             tokens = self._project_tokens(
-                sampled_features, sampled_coord, local_coord
+                sampled_features,
+                sampled_coord,
+                local_coord,
             )
 
             if tokens.ndim != 2 or tokens.shape[1] != self.out_dim:
@@ -545,9 +679,13 @@ class PointAdapter(nn.Module):
                     f"unexpected token shape {tuple(tokens.shape)}"
                 )
             if tokens.shape[0] > self.num_tokens:
-                raise RuntimeError("point reasoning-token budget exceeded")
+                raise RuntimeError(
+                    "point reasoning-token budget exceeded"
+                )
             if not torch.isfinite(tokens).all():
-                raise RuntimeError("PointAdapter produced NaN/Inf")
+                raise RuntimeError(
+                    "PointAdapter produced NaN/Inf reasoning tokens"
+                )
 
             tokens_all.append(tokens)
             sampled_features_all.append(sampled_features)
@@ -595,7 +733,9 @@ class PointAdapter(nn.Module):
 
     def trainable_parameter_count(self) -> int:
         return sum(
-            p.numel() for p in self.parameters() if p.requires_grad
+            p.numel()
+            for p in self.parameters()
+            if p.requires_grad
         )
 
 
@@ -636,6 +776,13 @@ if __name__ == "__main__":
         for x in out.tokens
     )
 
+    # New architecture invariant: sampled reasoning features retain Utonia dim.
+    assert isinstance(out.sampled_features, list)
+    assert all(
+        x.ndim == 2 and x.shape[1] == cfg.in_dim
+        for x in out.sampled_features
+    )
+
     # Geometry-only path must not require intensity.
     geo = adapter.forward_with_metadata({
         "features": feat[:n1],
@@ -644,8 +791,13 @@ if __name__ == "__main__":
     })
     assert geo.dense_features.shape == (n1, cfg.dense_dim)
     assert geo.intensity_used is False
+    assert geo.sampled_features.shape[1] == cfg.in_dim
 
     print("PointAdapter standalone tests: PASS")
     print("dense:", tuple(out.dense_features.shape))
     print("tokens:", [tuple(x.shape) for x in out.tokens])
+    print(
+        "sampled raw Utonia features:",
+        [tuple(x.shape) for x in out.sampled_features],
+    )
     print("trainable params:", adapter.trainable_parameter_count())
