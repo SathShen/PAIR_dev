@@ -445,7 +445,7 @@ class UnifiedChangeDecoder(nn.Module):
 
         # Output heads. Binary is kept for the existing 2D path only.
         self.binary_change_classifier = nn.Linear(self.decoder_dim, 1)
-        self.event_head = nn.Linear(self.decoder_dim, 6)
+        self.event_head = nn.Linear(self.decoder_dim, 3)
 
         self.class_encoder = QwenClassPrototypeEncoder(qwen_dim=self.qwen_dim, decoder_dim=self.decoder_dim)
         self.logit_scale = nn.Parameter(torch.tensor(float(initial_logit_scale)).log())

@@ -290,7 +290,6 @@ def forward_loss(model, criterion, samples, spec):
         prediction=prediction,
         target=target,
         class_names=spec.class_names,
-        dataset_name=spec.name,
     )
     return prediction, loss_output, target
 
@@ -310,8 +309,7 @@ def validate(model, criterion, loader, spec, runtime, settings):
     evaluator = PAIRMetrics(
         spec.class_names,
         runtime["device"],
-        settings.change_threshold,
-        dataset_name=spec.name,
+        settings.change_threshold
     )
 
     sums, count = {}, 0

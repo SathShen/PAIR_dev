@@ -85,15 +85,12 @@ VALID_MODALITIES = {"image", "point"}
 PAIR_POINT_WINDOW_SIZE_M = 51.2
 PAIR_CHANGE_CENTER_CELL_M = PAIR_POINT_WINDOW_SIZE_M / 20.0
 PAIR_CHANGE_CROP_MAX_TRIES = 32
-PAIR_CHANGE_CENTER_CACHE_VERSION = 3
+PAIR_CHANGE_CENTER_CACHE_VERSION = 4
 
 PAIR_EVENT_NAMES = {
     0: "unchanged",
     1: "added",
     2: "removed",
-    3: "class_change",
-    4: "height_up",
-    5: "height_down",
 }
 PAIR_EVENT_NUM_CLASSES = len(PAIR_EVENT_NAMES)
 
@@ -2075,9 +2072,9 @@ def _self_test():
     assert c1.shape[0] > 0 and c2.shape[0] > 0
 
     assert DatasetSpec.__dataclass_fields__["ignored_id"].default is None
-    assert PAIR_EVENT_NUM_CLASSES == 6
+    assert PAIR_EVENT_NUM_CLASSES == 3
     assert PAIR_POINT_WINDOW_SIZE_M == 51.2
-    assert PAIR_CHANGE_CENTER_CACHE_VERSION == 3
+    assert PAIR_CHANGE_CENTER_CACHE_VERSION == 4
     assert abs(PAIR_CHANGE_CENTER_CELL_M - 2.56) < 1e-9
 
     print("pair_dataset.py self-test: PASS")
