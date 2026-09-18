@@ -25,7 +25,7 @@ There is no 3D binary change target/head. Traditional binary change metrics are
 derived in metrics.py from event != unchanged.
 
 3D checkpoint selection:
-    Joint Semantic-Event F1 (JSE-F1), metric key: jse/F1
+    Joint Semantic-Event F1 (Fjse), metric key: jse/F1
 """
 
 from __future__ import annotations
@@ -76,10 +76,16 @@ def build_settings(experiment: ExperimentConfig, cli):
     t = experiment.training
     v = experiment.validation
     lg = experiment.logging
-    output_dir = cli.output_dir
-    if output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M")
-        output_dir = Path(lg.get("output_dir", f"/outputs/{timestamp}_{experiment.experiment['name']}"))
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M")
+    folder_name =  f"{timestamp}_{experiment.experiment['name']}"
+    if cli.output_dir is None:
+        base_output_dir = Path(lg.get("output_dir", "outputs"))
+    else:
+        base_output_dir = Path(cli.output_dir)
+    output_dir = os.path.join(base_output_dir, folder_name)
+
+
     return SimpleNamespace(
         lr=float(o.get("lr", 1e-4)),
         lora_lr=float(o.get("lora_lr", 2e-5)),
@@ -444,7 +450,7 @@ def selection_metric_for_spec(spec):
     if spec.route == "2d" and spec.label_mode == "semantic_pair":
         return "scd/F_scd", "Fscd"
     if spec.route in {"3d", "2d3d"} and spec.label_mode == "semantic_pair":
-        return "jse/F1", "JSEF1"
+        return "jse/F1", "Fjse"
     if spec.label_mode in {"binary", "post_semantic"}:
         return "change/IoU", "IoU"
     raise ValueError(f"No checkpoint selection rule for route={spec.route!r}, label_mode={spec.label_mode!r}")
@@ -513,7 +519,7 @@ def replace_dataset_valbest(output_dir, dataset_name, keep_path):
 def validation_metric_layout(spec, scalars):
     if spec.route == "3d":
         candidates = (
-            ("JSEF1", "jse/F1"),
+            ("Fjse", "jse/F1"),
             ("JSEP", "jse/Precision"),
             ("JSER", "jse/Recall"),
             ("SemOA", "semantic/OA"),
