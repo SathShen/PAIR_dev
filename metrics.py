@@ -26,7 +26,10 @@ PAIR_EVENT_NAMES = {
     2: "removed",
 }
 PAIR_EVENT_NUM_CLASSES = len(PAIR_EVENT_NAMES)
-
+PAIR_EVENT_ACTIVE_SUPPORT = {
+    1: (0, 2),  # T1: unchanged / removed
+    2: (0, 1),  # T2: unchanged / added
+}
 
 def _safe_div(a, b):
     return a / b.clamp_min(EPS)
@@ -204,6 +207,22 @@ class PAIRMetrics:
         )
         self.event_t2 = torch.zeros_like(self.event_t1)
 
+        self.jse_tp = torch.zeros(
+            (),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.jse_pred_change = torch.zeros(
+            (),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.jse_gt_change = torch.zeros(
+            (),
+            dtype=torch.long,
+            device=self.device,
+        )
+
     @staticmethod
     def _mask_or_true(target, key, value, device):
         valid = target.get(key)
@@ -269,17 +288,85 @@ class PAIRMetrics:
             )
 
     @staticmethod
-    def _validate_event_target(target, valid, name):
+    def _validate_event_target(
+        target,
+        valid,
+        name,
+        allowed_ids=None,
+    ):
         if not valid.any():
             return
+
         y = target[valid]
+
+        # First check the global event ID range.
         bad = (y < 0) | (y >= PAIR_EVENT_NUM_CLASSES)
         if bad.any():
-            values = torch.unique(y[bad]).detach().cpu().tolist()
+            values = torch.unique(
+                y[bad]
+            ).detach().cpu().tolist()
+
             raise ValueError(
                 f"{name} contains invalid event IDs {values}; "
                 f"expected 0..{PAIR_EVENT_NUM_CLASSES - 1}"
             )
+
+        # Then check the time-specific active support.
+        if allowed_ids is not None:
+            support_ok = torch.zeros_like(
+                y,
+                dtype=torch.bool,
+            )
+
+            for event_id in allowed_ids:
+                support_ok |= (y == event_id)
+
+            if (~support_ok).any():
+                values = torch.unique(
+                    y[~support_ok]
+                ).detach().cpu().tolist()
+
+                raise ValueError(
+                    f"{name} contains event IDs {values} outside "
+                    f"its active support {tuple(allowed_ids)}"
+                )
+            
+    def _active_event_argmax(
+        self,
+        logits,
+        time_id,
+    ):
+        """
+        Predict event classes only within the active support
+        of the corresponding time point.
+
+        T1: {0 unchanged, 2 removed}
+        T2: {0 unchanged, 1 added}
+        """
+        if time_id not in PAIR_EVENT_ACTIVE_SUPPORT:
+            raise ValueError(
+                f"Unsupported time_id={time_id}; expected 1 or 2"
+            )
+
+        scores = logits.detach().to(self.device)
+
+        allowed = torch.tensor(
+            PAIR_EVENT_ACTIVE_SUPPORT[time_id],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Restrict competition to valid event classes BEFORE argmax.
+        local_pred = (
+            scores
+            .index_select(1, allowed)
+            .argmax(-1)
+        )
+
+        # Map the local index back to the global event ID.
+        pred = allowed[local_pred]
+
+        return pred.reshape(-1)
 
     @staticmethod
     def _change_target(target, time_id):
@@ -532,20 +619,27 @@ class PAIRMetrics:
             self.device,
         )
 
-        self._validate_event_target(egt1, ev1, "event_t1")
-        self._validate_event_target(egt2, ev2, "event_t2")
-
-        epred1 = (
-            logits1.detach()
-            .argmax(-1)
-            .to(self.device)
-            .reshape(-1)
+        self._validate_event_target(
+            egt1,
+            ev1,
+            "event_t1",
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[1],
         )
-        epred2 = (
-            logits2.detach()
-            .argmax(-1)
-            .to(self.device)
-            .reshape(-1)
+        self._validate_event_target(
+            egt2,
+            ev2,
+            "event_t2",
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[2],
+        )
+
+        epred1 = self._active_event_argmax(
+            logits1,
+            time_id=1,
+        )
+
+        epred2 = self._active_event_argmax(
+            logits2,
+            time_id=2,
         )
 
         if epred1.numel() != egt1.numel() or epred2.numel() != egt2.numel():
@@ -588,6 +682,57 @@ class PAIRMetrics:
                 ev2,
                 2,
             )
+
+            # Joint Semantic-Event F1 (JSE-F1).
+            #
+            # A changed point is a JSE true positive only when:
+            #   1) it is truly changed,
+            #   2) its event type is correct,
+            #   3) its semantic class is correct.
+            #
+            # For changed GT points, semantic GT must be valid.
+            # For unchanged GT points, semantic validity is not required because
+            # a predicted change is still a valid false positive.
+            jvalid1 = ev1 & ((egt1 == 0) | valid1)
+            jvalid2 = ev2 & ((egt2 == 0) | valid2)
+
+            gt_changed1 = egt1 != 0
+            gt_changed2 = egt2 != 0
+
+            pred_changed1 = epred1 != 0
+            pred_changed2 = epred2 != 0
+
+            joint_correct1 = (
+                gt_changed1
+                & (epred1 == egt1)
+                & (pred1 == gt1)
+            )
+            joint_correct2 = (
+                gt_changed2
+                & (epred2 == egt2)
+                & (pred2 == gt2)
+            )
+
+            self.jse_tp += (
+                jvalid1 & joint_correct1
+            ).sum()
+            self.jse_tp += (
+                jvalid2 & joint_correct2
+            ).sum()
+
+            self.jse_pred_change += (
+                jvalid1 & pred_changed1
+            ).sum()
+            self.jse_pred_change += (
+                jvalid2 & pred_changed2
+            ).sum()
+
+            self.jse_gt_change += (
+                jvalid1 & gt_changed1
+            ).sum()
+            self.jse_gt_change += (
+                jvalid2 & gt_changed2
+            ).sum()
 
             if self.unchanged_local is not None:
                 gated1 = pred1.clone()
@@ -665,6 +810,9 @@ class PAIRMetrics:
                 self.change,
                 self.event_t1,
                 self.event_t2,
+                self.jse_tp,
+                self.jse_pred_change,
+                self.jse_gt_change,
             ):
                 torch.distributed.all_reduce(
                     tensor,
@@ -739,6 +887,29 @@ class PAIRMetrics:
                 "event/mIoU": event["mIoU"],
                 "event/mF1": event["mF1"],
                 "event/Kappa": event["Kappa"],
+            })
+
+            jse_tp = self.jse_tp.double()
+            jse_pred_change = self.jse_pred_change.double()
+            jse_gt_change = self.jse_gt_change.double()
+
+            jse_precision = (
+                jse_tp
+                / jse_pred_change.clamp_min(EPS)
+            )
+            jse_recall = (
+                jse_tp
+                / jse_gt_change.clamp_min(EPS)
+            )
+            jse_f1 = (
+                2.0 * jse_precision * jse_recall
+                / (jse_precision + jse_recall).clamp_min(EPS)
+            )
+
+            result.update({
+                "jse/Precision": float(jse_precision.item()),
+                "jse/Recall": float(jse_recall.item()),
+                "jse/F1": float(jse_f1.item()),
             })
 
             for i in range(PAIR_EVENT_NUM_CLASSES):
@@ -875,7 +1046,9 @@ def _self_test():
     r3d = m3d.compute()
     assert r3d["scalars"]["change/F1"] == 1.0
     assert r3d["scalars"]["event/OA"] == 1.0
+    assert r3d["scalars"]["jse/F1"] == 1.0
     assert r3d["confusion"]["event_combined"].shape == (3, 3)
+
 
     print("metrics.py self-test: PASS")
 

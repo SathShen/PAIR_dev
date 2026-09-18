@@ -14,6 +14,10 @@ PAIR unified loss.
     0 unchanged
     1 added
     2 removed
+
+Active event support:
+    T1: unchanged / removed = {0, 2}
+    T2: unchanged / added   = {0, 1}
 """
 
 from __future__ import annotations
@@ -27,6 +31,10 @@ import torch.nn.functional as F
 
 
 PAIR_EVENT_NUM_CLASSES = 3
+PAIR_EVENT_ACTIVE_SUPPORT = {
+    1: (0, 2),  # T1: unchanged / removed
+    2: (0, 1),  # T2: unchanged / added
+}
 
 
 @dataclass
@@ -83,21 +91,14 @@ class PAIRSemanticChangeLoss(nn.Module):
             return torch.ones(value.numel(), dtype=torch.bool, device=device)
         valid = valid.to(device).reshape(-1).bool()
         if valid.numel() != value.numel():
-            raise ValueError(
-                f"{key} size {valid.numel()} does not match target size {value.numel()}"
-            )
+            raise ValueError(f"{key} size {valid.numel()} does not match target size {value.numel()}")
         return valid
 
     @classmethod
-    def remap_semantic_target(
-        cls,
-        raw_target,
-        valid_mask,
-        class_names,
-        ignore_index=-100,
-    ):
+    def remap_semantic_target(cls, raw_target, valid_mask, class_names, ignore_index=-100):
         raw_target = raw_target.reshape(-1).long()
         valid_mask = valid_mask.reshape(-1).bool()
+
         if raw_target.numel() != valid_mask.numel():
             raise ValueError("semantic target and valid mask sizes differ")
 
@@ -112,9 +113,7 @@ class PAIRSemanticChangeLoss(nn.Module):
         bad = valid_mask & ~matched
         if bad.any():
             values = torch.unique(raw_target[bad]).detach().cpu().tolist()
-            raise ValueError(
-                f"Semantic labels {values} are not declared in DatasetSpec.class_names"
-            )
+            raise ValueError(f"Semantic labels {values} are not declared in DatasetSpec.class_names")
 
         return local
 
@@ -129,22 +128,19 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         if logits.shape[0] != raw_target.numel():
             raise ValueError(
-                f"semantic logits/target size mismatch: "
-                f"{logits.shape[0]} vs {raw_target.numel()}"
+                f"semantic logits/target size mismatch: {logits.shape[0]} vs {raw_target.numel()}"
             )
+
         if logits.shape[1] != len(class_names):
             raise ValueError(
-                f"semantic logits K={logits.shape[1]} but "
-                f"class_names has {len(class_names)} classes"
+                f"semantic logits K={logits.shape[1]} but class_names has {len(class_names)} classes"
             )
+
         if not valid_mask.any():
             return logits.sum() * 0.0
 
-        local_target = cls.remap_semantic_target(
-            raw_target,
-            valid_mask,
-            class_names,
-        )
+        local_target = cls.remap_semantic_target(raw_target, valid_mask, class_names)
+
         return F.cross_entropy(
             logits.float(),
             local_target,
@@ -156,16 +152,10 @@ class PAIRSemanticChangeLoss(nn.Module):
         raw2 = target["semantic_t2"]
 
         valid1 = self._valid_or_true(
-            target,
-            "semantic_valid_t1",
-            raw1,
-            prediction.semantic_logits_t1.device,
+            target, "semantic_valid_t1", raw1, prediction.semantic_logits_t1.device
         )
         valid2 = self._valid_or_true(
-            target,
-            "semantic_valid_t2",
-            raw2,
-            prediction.semantic_logits_t2.device,
+            target, "semantic_valid_t2", raw2, prediction.semantic_logits_t2.device
         )
 
         sem1 = self.semantic_ce(
@@ -180,6 +170,7 @@ class PAIRSemanticChangeLoss(nn.Module):
             valid2,
             class_names,
         )
+
         return sem1, sem2
 
     @staticmethod
@@ -205,18 +196,13 @@ class PAIRSemanticChangeLoss(nn.Module):
             y = target[valid_mask]
             if not torch.all((y == 0) | (y == 1)):
                 values = torch.unique(y).detach().cpu().tolist()
-                raise ValueError(
-                    f"valid change target must contain only 0/1, got {values}"
-                )
+                raise ValueError(f"valid change target must contain only 0/1, got {values}")
 
         return logits, target.float(), valid_mask
 
     def change_bce(self, logits, target, valid_mask):
-        logits, target, valid_mask = self._prepare_change(
-            logits,
-            target,
-            valid_mask,
-        )
+        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
+
         if not valid_mask.any():
             return logits.sum() * 0.0
 
@@ -226,20 +212,19 @@ class PAIRSemanticChangeLoss(nn.Module):
         )
 
     def change_dice(self, logits, target, valid_mask):
-        logits, target, valid_mask = self._prepare_change(
-            logits,
-            target,
-            valid_mask,
-        )
+        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
+
         if not valid_mask.any():
             return logits.sum() * 0.0
 
         prob = torch.sigmoid(logits[valid_mask].float())
         target = target[valid_mask]
+
         intersection = (prob * target).sum()
         dice = (2 * intersection + self.dice_eps) / (
             prob.sum() + target.sum() + self.dice_eps
         )
+
         return 1.0 - dice
 
     @staticmethod
@@ -250,14 +235,18 @@ class PAIRSemanticChangeLoss(nn.Module):
         if key in target:
             change = target[key]
             valid = target.get(valid_key)
+
             if valid is None:
                 valid = torch.ones_like(change, dtype=torch.bool)
+
             return change, valid
 
         change = target["change"]
         valid = target.get("change_valid")
+
         if valid is None:
             valid = torch.ones_like(change, dtype=torch.bool)
+
         return change, valid
 
     def _binary_losses(self, prediction, target):
@@ -279,6 +268,7 @@ class PAIRSemanticChangeLoss(nn.Module):
             change_t2,
             valid_t2,
         )
+
         dice1 = self.change_dice(
             prediction.change_logits_t1,
             change_t1,
@@ -292,10 +282,11 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         change_bce = 0.5 * (bce1 + bce2)
         change_dice = 0.5 * (dice1 + dice2)
+
         return change_bce, change_dice
 
     @staticmethod
-    def event_ce(logits, target, valid_mask):
+    def event_ce(logits, target, valid_mask, allowed_ids, name):
         if (
             logits is None
             or logits.ndim != 2
@@ -317,20 +308,54 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         if valid_mask.any():
             y = target[valid_mask]
+
             bad = (y < 0) | (y >= PAIR_EVENT_NUM_CLASSES)
             if bad.any():
                 values = torch.unique(y[bad]).detach().cpu().tolist()
                 raise ValueError(
-                    f"valid event target contains invalid IDs {values}; "
+                    f"{name} contains invalid event IDs {values}; "
                     f"expected 0..{PAIR_EVENT_NUM_CLASSES - 1}"
+                )
+
+            support_ok = torch.zeros_like(y, dtype=torch.bool)
+            for event_id in allowed_ids:
+                support_ok |= y == event_id
+
+            if (~support_ok).any():
+                values = torch.unique(y[~support_ok]).detach().cpu().tolist()
+                raise ValueError(
+                    f"{name} contains event IDs {values} outside "
+                    f"its active support {tuple(allowed_ids)}"
                 )
 
         if not valid_mask.any():
             return logits.sum() * 0.0
 
+        allowed = torch.tensor(
+            allowed_ids,
+            dtype=torch.long,
+            device=logits.device,
+        )
+
+        # IMPORTANT:
+        # Restrict the class space BEFORE softmax / cross entropy.
+        #
+        # T1:
+        #   global event IDs [0, 2] -> local CE IDs [0, 1]
+        #
+        # T2:
+        #   global event IDs [0, 1] -> local CE IDs [0, 1]
+        active_logits = logits[valid_mask].float().index_select(1, allowed)
+        global_target = target[valid_mask]
+
+        local_target = torch.empty_like(global_target)
+
+        for local_id, global_id in enumerate(allowed_ids):
+            local_target[global_target == global_id] = local_id
+
         return F.cross_entropy(
-            logits[valid_mask].float(),
-            target[valid_mask],
+            active_logits,
+            local_target,
         )
 
     def _event_losses(self, prediction, target):
@@ -338,6 +363,7 @@ class PAIRSemanticChangeLoss(nn.Module):
             raise ValueError(
                 "Event branch must provide both event_logits_t1 and event_logits_t2"
             )
+
         if "event_t1" not in target or "event_t2" not in target:
             raise KeyError(
                 "Event loss requires target['event_t1'] and target['event_t2']"
@@ -363,13 +389,20 @@ class PAIRSemanticChangeLoss(nn.Module):
             prediction.event_logits_t1,
             event1,
             valid1,
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[1],
+            name="event_t1",
         )
+
         event_t2 = self.event_ce(
             prediction.event_logits_t2,
             event2,
             valid2,
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[2],
+            name="event_t2",
         )
+
         event = 0.5 * (event_t1 + event_t2)
+
         return event_t1, event_t2, event
 
     def forward(
@@ -380,8 +413,8 @@ class PAIRSemanticChangeLoss(nn.Module):
         class_names: Dict[int, str],
         dataset_name: Optional[str] = None,
     ):
-        # train.py may still pass dataset_name. Loss behavior is route/output
-        # driven and no longer depends on dataset-specific event classes.
+        # train.py may still pass dataset_name.
+        # Loss behavior is determined by available outputs, not dataset name.
         del dataset_name
 
         sem1, sem2 = self._semantic_losses(
@@ -397,13 +430,12 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         if has_binary_t1 != has_binary_t2:
             raise ValueError(
-                "Binary branch is incomplete: change_logits_t1/t2 "
-                "must be present together"
+                "Binary branch is incomplete: change_logits_t1/t2 must be present together"
             )
+
         if has_event_t1 != has_event_t2:
             raise ValueError(
-                "Event branch is incomplete: event_logits_t1/t2 "
-                "must be present together"
+                "Event branch is incomplete: event_logits_t1/t2 must be present together"
             )
 
         has_binary = has_binary_t1 and has_binary_t2
@@ -417,6 +449,7 @@ class PAIRSemanticChangeLoss(nn.Module):
         total = self.semantic_weight * (sem1 + sem2)
 
         zero = self._zero_from(prediction.semantic_logits_t1)
+
         change_bce = zero
         change_dice = zero
         event_t1 = zero
@@ -428,6 +461,7 @@ class PAIRSemanticChangeLoss(nn.Module):
                 prediction,
                 target,
             )
+
             total = (
                 total
                 + self.change_bce_weight * change_bce
@@ -439,6 +473,7 @@ class PAIRSemanticChangeLoss(nn.Module):
                 prediction,
                 target,
             )
+
             total = total + self.event_weight * event
 
         return ChangeLossOutput(
@@ -459,6 +494,7 @@ def _self_test():
     torch.manual_seed(0)
 
     criterion = PAIRSemanticChangeLoss()
+
     class_names = {
         0: "ground",
         1: "building",
@@ -469,6 +505,9 @@ def _self_test():
     semantic_t1 = torch.tensor([0, 1, 2, 3, 1, 2])
     semantic_t2 = torch.tensor([0, 1, 2, 3, 1, 2])
 
+    # ------------------------------------------------------------------
+    # 2D
+    # ------------------------------------------------------------------
     pred_2d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
@@ -477,6 +516,7 @@ def _self_test():
         event_logits_t1=None,
         event_logits_t2=None,
     )
+
     target_2d = {
         "semantic_t1": semantic_t1,
         "semantic_t2": semantic_t2,
@@ -489,8 +529,12 @@ def _self_test():
         target=target_2d,
         class_names=class_names,
     )
+
     out_2d.total.backward()
 
+    # ------------------------------------------------------------------
+    # 3D
+    # ------------------------------------------------------------------
     pred_3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
@@ -499,6 +543,7 @@ def _self_test():
         event_logits_t1=torch.randn(6, 3, requires_grad=True),
         event_logits_t2=torch.randn(6, 3, requires_grad=True),
     )
+
     target_3d = {
         "semantic_t1": semantic_t1,
         "semantic_t2": semantic_t2,
@@ -514,8 +559,25 @@ def _self_test():
         class_names=class_names,
         dataset_name="NYC-SCD",
     )
+
     out_3d.total.backward()
 
+    # Illegal event classes must receive zero gradient:
+    # T1 illegal = Added (1)
+    # T2 illegal = Removed (2)
+    assert torch.allclose(
+        pred_3d.event_logits_t1.grad[:, 1],
+        torch.zeros_like(pred_3d.event_logits_t1.grad[:, 1]),
+    )
+
+    assert torch.allclose(
+        pred_3d.event_logits_t2.grad[:, 2],
+        torch.zeros_like(pred_3d.event_logits_t2.grad[:, 2]),
+    )
+
+    # ------------------------------------------------------------------
+    # Future 2D+3D route compatibility
+    # ------------------------------------------------------------------
     pred_2d3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
@@ -524,6 +586,7 @@ def _self_test():
         event_logits_t1=torch.randn(6, 3, requires_grad=True),
         event_logits_t2=torch.randn(6, 3, requires_grad=True),
     )
+
     target_2d3d = {
         "semantic_t1": semantic_t1,
         "semantic_t2": semantic_t2,
@@ -540,6 +603,7 @@ def _self_test():
         target=target_2d3d,
         class_names=class_names,
     )
+
     out_2d3d.total.backward()
 
     assert torch.isfinite(out_2d.total)

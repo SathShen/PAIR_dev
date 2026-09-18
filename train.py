@@ -21,9 +21,11 @@ CLI:
     semantic_t1 / semantic_t2
     event_t1 / event_t2
     event_valid_t1 / event_valid_t2
-
 There is no 3D binary change target/head. Traditional binary change metrics are
 derived in metrics.py from event != unchanged.
+
+3D checkpoint selection:
+    Joint Semantic-Event F1 (JSE-F1), metric key: jse/F1
 """
 
 from __future__ import annotations
@@ -37,9 +39,9 @@ import re
 import sys
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -74,14 +76,10 @@ def build_settings(experiment: ExperimentConfig, cli):
     t = experiment.training
     v = experiment.validation
     lg = experiment.logging
-
     output_dir = cli.output_dir
     if output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d%H%M")
-        output_dir = Path(
-            lg.get("output_dir", f"/outputs/{timestamp}_{experiment.experiment['name']}")
-        )
-
+        output_dir = Path(lg.get("output_dir", f"/outputs/{timestamp}_{experiment.experiment['name']}"))
     return SimpleNamespace(
         lr=float(o.get("lr", 1e-4)),
         lora_lr=float(o.get("lora_lr", 2e-5)),
@@ -107,7 +105,6 @@ def build_settings(experiment: ExperimentConfig, cli):
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
-
     if distributed:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
@@ -116,7 +113,6 @@ def setup_distributed():
     else:
         local_rank = rank = 0
         torch.cuda.set_device(0)
-
     return {
         "distributed": distributed,
         "world_size": world_size,
@@ -224,7 +220,6 @@ def merge_targets(samples, route):
     Collate prepared PAIR targets without inventing supervision.
 
     2D stays on the existing semantic + binary-change protocol.
-
     3D uses semantic + event. event_valid is mandatory because T1/T2 temporal
     support is intentionally asymmetric. semantic_valid is emitted only when
     the dataset actually supplies it (i.e. ignored_id is configured).
@@ -238,7 +233,6 @@ def merge_targets(samples, route):
             "semantic_valid_t2": _cat_valid_or_true(samples, "semantic_t2", "semantic_valid_t2"),
             "change_valid": _cat_valid_or_true(samples, "change", "change_valid"),
         }
-
     if route == "3d":
         target = {
             "semantic_t1": _cat_target(samples, "semantic_t1"),
@@ -255,10 +249,7 @@ def merge_targets(samples, route):
         if semantic_valid_t2 is not None:
             target["semantic_valid_t2"] = semantic_valid_t2
         return target
-
-    raise NotImplementedError(
-        "2D+3D target collation is deferred together with world-coordinate decoder wiring"
-    )
+    raise NotImplementedError("2D+3D target collation is deferred together with world-coordinate decoder wiring")
 
 
 # =============================================================================
@@ -267,7 +258,6 @@ def merge_targets(samples, route):
 
 def forward_loss(model, criterion, samples, spec):
     prompts = [sample["prompt"] for sample in samples]
-
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
         prediction = model(
@@ -285,16 +275,9 @@ def forward_loss(model, criterion, samples, spec):
             class_names=spec.class_names,
         )
     else:
-        raise NotImplementedError(
-            "PAIR 2D+3D training waits for real world-coordinate image/point correspondence"
-        )
-
+        raise NotImplementedError("PAIR 2D+3D training waits for real world-coordinate image/point correspondence")
     target = merge_targets(samples, spec.route)
-    loss_output = criterion(
-        prediction=prediction,
-        target=target,
-        class_names=spec.class_names,
-    )
+    loss_output = criterion(prediction=prediction, target=target, class_names=spec.class_names)
     return prediction, loss_output, target
 
 
@@ -310,12 +293,7 @@ def all_reduce_loss_sums(sums, count, device):
 @torch.no_grad()
 def validate(model, criterion, loader, spec, runtime, settings):
     model.eval()
-    evaluator = PAIRMetrics(
-        spec.class_names,
-        runtime["device"],
-        settings.change_threshold
-    )
-
+    evaluator = PAIRMetrics(spec.class_names, runtime["device"], settings.change_threshold)
     sums, count = {}, 0
     start = time.time()
     progress = tqdm(
@@ -326,28 +304,23 @@ def validate(model, criterion, loader, spec, runtime, settings):
         leave=True,
         disable=not runtime["is_main"],
     )
-
     for samples in progress:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec)
-
         evaluator.update(prediction, merged_target)
         batch_n = len(samples)
         for key, value in loss_output.as_dict().items():
             sums[key] = sums.get(key, 0.0) + float(value.detach().cpu()) * batch_n
-
         count += batch_n
         if runtime["is_main"]:
             progress.set_postfix(samples=count, refresh=False)
         if settings.val_max_samples > 0 and count >= settings.val_max_samples:
             break
-
     evaluator.reduce_distributed()
     losses = all_reduce_loss_sums(sums, count, runtime["device"])
     result = evaluator.compute()
     result["losses"] = losses
     result["seconds"] = time.time() - start
-
     model.train()
     return result
 
@@ -365,7 +338,6 @@ def build_optimizer(model, settings):
             lora.append(parameter)
         else:
             main.append(parameter)
-
     groups = []
     if main:
         groups.append({"params": main, "lr": settings.lr, "name": "pair"})
@@ -373,7 +345,6 @@ def build_optimizer(model, settings):
         groups.append({"params": lora, "lr": settings.lora_lr, "name": "lora"})
     if not groups:
         raise RuntimeError("PAIR has no trainable parameters")
-
     optimizer = torch.optim.AdamW(groups, weight_decay=settings.weight_decay)
     return optimizer, main, lora
 
@@ -381,9 +352,7 @@ def build_optimizer(model, settings):
 def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
     warmup = int(round(total_updates * warmup_ratio))
     if kind == "cosine":
-        return get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup, num_training_steps=total_updates
-        )
+        return get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup, num_training_steps=total_updates)
     if kind == "constant":
         return get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup)
     raise ValueError("optimizer.scheduler must be 'cosine' or 'constant'")
@@ -443,24 +412,20 @@ def save_checkpoint(
 def load_checkpoint(path, model, optimizer, scheduler):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     base = unwrap(model)
-
     trainable_state = ckpt.get("pair_trainable", {})
     if trainable_state:
         current = base.state_dict()
         current.update(trainable_state)
         base.load_state_dict(current, strict=False)
-
     # Compatibility with pre-PAIRModel checkpoints. strict=False is intentional:
     # old decoder checkpoints do not contain the new 3D event_head.
     if "decoder" in ckpt:
         base.decoder.load_state_dict(ckpt["decoder"], strict=False)
     if "image_adapter" in ckpt:
         base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
-
     load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
-
     return (
         int(ckpt.get("epoch", 0)),
         int(ckpt.get("update_in_epoch", 0)),
@@ -478,16 +443,11 @@ def safe_checkpoint_token(value):
 def selection_metric_for_spec(spec):
     if spec.route == "2d" and spec.label_mode == "semantic_pair":
         return "scd/F_scd", "Fscd"
-
     if spec.route in {"3d", "2d3d"} and spec.label_mode == "semantic_pair":
-        return "semantic/mIoU", "mIoU"
-
+        return "jse/F1", "JSEF1"
     if spec.label_mode in {"binary", "post_semantic"}:
         return "change/IoU", "IoU"
-
-    raise ValueError(
-        f"No checkpoint selection rule for route={spec.route!r}, label_mode={spec.label_mode!r}"
-    )
+    raise ValueError(f"No checkpoint selection rule for route={spec.route!r}, label_mode={spec.label_mode!r}")
 
 
 def selection_from_results(experiment, results_by_dataset):
@@ -495,15 +455,11 @@ def selection_from_results(experiment, results_by_dataset):
     for name in experiment.selected_names:
         if name not in results_by_dataset:
             continue
-
         spec = experiment.datasets[name].spec
         metric_key, metric_label = selection_metric_for_spec(spec)
         scalars = results_by_dataset[name]["scalars"]
         if metric_key not in scalars:
-            raise KeyError(
-                f"{name}: validation metric {metric_key!r} missing; available={sorted(scalars)}"
-            )
-
+            raise KeyError(f"{name}: validation metric {metric_key!r} missing; available={sorted(scalars)}")
         selection[name] = {
             "metric_key": metric_key,
             "metric_label": metric_label,
@@ -557,6 +513,9 @@ def replace_dataset_valbest(output_dir, dataset_name, keep_path):
 def validation_metric_layout(spec, scalars):
     if spec.route == "3d":
         candidates = (
+            ("JSEF1", "jse/F1"),
+            ("JSEP", "jse/Precision"),
+            ("JSER", "jse/Recall"),
             ("SemOA", "semantic/OA"),
             ("SemIoU", "semantic/mIoU"),
             ("EvtOA", "event/OA"),
@@ -566,7 +525,6 @@ def validation_metric_layout(spec, scalars):
             ("ChgIoU", "change/IoU"),
         )
         return tuple(item for item in candidates if item[1] in scalars)
-
     if spec.label_mode in {"binary", "post_semantic"}:
         return (
             ("OA", "change/OA"),
@@ -575,7 +533,6 @@ def validation_metric_layout(spec, scalars):
             ("Precision", "change/Precision"),
             ("F1", "change/F1"),
         )
-
     if spec.label_mode == "semantic_pair":
         scd_metrics = (
             ("OA", "scd/OA"),
@@ -590,14 +547,12 @@ def validation_metric_layout(spec, scalars):
             for item in (("OA", "semantic/OA"), ("mIoU", "semantic/mIoU"))
             if item[1] in scalars
         )
-
     return ()
 
 
 def log_tensorboard_train(writer, values, step, dataset_name):
     if writer is None:
         return
-
     for key in (
         "loss",
         "loss_semantic_t1",
@@ -616,11 +571,9 @@ def log_tensorboard_train(writer, values, step, dataset_name):
 def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
     if writer is None:
         return
-
     for key, value in result["losses"].items():
         if isinstance(value, (int, float)):
             writer.add_scalar(f"val/{dataset_name}/{key}", value, epoch)
-
     scalars = result["scalars"]
     for display_name, key in validation_metric_layout(spec, scalars):
         value = scalars.get(key)
@@ -666,7 +619,6 @@ def window_loss_string(means):
         f"avg_sem1={means['loss_semantic_t1']:.4f}",
         f"avg_sem2={means['loss_semantic_t2']:.4f}",
     ]
-
     # A mixed 2D/3D window has zeros for inactive branches. Showing both keeps
     # the global window truthful without guessing which route dominated.
     if "loss_change_bce" in means:
@@ -685,7 +637,6 @@ def window_loss_string(means):
 def main():
     run_start = time.time()
     cli = parse_args()
-
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
@@ -702,7 +653,6 @@ def main():
             raise ValueError("training.grad_accum must be >= 1")
 
         set_seed(settings.seed, runtime["rank"])
-
         if runtime["is_main"]:
             settings.output_dir.mkdir(parents=True, exist_ok=True)
             log_path = settings.output_dir / "run.log"
@@ -736,9 +686,7 @@ def main():
 
         criterion = PAIRSemanticChangeLoss().to(runtime["device"])
         optimizer, _, _ = build_optimizer(model, settings)
-        scheduler = build_scheduler(
-            optimizer, total_updates, settings.warmup_ratio, settings.scheduler
-        )
+        scheduler = build_scheduler(optimizer, total_updates, settings.warmup_ratio, settings.scheduler)
 
         start_epoch = 0
         start_update_in_epoch = 0
@@ -777,7 +725,6 @@ def main():
 
         if runtime["is_main"]:
             writer = make_writer(settings.output_dir, settings.tensorboard, True)
-
             # Preserve user-authored config exactly; resolved config is separate.
             source_config_text = experiment.path.read_text(encoding="utf-8")
             (settings.output_dir / "config.json").write_text(source_config_text, encoding="utf-8")
@@ -788,7 +735,6 @@ def main():
             base = unwrap(model)
             lora_trainable, _ = lora_parameter_count(base.qwen_backbone.model)
             total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
             print("=" * 96)
             print("PAIR MULTI-DATASET TRAINING")
             print("=" * 96)
@@ -805,7 +751,6 @@ def main():
             print("Total optimizer updates:", total_updates)
             print("Automatic dataset epoch plan:", dataset_scheduler.summary())
             print()
-
             for name in experiment.selected_names:
                 info = dataset_runtime[name]
                 print(
@@ -835,7 +780,6 @@ def main():
                 for name in experiment.selected_names
             }
             first_update = start_update_in_epoch if epoch == start_epoch else 0
-
             if first_update > 0:
                 registry.consume_updates(schedule[:first_update])
 
@@ -845,7 +789,6 @@ def main():
                 accumulation_steps = update.microbatches
                 handle = registry.handles[dataset_name]
                 spec = handle.config.spec
-
                 optimizer.zero_grad(set_to_none=True)
                 update_sums = {}
                 update_samples = 0
@@ -854,26 +797,21 @@ def main():
                 for micro_idx in range(accumulation_steps):
                     samples = registry.next_train_batch(dataset_name)
                     update_samples += len(samples)
-
                     sync_context = contextlib.nullcontext()
                     if isinstance(model, DDP) and micro_idx + 1 < accumulation_steps:
                         sync_context = model.no_sync()
-
                     with sync_context:
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             _, loss_output, _ = forward_loss(model, criterion, samples, spec)
                             loss = loss_output.total / accumulation_steps
                         loss.backward()
-
                     for key, value in loss_output.as_dict().items():
                         update_sums[key] = update_sums.get(key, 0.0) + float(value.detach().cpu())
 
                 trainable = [p for p in model.parameters() if p.requires_grad]
                 if settings.max_grad_norm > 0:
                     grad_norm = float(
-                        torch.nn.utils.clip_grad_norm_(trainable, settings.max_grad_norm)
-                        .detach()
-                        .cpu()
+                        torch.nn.utils.clip_grad_norm_(trainable, settings.max_grad_norm).detach().cpu()
                     )
                 else:
                     grad_norm = float("nan")
@@ -883,10 +821,7 @@ def main():
                 optimizer_step += 1
 
                 means = {key: value / accumulation_steps for key, value in update_sums.items()}
-                lrs = {
-                    group.get("name", str(i)): group["lr"]
-                    for i, group in enumerate(optimizer.param_groups)
-                }
+                lrs = {group.get("name", str(i)): group["lr"] for i, group in enumerate(optimizer.param_groups)}
                 elapsed = time.time() - update_start
                 samples_per_sec = update_samples * runtime["world_size"] / max(elapsed, 1e-6)
 
@@ -931,7 +866,6 @@ def main():
                             f"E{epoch+1:03d} U{optimizer_step:06d} [{mix}] | "
                             f"{window_loss_string(window_means)}"
                         )
-
                         for name in experiment.selected_names:
                             count = log_window_dataset_counts[name]
                             if count <= 0:
@@ -941,7 +875,6 @@ def main():
                                 for key, value in log_window_dataset_sums.get(name, {}).items()
                             }
                             log_tensorboard_train(writer, dataset_means, optimizer_step, name)
-
                     log_window_dataset_counts.clear()
                     log_window_sums.clear()
                     log_window_count = 0
@@ -967,7 +900,6 @@ def main():
                     handle = registry.handles[dataset_name]
                     if handle.val_loader is None:
                         continue
-
                     result = validate(
                         model,
                         criterion,
@@ -977,7 +909,6 @@ def main():
                         settings,
                     )
                     results_by_dataset[dataset_name] = result
-
                     if runtime["is_main"]:
                         print_val(dataset_name, result, handle.config.spec)
                         log_tensorboard_val(
@@ -1021,9 +952,7 @@ def main():
                             validation_selection=selection,
                             validation_metrics=full_validation_metrics,
                         )
-                        removed = replace_dataset_valbest(
-                            settings.output_dir, dataset_name, best_path
-                        )
+                        removed = replace_dataset_valbest(settings.output_dir, dataset_name, best_path)
                         item = selection[dataset_name]
                         print(
                             f"ValBest [{dataset_name}] "
@@ -1087,7 +1016,6 @@ def main():
                 handle = registry.handles[dataset_name]
                 if handle.val_loader is None:
                     continue
-
                 metric_key, metric_label = selection_metric_for_spec(handle.config.spec)
                 best_value = dataset_best_values.get(dataset_name, -float("inf"))
                 best_epoch = dataset_best_epochs.get(dataset_name, 0)
@@ -1112,14 +1040,12 @@ def main():
             print()
             print(f"Run stopped after: {format_duration(elapsed)} ({elapsed:.1f} s)")
             print("Stopped:", time.strftime("%Y-%m-%d %H:%M:%S"))
-
         if writer is not None:
             writer.close()
         if log_file is not None:
             sys.stdout.flush()
             sys.stdout = original_stdout
             log_file.close()
-
         cleanup_distributed()
 
 
