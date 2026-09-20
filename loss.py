@@ -1,29 +1,44 @@
 """
-PAIR unified loss.
+PAIR unified loss — V1.
 
-2D:
+Design goals
+------------
+1) Keep the loss aligned with PAIR's task protocol instead of coupling it to
+   any specific optimizer.
+2) Use the same small set of robust primitives across 2D and 3D:
+      semantic: CE + Lovasz-Softmax
+      binary change: BCE + Dice
+      3D event: active-support CE + derived change Dice
+3) Normalize across ACTIVE task groups so a batch with more annotated heads
+   does not automatically contribute a proportionally larger total loss.
+4) Keep the existing 3D event protocol exactly:
+      0 unchanged
+      1 added
+      2 removed
+      T1 support = {0, 2}
+      T2 support = {0, 1}
+   There is still NO separate 3D binary-change head. The event Dice term is
+   derived directly from the shared event head.
+
+Routes
+------
+2D SCD:
     semantic_logits_t1/t2 + binary change_logits_t1/t2
+
+2D BCD:
+    semantic supervision may be fully masked out; binary change remains active.
 
 3D:
     semantic_logits_t1/t2 + event_logits_t1/t2
 
-2D+3D:
+Future 2D+3D:
     binary change logits and event logits may coexist.
-
-3D event protocol:
-    0 unchanged
-    1 added
-    2 removed
-
-Active event support:
-    T1: unchanged / removed = {0, 2}
-    T2: unchanged / added   = {0, 1}
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,42 +55,106 @@ PAIR_EVENT_ACTIVE_SUPPORT = {
 @dataclass
 class ChangeLossOutput:
     total: torch.Tensor
+
+    # Semantic CE kept under the old names for train.py compatibility.
     semantic_t1: torch.Tensor
     semantic_t2: torch.Tensor
+    semantic_ce: torch.Tensor
+    semantic_lovasz_t1: torch.Tensor
+    semantic_lovasz_t2: torch.Tensor
+    semantic_lovasz: torch.Tensor
+    semantic: torch.Tensor
+
+    # Binary change.
     change_bce: torch.Tensor
     change_dice: torch.Tensor
+    change: torch.Tensor
+
+    # 3D event. event_t1/t2 remain the active-support CE terms.
     event_t1: torch.Tensor
     event_t2: torch.Tensor
+    event_ce: torch.Tensor
+    event_dice_t1: torch.Tensor
+    event_dice_t2: torch.Tensor
+    event_dice: torch.Tensor
     event: torch.Tensor
 
+    # Scalar tensor containing the denominator used by active-task
+    # normalization. Useful for debugging/logging.
+    active_weight_sum: torch.Tensor
+
     def as_dict(self):
+        # Preserve all legacy keys while exposing the new components.
         return {
             "loss": self.total,
             "loss_semantic_t1": self.semantic_t1,
             "loss_semantic_t2": self.semantic_t2,
+            "loss_semantic_ce": self.semantic_ce,
+            "loss_semantic_lovasz_t1": self.semantic_lovasz_t1,
+            "loss_semantic_lovasz_t2": self.semantic_lovasz_t2,
+            "loss_semantic_lovasz": self.semantic_lovasz,
+            "loss_semantic": self.semantic,
             "loss_change_bce": self.change_bce,
             "loss_change_dice": self.change_dice,
+            "loss_change": self.change,
             "loss_event_t1": self.event_t1,
             "loss_event_t2": self.event_t2,
+            "loss_event_ce": self.event_ce,
+            "loss_event_dice_t1": self.event_dice_t1,
+            "loss_event_dice_t2": self.event_dice_t2,
+            "loss_event_dice": self.event_dice,
             "loss_event": self.event,
+            "loss_active_weight_sum": self.active_weight_sum,
         }
 
 
 class PAIRSemanticChangeLoss(nn.Module):
     def __init__(
         self,
+        # Keep the original positional argument order intact.
         semantic_weight=1.0,
         change_bce_weight=1.0,
         change_dice_weight=1.0,
         event_weight=1.0,
         dice_eps=1.0,
+        # V1 additions.
+        semantic_lovasz_weight=0.5,
+        change_weight=1.0,
+        event_dice_weight=1.0,
+        normalize_active_tasks=True,
     ):
         super().__init__()
+
+        # Task-group weights.
         self.semantic_weight = float(semantic_weight)
+        self.change_weight = float(change_weight)
+        self.event_weight = float(event_weight)
+
+        # Within-task weights.
+        self.semantic_lovasz_weight = float(semantic_lovasz_weight)
         self.change_bce_weight = float(change_bce_weight)
         self.change_dice_weight = float(change_dice_weight)
-        self.event_weight = float(event_weight)
+        self.event_dice_weight = float(event_dice_weight)
+
         self.dice_eps = float(dice_eps)
+        self.normalize_active_tasks = bool(normalize_active_tasks)
+
+        for name, value in (
+            ("semantic_weight", self.semantic_weight),
+            ("change_weight", self.change_weight),
+            ("event_weight", self.event_weight),
+            ("semantic_lovasz_weight", self.semantic_lovasz_weight),
+            ("change_bce_weight", self.change_bce_weight),
+            ("change_dice_weight", self.change_dice_weight),
+            ("event_dice_weight", self.event_dice_weight),
+            ("dice_eps", self.dice_eps),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def make_raw_to_local(class_names: Dict[int, str]) -> Dict[int, int]:
@@ -89,13 +168,33 @@ class PAIRSemanticChangeLoss(nn.Module):
         valid = target.get(key)
         if valid is None:
             return torch.ones(value.numel(), dtype=torch.bool, device=device)
+
         valid = valid.to(device).reshape(-1).bool()
         if valid.numel() != value.numel():
-            raise ValueError(f"{key} size {valid.numel()} does not match target size {value.numel()}")
+            raise ValueError(
+                f"{key} size {valid.numel()} does not match target size {value.numel()}"
+            )
         return valid
 
+    @staticmethod
+    def _zero_from(tensor):
+        return tensor.sum() * 0.0
+
+    @staticmethod
+    def _mean_over_active(losses: Sequence[torch.Tensor], active: Sequence[bool]):
+        selected = [loss for loss, is_active in zip(losses, active) if is_active]
+        if not selected:
+            return losses[0].sum() * 0.0
+        return torch.stack(selected).mean()
+
     @classmethod
-    def remap_semantic_target(cls, raw_target, valid_mask, class_names, ignore_index=-100):
+    def remap_semantic_target(
+        cls,
+        raw_target,
+        valid_mask,
+        class_names,
+        ignore_index=-100,
+    ):
         raw_target = raw_target.reshape(-1).long()
         valid_mask = valid_mask.reshape(-1).bool()
 
@@ -113,12 +212,76 @@ class PAIRSemanticChangeLoss(nn.Module):
         bad = valid_mask & ~matched
         if bad.any():
             values = torch.unique(raw_target[bad]).detach().cpu().tolist()
-            raise ValueError(f"Semantic labels {values} are not declared in DatasetSpec.class_names")
+            raise ValueError(
+                f"Semantic labels {values} are not declared in DatasetSpec.class_names"
+            )
 
         return local
 
+    # ------------------------------------------------------------------
+    # Lovasz-Softmax
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+        p = gt_sorted.numel()
+        gts = gt_sorted.sum()
+        intersection = gts - gt_sorted.float().cumsum(0)
+        union = gts + (1.0 - gt_sorted).float().cumsum(0)
+        jaccard = 1.0 - intersection / union.clamp_min(1e-12)
+
+        if p > 1:
+            jaccard[1:p] = jaccard[1:p] - jaccard[:-1]
+
+        return jaccard
+
     @classmethod
-    def semantic_ce(cls, logits, raw_target, valid_mask, class_names):
+    def _lovasz_softmax_flat(
+        cls,
+        probas: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        if probas.numel() == 0:
+            return probas.sum() * 0.0
+
+        num_classes = probas.shape[1]
+        losses = []
+
+        # "present" classes only. This avoids penalizing a crop for semantic
+        # classes that are absent from its valid supervision.
+        for class_id in range(num_classes):
+            fg = (labels == class_id).float()
+            if fg.sum() == 0:
+                continue
+
+            errors = (fg - probas[:, class_id]).abs()
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            fg_sorted = fg[perm]
+
+            losses.append(
+                torch.dot(
+                    errors_sorted,
+                    cls._lovasz_grad(fg_sorted),
+                )
+            )
+
+        if not losses:
+            return probas.sum() * 0.0
+
+        return torch.stack(losses).mean()
+
+    # ------------------------------------------------------------------
+    # Semantic task: CE + Lovasz
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _prepare_semantic(
+        cls,
+        logits,
+        raw_target,
+        valid_mask,
+        class_names,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if logits is None or logits.ndim != 2:
             shape = None if logits is None else tuple(logits.shape)
             raise ValueError(f"semantic logits must be [N,K], got {shape}")
@@ -128,35 +291,78 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         if logits.shape[0] != raw_target.numel():
             raise ValueError(
-                f"semantic logits/target size mismatch: {logits.shape[0]} vs {raw_target.numel()}"
+                f"semantic logits/target size mismatch: "
+                f"{logits.shape[0]} vs {raw_target.numel()}"
             )
 
         if logits.shape[1] != len(class_names):
             raise ValueError(
-                f"semantic logits K={logits.shape[1]} but class_names has {len(class_names)} classes"
+                f"semantic logits K={logits.shape[1]} but "
+                f"class_names has {len(class_names)} classes"
             )
+
+        local_target = cls.remap_semantic_target(
+            raw_target,
+            valid_mask,
+            class_names,
+        )
+
+        return logits.float(), local_target, valid_mask
+
+    @classmethod
+    def semantic_ce(cls, logits, raw_target, valid_mask, class_names):
+        logits, local_target, valid_mask = cls._prepare_semantic(
+            logits,
+            raw_target,
+            valid_mask,
+            class_names,
+        )
 
         if not valid_mask.any():
             return logits.sum() * 0.0
 
-        local_target = cls.remap_semantic_target(raw_target, valid_mask, class_names)
-
         return F.cross_entropy(
-            logits.float(),
+            logits,
             local_target,
             ignore_index=-100,
         )
+
+    @classmethod
+    def semantic_lovasz(cls, logits, raw_target, valid_mask, class_names):
+        logits, local_target, valid_mask = cls._prepare_semantic(
+            logits,
+            raw_target,
+            valid_mask,
+            class_names,
+        )
+
+        if not valid_mask.any():
+            return logits.sum() * 0.0
+
+        probas = F.softmax(logits[valid_mask], dim=1)
+        labels = local_target[valid_mask]
+
+        return cls._lovasz_softmax_flat(probas, labels)
 
     def _semantic_losses(self, prediction, target, class_names):
         raw1 = target["semantic_t1"]
         raw2 = target["semantic_t2"]
 
         valid1 = self._valid_or_true(
-            target, "semantic_valid_t1", raw1, prediction.semantic_logits_t1.device
+            target,
+            "semantic_valid_t1",
+            raw1,
+            prediction.semantic_logits_t1.device,
         )
         valid2 = self._valid_or_true(
-            target, "semantic_valid_t2", raw2, prediction.semantic_logits_t2.device
+            target,
+            "semantic_valid_t2",
+            raw2,
+            prediction.semantic_logits_t2.device,
         )
+
+        active1 = bool(valid1.any().item())
+        active2 = bool(valid2.any().item())
 
         sem1 = self.semantic_ce(
             prediction.semantic_logits_t1,
@@ -171,11 +377,45 @@ class PAIRSemanticChangeLoss(nn.Module):
             class_names,
         )
 
-        return sem1, sem2
+        lov1 = self.semantic_lovasz(
+            prediction.semantic_logits_t1,
+            raw1,
+            valid1,
+            class_names,
+        )
+        lov2 = self.semantic_lovasz(
+            prediction.semantic_logits_t2,
+            raw2,
+            valid2,
+            class_names,
+        )
 
-    @staticmethod
-    def _zero_from(tensor):
-        return tensor.sum() * 0.0
+        sem_ce = self._mean_over_active(
+            (sem1, sem2),
+            (active1, active2),
+        )
+        sem_lovasz = self._mean_over_active(
+            (lov1, lov2),
+            (active1, active2),
+        )
+
+        semantic = sem_ce + self.semantic_lovasz_weight * sem_lovasz
+        semantic_active = active1 or active2
+
+        return (
+            sem1,
+            sem2,
+            sem_ce,
+            lov1,
+            lov2,
+            sem_lovasz,
+            semantic,
+            semantic_active,
+        )
+
+    # ------------------------------------------------------------------
+    # Binary change task: BCE + Dice
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _prepare_change(logits, target, valid_mask):
@@ -196,12 +436,18 @@ class PAIRSemanticChangeLoss(nn.Module):
             y = target[valid_mask]
             if not torch.all((y == 0) | (y == 1)):
                 values = torch.unique(y).detach().cpu().tolist()
-                raise ValueError(f"valid change target must contain only 0/1, got {values}")
+                raise ValueError(
+                    f"valid change target must contain only 0/1, got {values}"
+                )
 
         return logits, target.float(), valid_mask
 
     def change_bce(self, logits, target, valid_mask):
-        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
+        logits, target, valid_mask = self._prepare_change(
+            logits,
+            target,
+            valid_mask,
+        )
 
         if not valid_mask.any():
             return logits.sum() * 0.0
@@ -212,7 +458,11 @@ class PAIRSemanticChangeLoss(nn.Module):
         )
 
     def change_dice(self, logits, target, valid_mask):
-        logits, target, valid_mask = self._prepare_change(logits, target, valid_mask)
+        logits, target, valid_mask = self._prepare_change(
+            logits,
+            target,
+            valid_mask,
+        )
 
         if not valid_mask.any():
             return logits.sum() * 0.0
@@ -221,7 +471,7 @@ class PAIRSemanticChangeLoss(nn.Module):
         target = target[valid_mask]
 
         intersection = (prob * target).sum()
-        dice = (2 * intersection + self.dice_eps) / (
+        dice = (2.0 * intersection + self.dice_eps) / (
             prob.sum() + target.sum() + self.dice_eps
         )
 
@@ -258,6 +508,12 @@ class PAIRSemanticChangeLoss(nn.Module):
         change_t1, valid_t1 = self._change_target(target, 1)
         change_t2, valid_t2 = self._change_target(target, 2)
 
+        valid_t1 = valid_t1.to(prediction.change_logits_t1.device).reshape(-1).bool()
+        valid_t2 = valid_t2.to(prediction.change_logits_t2.device).reshape(-1).bool()
+
+        active1 = bool(valid_t1.any().item())
+        active2 = bool(valid_t2.any().item())
+
         bce1 = self.change_bce(
             prediction.change_logits_t1,
             change_t1,
@@ -280,13 +536,30 @@ class PAIRSemanticChangeLoss(nn.Module):
             valid_t2,
         )
 
-        change_bce = 0.5 * (bce1 + bce2)
-        change_dice = 0.5 * (dice1 + dice2)
+        change_bce = self._mean_over_active(
+            (bce1, bce2),
+            (active1, active2),
+        )
+        change_dice = self._mean_over_active(
+            (dice1, dice2),
+            (active1, active2),
+        )
 
-        return change_bce, change_dice
+        change = (
+            self.change_bce_weight * change_bce
+            + self.change_dice_weight * change_dice
+        )
+
+        change_active = active1 or active2
+
+        return change_bce, change_dice, change, change_active
+
+    # ------------------------------------------------------------------
+    # 3D event task: active-support CE + derived change Dice
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def event_ce(logits, target, valid_mask, allowed_ids, name):
+    def _prepare_event(logits, target, valid_mask, allowed_ids, name):
         if (
             logits is None
             or logits.ndim != 2
@@ -328,26 +601,32 @@ class PAIRSemanticChangeLoss(nn.Module):
                     f"its active support {tuple(allowed_ids)}"
                 )
 
-        if not valid_mask.any():
-            return logits.sum() * 0.0
-
         allowed = torch.tensor(
             allowed_ids,
             dtype=torch.long,
             device=logits.device,
         )
 
-        # IMPORTANT:
-        # Restrict the class space BEFORE softmax / cross entropy.
-        #
-        # T1:
-        #   global event IDs [0, 2] -> local CE IDs [0, 1]
-        #
-        # T2:
-        #   global event IDs [0, 1] -> local CE IDs [0, 1]
-        active_logits = logits[valid_mask].float().index_select(1, allowed)
-        global_target = target[valid_mask]
+        return logits.float(), target, valid_mask, allowed
 
+    @classmethod
+    def event_ce(cls, logits, target, valid_mask, allowed_ids, name):
+        logits, target, valid_mask, allowed = cls._prepare_event(
+            logits,
+            target,
+            valid_mask,
+            allowed_ids,
+            name,
+        )
+
+        if not valid_mask.any():
+            return logits.sum() * 0.0
+
+        # Restrict the class space BEFORE CE.
+        # T1 global [0,2] -> local [0,1]
+        # T2 global [0,1] -> local [0,1]
+        active_logits = logits[valid_mask].index_select(1, allowed)
+        global_target = target[valid_mask]
         local_target = torch.empty_like(global_target)
 
         for local_id, global_id in enumerate(allowed_ids):
@@ -357,6 +636,33 @@ class PAIRSemanticChangeLoss(nn.Module):
             active_logits,
             local_target,
         )
+
+    def event_change_dice(self, logits, target, valid_mask, allowed_ids, name):
+        logits, target, valid_mask, allowed = self._prepare_event(
+            logits,
+            target,
+            valid_mask,
+            allowed_ids,
+            name,
+        )
+
+        if not valid_mask.any():
+            return logits.sum() * 0.0
+
+        active_logits = logits[valid_mask].index_select(1, allowed)
+        active_prob = F.softmax(active_logits, dim=1)
+
+        # In both active supports the second local class is the changed class:
+        # T1 [unchanged, removed], T2 [unchanged, added].
+        change_prob = active_prob[:, 1]
+        change_target = (target[valid_mask] != 0).float()
+
+        intersection = (change_prob * change_target).sum()
+        dice = (2.0 * intersection + self.dice_eps) / (
+            change_prob.sum() + change_target.sum() + self.dice_eps
+        )
+
+        return 1.0 - dice
 
     def _event_losses(self, prediction, target):
         if prediction.event_logits_t1 is None or prediction.event_logits_t2 is None:
@@ -385,6 +691,9 @@ class PAIRSemanticChangeLoss(nn.Module):
             prediction.event_logits_t2.device,
         )
 
+        active1 = bool(valid1.any().item())
+        active2 = bool(valid2.any().item())
+
         event_t1 = self.event_ce(
             prediction.event_logits_t1,
             event1,
@@ -401,9 +710,48 @@ class PAIRSemanticChangeLoss(nn.Module):
             name="event_t2",
         )
 
-        event = 0.5 * (event_t1 + event_t2)
+        dice_t1 = self.event_change_dice(
+            prediction.event_logits_t1,
+            event1,
+            valid1,
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[1],
+            name="event_t1",
+        )
 
-        return event_t1, event_t2, event
+        dice_t2 = self.event_change_dice(
+            prediction.event_logits_t2,
+            event2,
+            valid2,
+            allowed_ids=PAIR_EVENT_ACTIVE_SUPPORT[2],
+            name="event_t2",
+        )
+
+        event_ce = self._mean_over_active(
+            (event_t1, event_t2),
+            (active1, active2),
+        )
+        event_dice = self._mean_over_active(
+            (dice_t1, dice_t2),
+            (active1, active2),
+        )
+
+        event = event_ce + self.event_dice_weight * event_dice
+        event_active = active1 or active2
+
+        return (
+            event_t1,
+            event_t2,
+            event_ce,
+            dice_t1,
+            dice_t2,
+            event_dice,
+            event,
+            event_active,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward / active-task normalization
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -413,11 +761,20 @@ class PAIRSemanticChangeLoss(nn.Module):
         class_names: Dict[int, str],
         dataset_name: Optional[str] = None,
     ):
-        # train.py may still pass dataset_name.
-        # Loss behavior is determined by available outputs, not dataset name.
+        # Kept for API compatibility. The supervision actually present in the
+        # batch determines which task groups are active.
         del dataset_name
 
-        sem1, sem2 = self._semantic_losses(
+        (
+            sem1,
+            sem2,
+            sem_ce,
+            sem_lov1,
+            sem_lov2,
+            sem_lovasz,
+            semantic,
+            semantic_active,
+        ) = self._semantic_losses(
             prediction,
             target,
             class_names,
@@ -446,45 +803,112 @@ class PAIRSemanticChangeLoss(nn.Module):
                 "PAIR loss received neither binary-change logits nor event logits"
             )
 
-        total = self.semantic_weight * (sem1 + sem2)
-
         zero = self._zero_from(prediction.semantic_logits_t1)
 
         change_bce = zero
         change_dice = zero
+        change = zero
+        change_active = False
+
         event_t1 = zero
         event_t2 = zero
+        event_ce = zero
+        event_dice_t1 = zero
+        event_dice_t2 = zero
+        event_dice = zero
         event = zero
+        event_active = False
 
         if has_binary:
-            change_bce, change_dice = self._binary_losses(
+            (
+                change_bce,
+                change_dice,
+                change,
+                change_active,
+            ) = self._binary_losses(
                 prediction,
                 target,
-            )
-
-            total = (
-                total
-                + self.change_bce_weight * change_bce
-                + self.change_dice_weight * change_dice
             )
 
         if has_event:
-            event_t1, event_t2, event = self._event_losses(
+            (
+                event_t1,
+                event_t2,
+                event_ce,
+                event_dice_t1,
+                event_dice_t2,
+                event_dice,
+                event,
+                event_active,
+            ) = self._event_losses(
                 prediction,
                 target,
             )
 
-            total = total + self.event_weight * event
+        weighted_terms = []
+        active_weights = []
+
+        if semantic_active and self.semantic_weight > 0:
+            weighted_terms.append(
+                self.semantic_weight * semantic
+            )
+            active_weights.append(
+                self.semantic_weight
+            )
+
+        if change_active and self.change_weight > 0:
+            weighted_terms.append(
+                self.change_weight * change
+            )
+            active_weights.append(
+                self.change_weight
+            )
+
+        if event_active and self.event_weight > 0:
+            weighted_terms.append(
+                self.event_weight * event
+            )
+            active_weights.append(
+                self.event_weight
+            )
+
+        if not weighted_terms:
+            raise ValueError(
+                "PAIR loss has no active supervised task after valid masks/weights are applied"
+            )
+
+        numerator = torch.stack(weighted_terms).sum()
+        weight_sum_value = float(sum(active_weights))
+
+        if self.normalize_active_tasks:
+            total = numerator / weight_sum_value
+        else:
+            total = numerator
+
+        active_weight_sum = numerator.new_tensor(
+            weight_sum_value
+        )
 
         return ChangeLossOutput(
             total=total,
             semantic_t1=sem1,
             semantic_t2=sem2,
+            semantic_ce=sem_ce,
+            semantic_lovasz_t1=sem_lov1,
+            semantic_lovasz_t2=sem_lov2,
+            semantic_lovasz=sem_lovasz,
+            semantic=semantic,
             change_bce=change_bce,
             change_dice=change_dice,
+            change=change,
             event_t1=event_t1,
             event_t2=event_t2,
+            event_ce=event_ce,
+            event_dice_t1=event_dice_t1,
+            event_dice_t2=event_dice_t2,
+            event_dice=event_dice,
             event=event,
+            active_weight_sum=active_weight_sum,
         )
 
 
@@ -506,7 +930,7 @@ def _self_test():
     semantic_t2 = torch.tensor([0, 1, 2, 3, 1, 2])
 
     # ------------------------------------------------------------------
-    # 2D
+    # 2D SCD: semantic + binary change
     # ------------------------------------------------------------------
     pred_2d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
@@ -530,10 +954,52 @@ def _self_test():
         class_names=class_names,
     )
 
+    assert torch.isfinite(out_2d.total)
+    assert torch.allclose(out_2d.active_weight_sum, torch.tensor(2.0))
+    expected_2d = 0.5 * (out_2d.semantic + out_2d.change)
+    assert torch.allclose(out_2d.total, expected_2d, atol=1e-6, rtol=1e-6)
+
     out_2d.total.backward()
+    assert pred_2d.semantic_logits_t1.grad is not None
+    assert pred_2d.change_logits_t1.grad is not None
 
     # ------------------------------------------------------------------
-    # 3D
+    # 2D BCD: semantic supervision fully masked out.
+    # Total must be the binary task itself, NOT half of it.
+    # ------------------------------------------------------------------
+    pred_bcd = SimpleNamespace(
+        semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
+        semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
+        change_logits_t1=torch.randn(6, requires_grad=True),
+        change_logits_t2=torch.randn(6, requires_grad=True),
+        event_logits_t1=None,
+        event_logits_t2=None,
+    )
+
+    target_bcd = {
+        "semantic_t1": semantic_t1,
+        "semantic_t2": semantic_t2,
+        "semantic_valid_t1": torch.zeros(6, dtype=torch.bool),
+        "semantic_valid_t2": torch.zeros(6, dtype=torch.bool),
+        "change_t1": torch.tensor([0, 1, 0, 1, 1, 0]),
+        "change_t2": torch.tensor([0, 1, 0, 1, 1, 0]),
+    }
+
+    out_bcd = criterion(
+        prediction=pred_bcd,
+        target=target_bcd,
+        class_names=class_names,
+    )
+
+    assert torch.isfinite(out_bcd.total)
+    assert torch.allclose(out_bcd.active_weight_sum, torch.tensor(1.0))
+    assert torch.allclose(out_bcd.total, out_bcd.change, atol=1e-6, rtol=1e-6)
+
+    out_bcd.total.backward()
+    assert pred_bcd.change_logits_t1.grad is not None
+
+    # ------------------------------------------------------------------
+    # 3D: semantic + event. No binary head.
     # ------------------------------------------------------------------
     pred_3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
@@ -560,23 +1026,31 @@ def _self_test():
         dataset_name="NYC-SCD",
     )
 
+    assert torch.isfinite(out_3d.total)
+    assert torch.allclose(out_3d.active_weight_sum, torch.tensor(2.0))
+    expected_3d = 0.5 * (out_3d.semantic + out_3d.event)
+    assert torch.allclose(out_3d.total, expected_3d, atol=1e-6, rtol=1e-6)
+
     out_3d.total.backward()
 
-    # Illegal event classes must receive zero gradient:
-    # T1 illegal = Added (1)
-    # T2 illegal = Removed (2)
+    # Illegal event classes must still receive exactly zero gradient even
+    # after adding derived event Dice, because both CE and Dice operate only
+    # inside the active support.
     assert torch.allclose(
         pred_3d.event_logits_t1.grad[:, 1],
         torch.zeros_like(pred_3d.event_logits_t1.grad[:, 1]),
+        atol=0.0,
+        rtol=0.0,
     )
-
     assert torch.allclose(
         pred_3d.event_logits_t2.grad[:, 2],
         torch.zeros_like(pred_3d.event_logits_t2.grad[:, 2]),
+        atol=0.0,
+        rtol=0.0,
     )
 
     # ------------------------------------------------------------------
-    # Future 2D+3D route compatibility
+    # Future 2D+3D: semantic + binary + event -> three active groups.
     # ------------------------------------------------------------------
     pred_2d3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
@@ -604,18 +1078,39 @@ def _self_test():
         class_names=class_names,
     )
 
+    assert torch.isfinite(out_2d3d.total)
+    assert torch.allclose(out_2d3d.active_weight_sum, torch.tensor(3.0))
+
     out_2d3d.total.backward()
 
-    assert torch.isfinite(out_2d.total)
-    assert torch.isfinite(out_3d.total)
-    assert torch.isfinite(out_2d3d.total)
-
-    assert pred_2d.change_logits_t1.grad is not None
-    assert pred_3d.event_logits_t1.grad is not None
     assert pred_2d3d.change_logits_t1.grad is not None
     assert pred_2d3d.event_logits_t1.grad is not None
 
-    print("loss.py self-test: PASS")
+    print("loss.py V1 self-test: PASS")
+    print(
+        "2D SCD total=%.6f | semantic=%.6f | change=%.6f"
+        % (
+            float(out_2d.total.detach()),
+            float(out_2d.semantic.detach()),
+            float(out_2d.change.detach()),
+        )
+    )
+    print(
+        "2D BCD total=%.6f | change=%.6f"
+        % (
+            float(out_bcd.total.detach()),
+            float(out_bcd.change.detach()),
+        )
+    )
+    print(
+        "3D total=%.6f | semantic=%.6f | eventCE=%.6f | eventDice=%.6f"
+        % (
+            float(out_3d.total.detach()),
+            float(out_3d.semantic.detach()),
+            float(out_3d.event_ce.detach()),
+            float(out_3d.event_dice.detach()),
+        )
+    )
 
 
 if __name__ == "__main__":

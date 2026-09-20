@@ -557,34 +557,66 @@ def validation_metric_layout(spec, scalars):
 
 
 def log_tensorboard_train(writer, values, step, dataset_name):
+    """
+    TensorBoard train logging:
+        - only total train loss for each dataset
+    """
     if writer is None:
         return
-    for key in (
-        "loss",
-        "loss_semantic_t1",
-        "loss_semantic_t2",
-        "loss_change_bce",
-        "loss_change_dice",
-        "loss_event_t1",
-        "loss_event_t2",
-        "loss_event",
-    ):
-        value = values.get(key)
-        if isinstance(value, (int, float)):
-            writer.add_scalar(f"train/{dataset_name}/{key}", value, step)
+
+    value = values.get("loss")
+    if isinstance(value, (int, float)):
+        writer.add_scalar(f"train/{dataset_name}/loss", value, step)
 
 
 def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
+    """
+    TensorBoard validation logging is intentionally minimal:
+
+    2D SCD (SECOND / LandsatSCD):
+        Fscd
+
+    3D SCD (NYC-SCD):
+        SemIoU
+        EvtIoU
+        Fjse
+
+    2D BCD (LEVIR-CD):
+        F1
+
+    Validation loss and all auxiliary metrics remain available in run.log /
+    console/checkpoints, but are not written to TensorBoard.
+    """
     if writer is None:
         return
-    for key, value in result["losses"].items():
-        if isinstance(value, (int, float)):
-            writer.add_scalar(f"val/{dataset_name}/{key}", value, epoch)
+
     scalars = result["scalars"]
-    for display_name, key in validation_metric_layout(spec, scalars):
+
+    if spec.route == "3d":
+        selected = (
+            ("SemIoU", "semantic/mIoU"),
+            ("EvtIoU", "event/mIoU"),
+            ("Fjse", "jse/F1"),
+        )
+    elif spec.label_mode in {"binary", "post_semantic"}:
+        selected = (
+            ("F1", "change/F1"),
+        )
+    elif spec.label_mode == "semantic_pair":
+        selected = (
+            ("Fscd", "scd/F_scd"),
+        )
+    else:
+        selected = ()
+
+    for display_name, key in selected:
         value = scalars.get(key)
         if isinstance(value, (int, float)):
-            writer.add_scalar(f"val/{dataset_name}/{display_name}", value, epoch)
+            writer.add_scalar(
+                f"val/{dataset_name}/{display_name}",
+                value,
+                epoch,
+            )
 
 
 def print_val(dataset_name, result, spec):
