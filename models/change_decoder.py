@@ -22,7 +22,7 @@ belongs to the loss/metrics layer, not here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -148,6 +148,16 @@ class UnifiedDecoderOutput:
 
     raw_class_ids: Tuple[int, ...]
     class_names: Tuple[str, ...]
+
+
+@dataclass
+class Cascade2DDecoderOutput:
+    """Final prediction output of the PAIR V2 2D Cascade Gated Decoder."""
+
+    semantic_logits_t1: Optional[torch.Tensor]
+    semantic_logits_t2: Optional[torch.Tensor]
+    change_logits_t1: torch.Tensor
+    change_logits_t2: torch.Tensor
 
 
 # =============================================================================
@@ -400,6 +410,307 @@ class SharedDenseBlock(nn.Module):
 
 
 # =============================================================================
+# PAIR V2 2D Cascade Gated Decoder
+# Ported from PerASCD models/common.py.
+# The module always keeps three streams:
+#   x0 = T1 semantic
+#   x1 = T2 semantic
+#   xc = explicit change
+# =============================================================================
+
+
+class CBAMconv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, reduction=16):
+        super().__init__()
+        self.conv2d = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=kernel_size // 2,
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp1 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+        self.conv1x1 = nn.Conv2d(
+            2,
+            1,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            bias=False,
+        )
+
+    def forward(self, x):
+        avg_out = self.mlp1(self.avg_pool(x))
+        max_out = self.mlp1(self.max_pool(x))
+        channel_w = self.sigmoid(avg_out + max_out)
+        x = x * channel_w
+
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_w = self.sigmoid(
+            self.conv1x1(torch.cat([avg_out, max_out], dim=1))
+        )
+        x = x * spatial_w
+        return self.conv2d(x)
+
+
+class ChangeAwareGatingModule(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            in_channels // 4,
+            kernel_size=3,
+            padding=1,
+        )
+        self.relu = nn.ReLU()
+        self.conv_local = nn.Conv2d(in_channels // 4, 2, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_global = nn.Conv2d(in_channels // 4, 2, kernel_size=1)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)
+
+        avg = self.avg_pool(x)
+        avg = self.conv_global(avg)
+        global_weight = self.sigmoid(avg)
+
+        logit = self.conv_local(x)
+        local_weight = self.sigmoid(logit)
+        return local_weight * (1 + global_weight)
+
+
+class CascadeGatedBlock(nn.Module):
+    def __init__(
+        self,
+        feat_channels,
+        out_channels,
+        drop_rate=0.0,
+        use_lateral=True,
+    ):
+        super().__init__()
+        self.use_lateral = use_lateral
+
+        self.feat_conv0 = nn.Sequential(
+            CBAMconv2d(feat_channels, out_channels, kernel_size=3),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.feat_convc = nn.Sequential(
+            CBAMconv2d(out_channels, out_channels, kernel_size=3),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.highconv0 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.highconv1 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.highconvc = nn.Sequential(
+            nn.Conv2d(
+                out_channels * 3,
+                out_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.lowconv0 = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.lowconv1 = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.lowconvc = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.cagm = ChangeAwareGatingModule(out_channels * 2)
+        self.dropout = nn.Dropout2d(p=drop_rate)
+
+    def forward(self, x0, x1, xc, feat0=None, feat1=None):
+        x0 = self.highconv0(x0)
+        x1 = self.highconv1(x1)
+        xc = self.highconvc(torch.cat([xc, x0, x1], dim=1))
+
+        if self.use_lateral:
+            if feat0 is None or feat1 is None:
+                raise ValueError(
+                    "use_lateral=True requires feat0 and feat1."
+                )
+            x0 = F.interpolate(
+                x0,
+                scale_factor=2,
+                mode="bilinear",
+                align_corners=False,
+            )
+            x1 = F.interpolate(
+                x1,
+                scale_factor=2,
+                mode="bilinear",
+                align_corners=False,
+            )
+            xc = F.interpolate(
+                xc,
+                scale_factor=2,
+                mode="bilinear",
+                align_corners=False,
+            )
+            f0 = self.feat_conv0(feat0)
+            f1 = self.feat_conv0(feat1)
+        else:
+            f0 = self.feat_conv0(x0)
+            f1 = self.feat_conv0(x1)
+
+        fc = self.feat_convc(torch.abs(f0 - f1))
+        hardship_map = self.cagm(torch.cat([xc, fc], dim=1))
+        w_high = hardship_map[:, 0].unsqueeze(1)
+        w_low = hardship_map[:, 1].unsqueeze(1)
+
+        x0 = self.lowconv0((w_high * x0) + (w_low * f0))
+        x1 = self.lowconv1((w_high * x1) + (w_low * f1))
+        xc = self.lowconvc((w_high * xc) + (w_low * fc))
+
+        x0 = self.dropout(x0)
+        x1 = self.dropout(x1)
+        xc = self.dropout(xc)
+        return x0, x1, xc
+
+
+class CascadeGatedDecoder(nn.Module):
+    def __init__(
+        self,
+        in_channel_list,
+        out_channels,
+        drop_rate=0.0,
+        use_refinement_block=False,
+    ):
+        super().__init__()
+        self.use_refinement_block = use_refinement_block
+
+        self.first_feat_conv0 = nn.Sequential(
+            CBAMconv2d(
+                in_channel_list[-1],
+                out_channels,
+                kernel_size=3,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        fusion_blocks = []
+        for i in range(len(in_channel_list) - 1):
+            fusion_blocks.append(
+                CascadeGatedBlock(
+                    feat_channels=in_channel_list[
+                        len(in_channel_list) - i - 2
+                    ],
+                    out_channels=out_channels,
+                    drop_rate=drop_rate,
+                    use_lateral=True,
+                )
+            )
+        self.fusion_blocks = nn.ModuleList(fusion_blocks)
+
+        if use_refinement_block:
+            self.refinement_block = CascadeGatedBlock(
+                feat_channels=out_channels,
+                out_channels=out_channels,
+                drop_rate=drop_rate,
+                use_lateral=False,
+            )
+        else:
+            self.refinement_block = None
+
+    def forward(self, feat_list_a, feat_list_b):
+        x0 = self.first_feat_conv0(feat_list_a[-1])
+        x1 = self.first_feat_conv0(feat_list_b[-1])
+        xc = torch.abs(x0 - x1)
+
+        for i, block in enumerate(self.fusion_blocks):
+            feat0 = feat_list_a[len(feat_list_a) - i - 2]
+            feat1 = feat_list_b[len(feat_list_b) - i - 2]
+            x0, x1, xc = block(
+                x0,
+                x1,
+                xc,
+                feat0,
+                feat1,
+            )
+
+        if self.refinement_block is not None:
+            x0, x1, xc = self.refinement_block(x0, x1, xc)
+
+        return x0, x1, xc
+
+
+# =============================================================================
 # Qwen class prototype encoder
 # =============================================================================
 
@@ -540,6 +851,7 @@ class UnifiedChangeDecoder(nn.Module):
         *,
         decoder_dim: int = 256,
         qwen_dim: int = 2560,
+        vision_dim: int = 1024,
         num_heads: int = 8,
         num_shared_blocks: int = 2,
         reasoning_chunk_size: int = 4096,
@@ -550,6 +862,7 @@ class UnifiedChangeDecoder(nn.Module):
         super().__init__()
         self.decoder_dim = int(decoder_dim)
         self.qwen_dim = int(qwen_dim)
+        self.vision_dim = int(vision_dim)
 
         self.token_embedding = UnifiedTokenEmbedding(
             self.decoder_dim,
@@ -593,8 +906,38 @@ class UnifiedChangeDecoder(nn.Module):
             nn.GELU(),
         )
 
+        # PAIR V2 2D route.
+        # Input order is shallow -> deep:
+        # [ViT layer5 @ 1/4, layer11 @ 1/8, layer17 @ 1/16,
+        #  LLM reasoning @ 1/32].
+        self.cg_decoder_2d = CascadeGatedDecoder(
+            in_channel_list=(
+                self.vision_dim,
+                self.vision_dim,
+                self.vision_dim,
+                self.qwen_dim,
+            ),
+            out_channels=self.decoder_dim,
+            drop_rate=dropout,
+            use_refinement_block=False,
+        )
+
         # Output heads.
+        # Legacy/unified binary classifier is kept for the original token route.
         self.binary_change_classifier = nn.Linear(self.decoder_dim, 1)
+
+        # PAIR V2 2D CG change classifier.
+        # One shared xc stream produces two temporal binary logits:
+        #   channel 0 -> change_logits_t1
+        #   channel 1 -> change_logits_t2
+        # These are two independent output channels, not unchanged/change classes.
+        self.classifier_cd = nn.Sequential(
+            nn.Conv2d(self.decoder_dim, self.decoder_dim // 2, kernel_size=1),
+            nn.BatchNorm2d(self.decoder_dim // 2),
+            nn.ReLU(),
+            nn.Conv2d(self.decoder_dim // 2, 2, kernel_size=1),
+        )
+
         self.event_head = nn.Linear(self.decoder_dim, 3)
 
         self.class_encoder = QwenClassPrototypeEncoder(
@@ -603,6 +946,186 @@ class UnifiedChangeDecoder(nn.Module):
         )
         self.logit_scale = nn.Parameter(
             torch.tensor(float(initial_logit_scale)).log()
+        )
+
+    @staticmethod
+    def _normalize_2d_prediction_mode(prediction_mode: str) -> str:
+        prediction_mode = str(prediction_mode).lower().strip()
+        aliases = {
+            "scd": "scd",
+            "semantic": "scd",
+            "semantic_change": "scd",
+            "bcd": "bcd",
+            "binary": "bcd",
+            "binary_change": "bcd",
+        }
+        if prediction_mode not in aliases:
+            raise ValueError(
+                "prediction_mode must be 'scd' or 'bcd', "
+                f"got {prediction_mode!r}"
+            )
+        return aliases[prediction_mode]
+
+    def _validate_2d_pyramid(
+        self,
+        feat_list: Sequence[torch.Tensor],
+        *,
+        name: str,
+    ) -> None:
+        if not isinstance(feat_list, (list, tuple)):
+            raise TypeError(f"{name} must be a list/tuple of four tensors")
+        if len(feat_list) != 4:
+            raise ValueError(
+                f"{name} must contain four scales [1/4,1/8,1/16,1/32], "
+                f"got {len(feat_list)}"
+            )
+
+        expected_channels = (
+            self.vision_dim,
+            self.vision_dim,
+            self.vision_dim,
+            self.qwen_dim,
+        )
+        batch_size = None
+        previous_hw = None
+
+        for i, (feat, expected_c) in enumerate(
+            zip(feat_list, expected_channels)
+        ):
+            if not torch.is_tensor(feat) or feat.ndim != 4:
+                raise ValueError(
+                    f"{name}[{i}] must be [B,C,H,W], "
+                    f"got {type(feat)!r} / "
+                    f"{getattr(feat, 'shape', None)}"
+                )
+            if feat.shape[1] != expected_c:
+                raise ValueError(
+                    f"{name}[{i}] channel dim must be {expected_c}, "
+                    f"got {feat.shape[1]}"
+                )
+            if batch_size is None:
+                batch_size = feat.shape[0]
+            elif feat.shape[0] != batch_size:
+                raise ValueError(
+                    f"{name} has inconsistent batch dimensions"
+                )
+            if not torch.isfinite(feat).all():
+                raise ValueError(f"{name}[{i}] contains NaN/Inf")
+
+            hw = tuple(feat.shape[-2:])
+            if hw[0] <= 0 or hw[1] <= 0:
+                raise ValueError(f"{name}[{i}] has invalid spatial size {hw}")
+
+            if previous_hw is not None:
+                expected_hw = (
+                    previous_hw[0] // 2,
+                    previous_hw[1] // 2,
+                )
+                if hw != expected_hw:
+                    raise ValueError(
+                        f"{name} must be a strict x2 pyramid shallow->deep; "
+                        f"scale {i-1}={previous_hw}, scale {i}={hw}, "
+                        f"expected {expected_hw}"
+                    )
+            previous_hw = hw
+
+    def _semantic_logits_2d(
+        self,
+        feature: torch.Tensor,
+        prototypes: torch.Tensor,
+    ) -> torch.Tensor:
+        feature = F.normalize(feature.float(), dim=1)
+        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
+        return scale * torch.einsum(
+            "bdhw,kd->bkhw",
+            feature,
+            prototypes,
+        )
+
+    def _binary_logits_2d(self, feature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = self.classifier_cd(feature)
+        if logits.ndim != 4 or logits.shape[1] != 2:
+            raise RuntimeError(
+                "2D CG change classifier must return [B,2,H,W], "
+                f"got {tuple(logits.shape)}"
+            )
+        return logits[:, 0], logits[:, 1]
+
+    def forward_2d_cg(
+        self,
+        *,
+        feat_pyramid_t1: Sequence[torch.Tensor],
+        feat_pyramid_t2: Sequence[torch.Tensor],
+        prediction_mode: str,
+        class_names: Optional[Dict[int, str]] = None,
+        qwen_backbone=None,
+        detach_qwen_class_encoder: bool = True,
+    ) -> Cascade2DDecoderOutput:
+        """
+        PAIR V2 2D route.
+
+        Expected feature order for both times:
+            [1/4, 1/8, 1/16, 1/32]
+
+        For Qwen3-VL-4B at 512x512 this is:
+            layer5  @ 128x128, 1024 channels
+            layer11 @  64x64, 1024 channels
+            layer17 @  32x32, 1024 channels
+            LLM     @  16x16, 2560 channels
+
+        SCD and BCD share the exact same CG decoder and explicit xc stream.
+        Only the final prediction route differs.
+        """
+        prediction_mode = self._normalize_2d_prediction_mode(
+            prediction_mode
+        )
+        self._validate_2d_pyramid(
+            feat_pyramid_t1,
+            name="feat_pyramid_t1",
+        )
+        self._validate_2d_pyramid(
+            feat_pyramid_t2,
+            name="feat_pyramid_t2",
+        )
+
+        for i, (feat1, feat2) in enumerate(
+            zip(feat_pyramid_t1, feat_pyramid_t2)
+        ):
+            if feat1.shape != feat2.shape:
+                raise ValueError(
+                    f"T1/T2 pyramid shape mismatch at scale {i}: "
+                    f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
+                )
+
+        x0, x1, xc = self.cg_decoder_2d(
+            feat_pyramid_t1,
+            feat_pyramid_t2,
+        )
+
+        change_logits_t1, change_logits_t2 = self._binary_logits_2d(xc)
+
+        if prediction_mode == "scd":
+            if class_names is None:
+                raise ValueError("SCD route requires class_names")
+            if qwen_backbone is None:
+                raise ValueError("SCD route requires qwen_backbone")
+
+            _, _, prototypes = self.class_encoder(
+                class_names=class_names,
+                qwen_backbone=qwen_backbone,
+                detach_qwen=detach_qwen_class_encoder,
+            )
+            semantic_logits_t1 = self._semantic_logits_2d(x0, prototypes)
+            semantic_logits_t2 = self._semantic_logits_2d(x1, prototypes)
+        else:
+            semantic_logits_t1 = None
+            semantic_logits_t2 = None
+
+        return Cascade2DDecoderOutput(
+            semantic_logits_t1=semantic_logits_t1,
+            semantic_logits_t2=semantic_logits_t2,
+            change_logits_t1=change_logits_t1,
+            change_logits_t2=change_logits_t2,
         )
 
     @staticmethod

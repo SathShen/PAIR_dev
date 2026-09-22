@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_multidataset_Newloss",
+    "name": "PAIR_SECOND_upsample",
     "seed": 42,
     "epochs": 50
   },

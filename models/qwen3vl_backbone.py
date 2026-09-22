@@ -8,6 +8,10 @@ Supports true vectorized 2D batching:
 
 The wrapper also keeps the single-sample API backward compatible.
 
+PAIR V2 additionally exposes Qwen vision features before spatial merging from
+ViT layers 5 / 11 / 17.  The normal Qwen forward path is left untouched: the
+features are captured with forward hooks while the native vision encoder runs.
+
 For point tokens the input-normalization/mask API is batch-aware, but true
 batched 3D still depends on PointAdapter producing per-sample token sets.
 """
@@ -20,8 +24,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+
+DEFAULT_MODEL_DIR = "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct"
+
+
 class Qwen3VLBackbone(nn.Module):
-    def __init__(self, model_dir: str = None,
+    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR,
                  dtype: torch.dtype = torch.bfloat16,
                  device: Union[str, torch.device] = "cuda",
                  device_map: Optional[Union[str, Dict[str, Any]]] = "cuda",
@@ -59,7 +67,28 @@ class Qwen3VLBackbone(nn.Module):
 
         self.hidden_size = self.model.config.text_config.hidden_size
         self.image_token_id = self.model.config.image_token_id
-        self.vision_spatial_merge_size = self.model.config.vision_config.spatial_merge_size
+
+        vision_config = self.model.config.vision_config
+        self.vision_hidden_size = int(vision_config.hidden_size)
+        self.vision_patch_size = int(vision_config.patch_size)
+        self.vision_spatial_merge_size = int(vision_config.spatial_merge_size)
+
+        # PAIR V2 uses the three native Qwen DeepStack depths before Qwen's
+        # spatial merger.  For the current Qwen3-VL-4B checkpoint these are
+        # exactly layers 5, 11 and 17 (zero-based block indices).
+        self.vision_intermediate_layers = (5, 11, 17)
+        configured_deepstack = tuple(
+            int(x) for x in getattr(vision_config, "deepstack_visual_indexes", ())
+        )
+        if configured_deepstack and configured_deepstack != self.vision_intermediate_layers:
+            raise RuntimeError(
+                "PAIR V2 expects Qwen deepstack_visual_indexes=(5, 11, 17), "
+                f"but this checkpoint reports {configured_deepstack}"
+            )
+
+        self._vision_intermediate_cache: Dict[int, torch.Tensor] = {}
+        self._vision_hook_handles = []
+        self._register_vision_intermediate_hooks()
 
     @property
     def model_device(self) -> torch.device:
@@ -80,6 +109,227 @@ class Qwen3VLBackbone(nn.Module):
 
     def trainable_parameter_count(self) -> int:
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+    # ------------------------------------------------------------------
+    # PAIR V2: pre-merge Qwen vision features
+    # ------------------------------------------------------------------
+
+    def _vision_module(self) -> nn.Module:
+        base_model = getattr(self.model, "model", None)
+        vision = getattr(base_model, "visual", None)
+        if vision is None:
+            raise RuntimeError(
+                "Could not locate Qwen vision module at self.model.model.visual"
+            )
+        return vision
+
+    def _register_vision_intermediate_hooks(self) -> None:
+        vision = self._vision_module()
+        blocks = getattr(vision, "blocks", None)
+        if blocks is None:
+            raise RuntimeError("Qwen vision module does not expose .blocks")
+
+        depth = len(blocks)
+        for layer_idx in self.vision_intermediate_layers:
+            if layer_idx < 0 or layer_idx >= depth:
+                raise RuntimeError(
+                    f"Requested vision layer {layer_idx}, but Qwen vision depth is {depth}"
+                )
+
+            def _capture(_module, _inputs, output, *, _layer_idx=layer_idx):
+                hidden = output
+                if isinstance(hidden, (tuple, list)):
+                    if not hidden:
+                        raise RuntimeError(
+                            f"Qwen vision layer {_layer_idx} returned an empty output"
+                        )
+                    hidden = hidden[0]
+                if not torch.is_tensor(hidden):
+                    hidden = getattr(hidden, "last_hidden_state", None)
+                if not torch.is_tensor(hidden) or hidden.ndim != 2:
+                    shape = getattr(hidden, "shape", None)
+                    raise RuntimeError(
+                        f"Unexpected output from Qwen vision layer {_layer_idx}: "
+                        f"type={type(hidden).__name__}, shape={shape}"
+                    )
+                if hidden.shape[-1] != self.vision_hidden_size:
+                    raise RuntimeError(
+                        f"Qwen vision layer {_layer_idx} hidden dim {hidden.shape[-1]} "
+                        f"!= expected {self.vision_hidden_size}"
+                    )
+                # Do not detach: this remains valid if the vision tower is later
+                # unfrozen.  Current PAIR keeps the vision tower frozen.
+                self._vision_intermediate_cache[_layer_idx] = hidden
+
+            self._vision_hook_handles.append(
+                blocks[layer_idx].register_forward_hook(_capture)
+            )
+
+    def clear_vision_intermediate_cache(self) -> None:
+        self._vision_intermediate_cache.clear()
+
+    def get_vision_intermediate_flat(
+        self,
+        layers: Optional[Sequence[int]] = None,
+        *,
+        require_all: bool = True,
+    ) -> Dict[int, torch.Tensor]:
+        requested = (
+            self.vision_intermediate_layers
+            if layers is None
+            else tuple(int(x) for x in layers)
+        )
+        result = {
+            layer_idx: self._vision_intermediate_cache[layer_idx]
+            for layer_idx in requested
+            if layer_idx in self._vision_intermediate_cache
+        }
+        if require_all and len(result) != len(requested):
+            missing = [x for x in requested if x not in result]
+            raise RuntimeError(
+                "Qwen pre-merge vision features are incomplete. "
+                f"Missing layers {missing}. Run a Qwen forward with images first."
+            )
+        return result
+
+    def _restore_premerge_spatial_layout(
+        self,
+        flat_feature: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore Qwen's merge-grouped patch order to [T, C, H, W].
+
+        Qwen's image processor groups patches as
+            [T, H/merge, W/merge, merge_h, merge_w]
+        before flattening so that every consecutive merge^2 patches can be fed
+        to the patch merger.  A direct ``view(T, H, W, C)`` would therefore
+        scramble the spatial layout.
+        """
+        if flat_feature.ndim != 2:
+            raise ValueError(
+                f"flat_feature must be [N,C], got {tuple(flat_feature.shape)}"
+            )
+
+        t, h_patch, w_patch = [int(x.item()) for x in grid_thw]
+        merge = int(self.vision_spatial_merge_size)
+        if h_patch % merge or w_patch % merge:
+            raise RuntimeError(
+                f"Qwen patch grid {(t, h_patch, w_patch)} is not divisible by "
+                f"spatial_merge_size={merge}"
+            )
+
+        expected = t * h_patch * w_patch
+        if flat_feature.shape[0] != expected:
+            raise RuntimeError(
+                f"Pre-merge token count {flat_feature.shape[0]} != grid product {expected}"
+            )
+
+        channels = flat_feature.shape[-1]
+        feature = flat_feature.reshape(
+            t,
+            h_patch // merge,
+            w_patch // merge,
+            merge,
+            merge,
+            channels,
+        )
+        feature = feature.permute(0, 1, 3, 2, 4, 5).contiguous()
+        feature = feature.reshape(t, h_patch, w_patch, channels)
+        return feature.permute(0, 3, 1, 2).contiguous()
+
+    def get_temporal_vision_feature_maps(
+        self,
+        prepared: Dict[str, Any],
+        layers: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Dict[int, torch.Tensor]]:
+        """Return native pre-merge T1/T2 maps as [B,C,H,W].
+
+        This method is intentionally 2D-only.  It expects every sample in the
+        prepared batch to contain exactly one T1 image and one T2 image.  It
+        does not resample the maps into the 1/4, 1/8, 1/16 pseudo-pyramid; that
+        belongs to the downstream 2D decoder path.
+        """
+        requested = (
+            self.vision_intermediate_layers
+            if layers is None
+            else tuple(int(x) for x in layers)
+        )
+        cached = self.get_vision_intermediate_flat(requested, require_all=True)
+
+        inputs = prepared.get("inputs")
+        if inputs is None:
+            raise ValueError("prepared does not contain 'inputs'")
+        grid = inputs.get("image_grid_thw")
+        if grid is None:
+            raise RuntimeError("No image_grid_thw is available for 2D vision features")
+
+        image_records = list(prepared.get("image_records", ()))
+        if len(image_records) != int(grid.shape[0]):
+            raise RuntimeError(
+                f"image_records has {len(image_records)} entries but image_grid_thw "
+                f"has {int(grid.shape[0])}"
+            )
+
+        batch_size = int(prepared.get("batch_size", 0))
+        if batch_size <= 0:
+            raise RuntimeError(f"Invalid prepared batch_size={batch_size}")
+
+        raw_counts = [
+            int(row[0].item()) * int(row[1].item()) * int(row[2].item())
+            for row in grid
+        ]
+        expected_total = sum(raw_counts)
+
+        temporal_lists: Dict[str, Dict[int, List[Optional[torch.Tensor]]]] = {
+            "t1": {layer_idx: [None] * batch_size for layer_idx in requested},
+            "t2": {layer_idx: [None] * batch_size for layer_idx in requested},
+        }
+
+        for layer_idx in requested:
+            flat = cached[layer_idx]
+            if flat.shape[0] != expected_total:
+                raise RuntimeError(
+                    f"Layer {layer_idx} has {flat.shape[0]} pre-merge tokens, "
+                    f"expected {expected_total} from image_grid_thw"
+                )
+            pieces = torch.split(flat, raw_counts, dim=0)
+
+            for record_idx, ((batch_idx, label), piece) in enumerate(
+                zip(image_records, pieces)
+            ):
+                if label not in ("t1", "t2"):
+                    raise RuntimeError(f"Unexpected image record label {label!r}")
+                feature_tchw = self._restore_premerge_spatial_layout(
+                    piece, grid[record_idx]
+                )
+                if feature_tchw.shape[0] != 1:
+                    raise RuntimeError(
+                        "PAIR 2D V2 expects still-image features with grid_t=1, "
+                        f"got grid_t={feature_tchw.shape[0]}"
+                    )
+                temporal_lists[label][layer_idx][int(batch_idx)] = feature_tchw[0]
+
+        stacked: Dict[str, Dict[int, torch.Tensor]] = {"t1": {}, "t2": {}}
+        for label in ("t1", "t2"):
+            for layer_idx in requested:
+                features = temporal_lists[label][layer_idx]
+                missing = [i for i, feature in enumerate(features) if feature is None]
+                if missing:
+                    raise RuntimeError(
+                        f"Missing {label.upper()} image features at layer {layer_idx} "
+                        f"for batch items {missing}"
+                    )
+                shapes = [tuple(feature.shape) for feature in features if feature is not None]
+                if len(set(shapes)) != 1:
+                    raise RuntimeError(
+                        f"Cannot stack {label.upper()} layer {layer_idx} feature maps "
+                        f"with different shapes: {shapes}"
+                    )
+                stacked[label][layer_idx] = torch.stack(
+                    [feature for feature in features if feature is not None], dim=0
+                )
+
+        return stacked
 
     # ------------------------------------------------------------------
     # Batch normalization helpers
@@ -205,6 +455,10 @@ class Qwen3VLBackbone(nn.Module):
 
     def prepare_inputs(self, *, prompt, images_t1=None, images_t2=None,
                        point_tokens_t1=None, point_tokens_t2=None):
+        # Prevent stale 2D features from a previous Qwen forward from being
+        # consumed accidentally (especially when alternating 2D and 3D batches).
+        self.clear_vision_intermediate_cache()
+
         prompts, single_input = self._prompt_batch(prompt)
         bsz = len(prompts)
         images1 = self._value_batch(images_t1, bsz, "images_t1")

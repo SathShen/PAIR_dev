@@ -1,27 +1,32 @@
 """
 PAIR: Prompt-Aware Image-Point Reasoning.
 
-Unified temporal backbone/model for:
+Unified temporal model for:
     image pair                  -> 2d
     point-cloud pair            -> 3d
     image + point-cloud pair    -> 2d3d
 
-V1 2D spatial reconstruction update
------------------------------------
-The shared UnifiedChangeDecoder is kept unchanged. For 2D only, the shared
-semantic/change latent features are reshaped back to their image-token grid and
-passed through two lightweight, independent learnable upsampling heads:
+PAIR V2 2D route
+----------------
+Qwen3-VL provides three pre-merge ViT feature maps plus its final LLM image
+reasoning map.  For a 512x512 input:
 
-    16 -> 32 -> 64 -> 128   (for a 512x512 input with a 16x16 Qwen token grid)
+    ViT layer 5   : 32x32 -> 128x128   (1/4)
+    ViT layer 11  : 32x32 ->  64x64    (1/8)
+    ViT layer 17  : 32x32 ->  32x32    (1/16)
+    LLM reasoning :             16x16   (1/32)
 
-Semantic classification with Qwen language prototypes and binary-change
-classification are performed AFTER this feature reconstruction. Only the final
-low-channel logits are bilinearly resized from the reconstructed feature grid to
-the exact target raster size.
+The four scales are sent directly to the shared CascadeGatedDecoder.  SCD and
+BCD use the same x0/x1/xc decoder; only the final prediction route differs.
+The public 2D prediction contains only:
 
-The 3D path is unchanged:
-    semantic feature -> prototype classifier
-    change feature   -> 3-class event classifier
+    semantic_logits_t1
+    semantic_logits_t2
+    change_logits_t1
+    change_logits_t2
+
+The established 3D path remains unchanged and continues to use the unified
+token decoder with the shared 3-class event head.
 
 Point protocol at the PAIR boundary:
     coord      [N,3] mandatory
@@ -43,7 +48,6 @@ from models.change_decoder import (
     TemporalLinks,
     UnifiedChangeDecoder,
     UnifiedTokenSet,
-    build_identity_temporal_links,
 )
 from models.lora import apply_qwen_lora
 from models.point_adapter import PointAdapter, PointAdapterConfig
@@ -611,6 +615,15 @@ class PAIRBackbone(nn.Module):
         inputs = prepared["inputs"]
         point_tokens = prepared["point_tokens"]
 
+        capture_vision_intermediate = (
+            return_dense_features and task_mode in ("2d", "2d3d")
+        )
+        if capture_vision_intermediate:
+            # Avoid ever reusing stale layer-5/11/17 features from a previous
+            # image batch.  The Qwen wrapper's permanent hooks refill this
+            # cache during the native vision forward below.
+            self.qwen_backbone.clear_vision_intermediate_cache()
+
         stats = {"calls": 0, "replaced": False}
         visual_capture, language_capture, handles = {}, {}, []
 
@@ -656,6 +669,12 @@ class PAIRBackbone(nn.Module):
         if any(item is not None for item in point_tokens) and not stats["replaced"]:
             raise RuntimeError(
                 "Temporal point tokens were prepared but not injected into Qwen"
+            )
+
+        vision_intermediate = None
+        if capture_vision_intermediate:
+            vision_intermediate = self.qwen_backbone.get_temporal_vision_feature_maps(
+                prepared
             )
 
         # Image dense features.
@@ -780,6 +799,12 @@ class PAIRBackbone(nn.Module):
             "image_dense_2d_t2_list": dense_2d_t2,
             "image_hidden_2d_t1_list": hidden.get("image_hidden_2d_t1_list"),
             "image_hidden_2d_t2_list": hidden.get("image_hidden_2d_t2_list"),
+            "image_premerge_t1": (
+                None if vision_intermediate is None else vision_intermediate["t1"]
+            ),
+            "image_premerge_t2": (
+                None if vision_intermediate is None else vision_intermediate["t2"]
+            ),
             "point_encoded_t1": None if point_out_t1 is None else point_out_t1["point_encoded"],
             "point_encoded_t2": None if point_out_t2 is None else point_out_t2["point_encoded"],
             "point_adapter_output_t1": None if point_out_t1 is None else point_out_t1["point_adapter_output"],
@@ -955,111 +980,6 @@ class ImageDenseAdapter(nn.Module):
         return self.proj(x)
 
 
-# =============================================================================
-# 2D feature upsampling heads (V1)
-# =============================================================================
-
-
-def _init_depthwise_bilinear_deconv(layer: nn.ConvTranspose2d) -> None:
-    """Initialize a depthwise x2 transposed convolution as bilinear upsampling."""
-    if layer.groups != layer.in_channels:
-        raise ValueError("Expected depthwise ConvTranspose2d")
-    if layer.in_channels != layer.out_channels:
-        raise ValueError("Expected equal in/out channels")
-    if layer.kernel_size[0] != layer.kernel_size[1]:
-        raise ValueError("Expected a square upsampling kernel")
-
-    kernel_size = int(layer.kernel_size[0])
-    factor = (kernel_size + 1) // 2
-    center = factor - 1 if kernel_size % 2 == 1 else factor - 0.5
-    axis = torch.arange(kernel_size, dtype=torch.float32)
-    filt = 1.0 - torch.abs(axis - center) / factor
-    kernel = filt[:, None] * filt[None, :]
-
-    with torch.no_grad():
-        layer.weight.zero_()
-        layer.weight[:, 0].copy_(
-            kernel.to(device=layer.weight.device, dtype=layer.weight.dtype)
-            .unsqueeze(0)
-            .expand(layer.in_channels, -1, -1)
-        )
-
-
-class FeatureUpsampleBlock2D(nn.Module):
-    """
-    One lightweight learnable x2 feature-reconstruction stage.
-
-    The depthwise transposed convolution is initialized as bilinear x2 but is
-    trainable. A small depthwise + pointwise residual refinement is added after
-    upsampling. Its last projection is zero-initialized, so the stage starts
-    close to ordinary bilinear feature interpolation.
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = int(dim)
-
-        self.up = nn.ConvTranspose2d(
-            self.dim,
-            self.dim,
-            kernel_size=4,
-            stride=2,
-            padding=1,
-            groups=self.dim,
-            bias=False,
-        )
-        _init_depthwise_bilinear_deconv(self.up)
-
-        self.refine = nn.Sequential(
-            nn.Conv2d(
-                self.dim,
-                self.dim,
-                kernel_size=3,
-                padding=1,
-                groups=self.dim,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=True),
-        )
-        nn.init.zeros_(self.refine[-1].weight)
-        nn.init.zeros_(self.refine[-1].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
-        return x + self.refine(x)
-
-
-class FeatureUpsampler2D(nn.Module):
-    """
-    Progressive learnable feature upsampling for the 2D path only.
-
-    Default V1 uses three x2 stages. For a 16x16 token grid this gives:
-        16 -> 32 -> 64 -> 128.
-    """
-
-    def __init__(self, dim: int = 256, num_stages: int = 3):
-        super().__init__()
-        self.dim = int(dim)
-        self.stages = nn.ModuleList(
-            [FeatureUpsampleBlock2D(self.dim) for _ in range(int(num_stages))]
-        )
-
-    def forward(self, x: torch.Tensor, output_size) -> torch.Tensor:
-        if x.ndim != 4 or x.shape[1] != self.dim:
-            raise ValueError(
-                f"FeatureUpsampler2D expects [B,{self.dim},H,W], got {tuple(x.shape)}"
-            )
-
-        target_h, target_w = [int(v) for v in output_size]
-        for stage in self.stages:
-            next_h = int(x.shape[-2]) * 2
-            next_w = int(x.shape[-1]) * 2
-            if next_h > target_h or next_w > target_w:
-                break
-            x = stage(x)
-        return x
-
 
 def tensor_to_pil(image):
     if isinstance(image, Image.Image):
@@ -1082,59 +1002,6 @@ def tensor_to_pil(image):
     if arr.shape[-1] == 1:
         arr = arr[..., 0]
     return Image.fromarray(arr)
-
-
-def make_grid_positions(shape, device):
-    if shape is None:
-        raise RuntimeError("Missing image token shape")
-    t, h, w = shape
-    if t != 1:
-        raise NotImplementedError(f"Current 2D path expects T=1, got {shape}")
-
-    ys = torch.linspace(-1, 1, h, device=device)
-    xs = torch.linspace(-1, 1, w, device=device)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    zz = torch.zeros(h * w, device=device)
-    return torch.stack((xx.reshape(-1), yy.reshape(-1), zz), dim=1)
-
-
-def make_batched_image_token_set(features, shapes, batch_ids):
-    if features is None or batch_ids is None:
-        raise RuntimeError("Missing batched image features/batch IDs")
-
-    positions, expected_ids = [], []
-    for batch_id, shape in enumerate(shapes):
-        pos = make_grid_positions(shape, features.device)
-        positions.append(pos)
-        expected_ids.append(
-            torch.full(
-                (pos.shape[0],),
-                batch_id,
-                dtype=torch.long,
-                device=features.device,
-            )
-        )
-
-    positions = torch.cat(positions, dim=0)
-    expected_ids = torch.cat(expected_ids, dim=0)
-    batch_ids = batch_ids.to(features.device).long()
-
-    if features.shape[0] != positions.shape[0]:
-        raise RuntimeError(
-            f"Feature/position count mismatch: {features.shape[0]} vs {positions.shape[0]}"
-        )
-    if not torch.equal(batch_ids, expected_ids):
-        raise RuntimeError(
-            "PAIR image token order/batch IDs do not match sample-major layout"
-        )
-
-    n = features.shape[0]
-    return UnifiedTokenSet(
-        features=features,
-        positions=positions,
-        modality_ids=torch.zeros(n, dtype=torch.long, device=features.device),
-        batch_ids=batch_ids,
-    )
 
 
 def make_point_token_set(features, positions, batch_ids, feature_dim):
@@ -1161,158 +1028,193 @@ def make_point_token_set(features, positions, batch_ids, feature_dim):
     )
 
 
-def restore_2d_prediction_batch(
-    prediction,
-    shapes_t1,
-    shapes_t2,
-    output_sizes,
+def _stack_llm_image_maps(image_hidden_2d_list, *, name: str) -> torch.Tensor:
+    """Stack Qwen merged/LLM image reasoning maps as [B,C,H,W]."""
+    if not isinstance(image_hidden_2d_list, (list, tuple)) or not image_hidden_2d_list:
+        raise RuntimeError(f"{name} is missing or empty")
+
+    maps = []
+    for batch_id, feature in enumerate(image_hidden_2d_list):
+        if feature is None:
+            raise RuntimeError(f"{name}[{batch_id}] is missing")
+        if not torch.is_tensor(feature) or feature.ndim != 4:
+            raise ValueError(
+                f"{name}[{batch_id}] must be [T,H,W,C], got "
+                f"{getattr(feature, 'shape', None)}"
+            )
+        if feature.shape[0] != 1:
+            raise RuntimeError(
+                f"PAIR 2D expects still-image LLM features with T=1, got "
+                f"{tuple(feature.shape)}"
+            )
+        maps.append(feature[0].permute(2, 0, 1).contiguous())
+
+    shapes = [tuple(x.shape) for x in maps]
+    if len(set(shapes)) != 1:
+        raise RuntimeError(f"Cannot stack {name} with different shapes: {shapes}")
+    return torch.stack(maps, dim=0)
+
+
+def build_qwen_2d_pyramid(
     *,
-    decoder,
-    semantic_upsampler,
-    change_upsampler,
-    semantic_prototypes,
+    premerge_by_layer,
+    llm_image_hidden_2d_list,
+    layer_indices=(5, 11, 17),
+    name="image",
 ):
     """
-    Restore 2D predictions by reconstructing 256-D features before classification.
+    Build the PAIR V2 pseudo-pyramid in shallow->deep order:
+        [1/4, 1/8, 1/16, 1/32].
 
-    Semantic:
-        shared semantic_feature -> learnable upsample -> prototype classifier
-        -> final bilinear logit alignment.
-
-    Binary change:
-        shared change_feature -> learnable upsample -> binary classifier
-        -> final bilinear logit alignment.
+    Qwen layer 5/11/17 maps are all native pre-merge ViT resolution.  We only
+    resample the first two maps; the LLM map is kept at its true merged-token
+    resolution and must already be exactly half the native ViT resolution.
     """
-    if semantic_prototypes is None:
-        raise RuntimeError("2D semantic prototypes were not captured from the decoder")
+    if not isinstance(premerge_by_layer, dict):
+        raise TypeError(f"{name} premerge features must be a dict keyed by layer index")
 
-    decoder_dim = int(decoder.decoder_dim)
+    l5, l11, l17 = [int(x) for x in layer_indices]
+    missing = [idx for idx in (l5, l11, l17) if idx not in premerge_by_layer]
+    if missing:
+        raise RuntimeError(f"{name} is missing Qwen pre-merge layers {missing}")
 
-    def to_feature_map(part, *, h, w, name):
-        n = int(h) * int(w)
-        if part.shape != (n, decoder_dim):
-            raise RuntimeError(
-                f"{name} feature shape must be [{n},{decoder_dim}], got {tuple(part.shape)}"
+    f5 = premerge_by_layer[l5]
+    f11 = premerge_by_layer[l11]
+    f17 = premerge_by_layer[l17]
+    for idx, feat in ((l5, f5), (l11, f11), (l17, f17)):
+        if not torch.is_tensor(feat) or feat.ndim != 4:
+            raise ValueError(
+                f"{name} layer {idx} must be [B,C,H,W], got "
+                f"{getattr(feat, 'shape', None)}"
             )
-        return (
-            part.reshape(h, w, decoder_dim)
-            .permute(2, 0, 1)
-            .contiguous()
-            .unsqueeze(0)
+
+    if f5.shape != f11.shape or f5.shape != f17.shape:
+        raise RuntimeError(
+            f"{name} Qwen pre-merge layers must share one native grid, got "
+            f"{tuple(f5.shape)}, {tuple(f11.shape)}, {tuple(f17.shape)}"
         )
 
-    def restore_semantic(features, shapes):
-        chunks, cursor = [], 0
-        for shape, output_size in zip(shapes, output_sizes):
-            t, h, w = shape
-            n = t * h * w
-            if t != 1:
-                raise RuntimeError(f"Expected T=1, got {shape}")
+    native_h, native_w = [int(v) for v in f17.shape[-2:]]
+    if native_h % 2 or native_w % 2:
+        raise RuntimeError(
+            f"{name} native ViT grid {(native_h, native_w)} must be divisible by 2"
+        )
 
-            part = features[cursor : cursor + n]
-            if part.shape[0] != n:
-                raise RuntimeError("Semantic feature split mismatch")
+    llm = _stack_llm_image_maps(
+        llm_image_hidden_2d_list,
+        name=f"{name}_llm_hidden",
+    )
+    if llm.shape[0] != f17.shape[0]:
+        raise RuntimeError(
+            f"{name} pre-merge/LLM batch mismatch: {f17.shape[0]} vs {llm.shape[0]}"
+        )
+    expected_llm_hw = (native_h // 2, native_w // 2)
+    if tuple(llm.shape[-2:]) != expected_llm_hw:
+        raise RuntimeError(
+            f"{name} LLM grid must be {expected_llm_hw} for native ViT grid "
+            f"{(native_h, native_w)}, got {tuple(llm.shape[-2:])}"
+        )
 
-            x = to_feature_map(part, h=h, w=w, name="semantic")
-            x = semantic_upsampler(x, output_size)
-            hh, ww = int(x.shape[-2]), int(x.shape[-1])
+    # Match PerASCD's plain-ViT pseudo-pyramid construction.  There is no
+    # learnable V1 upsampler here: CG-Decoder owns the coarse-to-fine decoding.
+    p4 = F.interpolate(
+        f5,
+        size=(native_h * 4, native_w * 4),
+        mode="bilinear",
+        align_corners=False,
+    )
+    p8 = F.interpolate(
+        f11,
+        size=(native_h * 2, native_w * 2),
+        mode="bilinear",
+        align_corners=False,
+    )
+    p16 = f17
+    p32 = llm
+    return [p4, p8, p16, p32]
 
-            flat_feature = (
-                x[0]
-                .permute(1, 2, 0)
-                .contiguous()
-                .reshape(hh * ww, decoder_dim)
+
+def restore_2d_cg_prediction_batch(prediction, output_sizes):
+    """Resize CG logits to each target raster and flatten sample-major."""
+    batch_size = len(output_sizes)
+    if prediction.change_logits_t1.ndim != 3 or prediction.change_logits_t2.ndim != 3:
+        raise ValueError(
+            "change_logits_t1/t2 must both be [B,H,W], got "
+            f"{tuple(prediction.change_logits_t1.shape)} and "
+            f"{tuple(prediction.change_logits_t2.shape)}"
+        )
+    if (
+        prediction.change_logits_t1.shape[0] != batch_size
+        or prediction.change_logits_t2.shape[0] != batch_size
+    ):
+        raise RuntimeError(
+            "change_logits_t1/t2 batch size must match output_sizes: "
+            f"{prediction.change_logits_t1.shape[0]}, "
+            f"{prediction.change_logits_t2.shape[0]} vs {batch_size}"
+        )
+    if prediction.change_logits_t1.shape != prediction.change_logits_t2.shape:
+        raise RuntimeError(
+            "CG T1/T2 change logits must have the same raster shape"
+        )
+
+    def restore_semantic(logits, name):
+        if logits is None:
+            return None
+        if logits.ndim != 4 or logits.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must be [B,K,H,W] with B={batch_size}, got {tuple(logits.shape)}"
             )
-
-            # The original shared prototype classifier is used AFTER upsampling.
-            logits = decoder._semantic_logits(flat_feature, semantic_prototypes)
-            k = int(logits.shape[1])
-            logits = (
-                logits.reshape(hh, ww, k)
-                .permute(2, 0, 1)
-                .contiguous()
-                .unsqueeze(0)
-            )
-
+        chunks = []
+        for batch_id, output_size in enumerate(output_sizes):
             target_size = tuple(int(v) for v in output_size)
-            if logits.shape[-2:] != target_size:
-                logits = F.interpolate(
-                    logits,
+            x = logits[batch_id : batch_id + 1]
+            if tuple(x.shape[-2:]) != target_size:
+                x = F.interpolate(
+                    x,
                     size=target_size,
                     mode="bilinear",
                     align_corners=False,
                 )
-
+            k = int(x.shape[1])
             chunks.append(
-                logits[0]
-                .permute(1, 2, 0)
-                .contiguous()
-                .reshape(-1, k)
+                x[0].permute(1, 2, 0).contiguous().reshape(-1, k)
             )
-            cursor += n
-
-        if cursor != features.shape[0]:
-            raise RuntimeError("Unconsumed semantic features after 2D restore")
         return torch.cat(chunks, dim=0)
 
-    def restore_change(features, shapes):
-        chunks, cursor = [], 0
-        for shape, output_size in zip(shapes, output_sizes):
-            t, h, w = shape
-            n = t * h * w
-            if t != 1:
-                raise RuntimeError(f"Expected T=1, got {shape}")
-
-            part = features[cursor : cursor + n]
-            if part.shape[0] != n:
-                raise RuntimeError("Change feature split mismatch")
-
-            x = to_feature_map(part, h=h, w=w, name="change")
-            x = change_upsampler(x, output_size)
-            hh, ww = int(x.shape[-2]), int(x.shape[-1])
-
-            flat_feature = (
-                x[0]
-                .permute(1, 2, 0)
-                .contiguous()
-                .reshape(hh * ww, decoder_dim)
+    def restore_change(logits, name):
+        if logits.ndim != 3 or logits.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must be [B,H,W] with B={batch_size}, got {tuple(logits.shape)}"
             )
-
-            # The original shared binary classifier is used AFTER upsampling.
-            logits = decoder.binary_change_classifier(flat_feature)[:, 0]
-            logits = logits.reshape(1, 1, hh, ww)
-
+        chunks = []
+        for batch_id, output_size in enumerate(output_sizes):
             target_size = tuple(int(v) for v in output_size)
-            if logits.shape[-2:] != target_size:
-                logits = F.interpolate(
-                    logits,
+            x = logits[batch_id : batch_id + 1].unsqueeze(1)
+            if tuple(x.shape[-2:]) != target_size:
+                x = F.interpolate(
+                    x,
                     size=target_size,
                     mode="bilinear",
                     align_corners=False,
                 )
-
-            chunks.append(logits[0, 0].reshape(-1))
-            cursor += n
-
-        if cursor != features.shape[0]:
-            raise RuntimeError("Unconsumed change features after 2D restore")
+            chunks.append(x[0, 0].reshape(-1))
         return torch.cat(chunks, dim=0)
 
     prediction.semantic_logits_t1 = restore_semantic(
-        prediction.semantic_feature_t1,
-        shapes_t1,
+        prediction.semantic_logits_t1,
+        "semantic_logits_t1",
     )
     prediction.semantic_logits_t2 = restore_semantic(
-        prediction.semantic_feature_t2,
-        shapes_t2,
+        prediction.semantic_logits_t2,
+        "semantic_logits_t2",
     )
     prediction.change_logits_t1 = restore_change(
-        prediction.change_feature_t1,
-        shapes_t1,
+        prediction.change_logits_t1,
+        "change_logits_t1",
     )
     prediction.change_logits_t2 = restore_change(
-        prediction.change_feature_t2,
-        shapes_t2,
+        prediction.change_logits_t2,
+        "change_logits_t2",
     )
     return prediction
 
@@ -1536,19 +1438,10 @@ class PAIRModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
+        # Kept only as a backward-compatible constructor slot.  PAIR V2 does
+        # not instantiate or use the old merged-token ImageDenseAdapter.
         self.image_adapter = image_adapter
         self.qwen_tuning = str(qwen_tuning).lower()
-
-        # 2D only. T1/T2 share one module inside each branch, while semantic
-        # and binary-change reconstruction keep independent parameters.
-        self.semantic_upsampler_2d = FeatureUpsampler2D(
-            dim=self.decoder.decoder_dim,
-            num_stages=3,
-        )
-        self.change_upsampler_2d = FeatureUpsampler2D(
-            dim=self.decoder.decoder_dim,
-            num_stages=3,
-        )
 
     @property
     def qwen_backbone(self):
@@ -1626,12 +1519,12 @@ class PAIRModel(nn.Module):
             point_encoder=point_encoder,
             point_adapter=point_adapter,
         )
-        image_adapter = ImageDenseAdapter(qwen.hidden_size, decoder_dim).to(device)
         decoder = UnifiedChangeDecoder(
             qwen_dim=qwen.hidden_size,
+            vision_dim=qwen.vision_hidden_size,
             decoder_dim=decoder_dim,
         ).to(device)
-        return cls(backbone, decoder, image_adapter, qwen_tuning).to(device)
+        return cls(backbone, decoder, None, qwen_tuning).to(device)
 
     def train(self, mode=True):
         super().train(mode)
@@ -1642,7 +1535,7 @@ class PAIRModel(nn.Module):
         return self
 
     # -------------------------------------------------------------------------
-    # 2D: semantic + binary change with feature upsampling before classifiers
+    # 2D V2: Qwen multi-level pseudo-pyramid -> CascadeGatedDecoder
     # -------------------------------------------------------------------------
 
     def forward_2d(
@@ -1652,6 +1545,7 @@ class PAIRModel(nn.Module):
         prompts,
         class_names,
         output_sizes,
+        prediction_mode="scd",
     ):
         if not (
             len(images_t1)
@@ -1661,6 +1555,14 @@ class PAIRModel(nn.Module):
         ):
             raise ValueError("Batched 2D inputs have inconsistent lengths")
 
+        prediction_mode = str(prediction_mode).lower().strip()
+        if prediction_mode not in ("scd", "bcd"):
+            raise ValueError(
+                f"prediction_mode must be 'scd' or 'bcd', got {prediction_mode!r}"
+            )
+        if prediction_mode == "scd" and not class_names:
+            raise ValueError("SCD mode requires class_names")
+
         images_t1 = [tensor_to_pil(x) for x in images_t1]
         images_t2 = [tensor_to_pil(x) for x in images_t2]
         kwargs = dict(
@@ -1669,92 +1571,64 @@ class PAIRModel(nn.Module):
             images_t2=images_t2,
             return_logits=False,
             return_hidden_states=True,
+            # This flag now requests both the existing merged visual features
+            # and the new pre-merge layer-5/11/17 maps captured by Qwen hooks.
             return_dense_features=True,
             use_cache=False,
         )
 
-        # Frozen Qwen is safe under no_grad for 2D because all trainable 2D
-        # modules are downstream from Qwen.
+        # Frozen Qwen is safe under no_grad for 2D because the complete V2
+        # decoder sits downstream from the frozen Qwen representations.
         if self.qwen_tuning == "frozen":
             with torch.no_grad():
                 out = self.backbone(**kwargs)
         else:
             out = self.backbone(**kwargs)
 
-        if out.image_dense_t1 is None or out.image_dense_t2 is None:
-            raise RuntimeError("PAIR did not expose Qwen Vision dense features")
-        if (
-            out.image_hidden_t1 is None
-            or out.image_hidden_t2 is None
-            or out.task_hidden is None
-        ):
-            raise RuntimeError("PAIR did not expose Qwen reasoning features")
+        premerge_t1 = out.aux.get("image_premerge_t1")
+        premerge_t2 = out.aux.get("image_premerge_t2")
+        llm_t1 = out.aux.get("image_hidden_2d_t1_list")
+        llm_t2 = out.aux.get("image_hidden_2d_t2_list")
+        if premerge_t1 is None or premerge_t2 is None:
+            raise RuntimeError("PAIR did not expose Qwen pre-merge layer 5/11/17 features")
+        if llm_t1 is None or llm_t2 is None:
+            raise RuntimeError("PAIR did not expose Qwen LLM image reasoning maps")
 
-        shapes1 = out.aux["image_token_shapes_t1"]
-        shapes2 = out.aux["image_token_shapes_t2"]
-        for batch_id, (shape1, shape2) in enumerate(zip(shapes1, shapes2)):
-            if shape1 != shape2:
+        layer_indices = self.qwen_backbone.vision_intermediate_layers
+        feat_pyramid_t1 = build_qwen_2d_pyramid(
+            premerge_by_layer=premerge_t1,
+            llm_image_hidden_2d_list=llm_t1,
+            layer_indices=layer_indices,
+            name="T1",
+        )
+        feat_pyramid_t2 = build_qwen_2d_pyramid(
+            premerge_by_layer=premerge_t2,
+            llm_image_hidden_2d_list=llm_t2,
+            layer_indices=layer_indices,
+            name="T2",
+        )
+
+        for scale_id, (feat1, feat2) in enumerate(
+            zip(feat_pyramid_t1, feat_pyramid_t2)
+        ):
+            if feat1.shape != feat2.shape:
                 raise RuntimeError(
-                    "Aligned 2D temporal links require identical T1/T2 grids; "
-                    f"batch {batch_id}: {shape1} vs {shape2}"
+                    f"T1/T2 V2 pyramid mismatch at scale {scale_id}: "
+                    f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
                 )
 
-        dense1 = self.image_adapter(out.image_dense_t1)
-        dense2 = self.image_adapter(out.image_dense_t2)
-        dense_t1 = make_batched_image_token_set(
-            dense1,
-            shapes1,
-            out.aux["image_dense_batch_ids_t1"],
-        )
-        dense_t2 = make_batched_image_token_set(
-            dense2,
-            shapes2,
-            out.aux["image_dense_batch_ids_t2"],
-        )
-        reasoning_t1 = make_batched_image_token_set(
-            out.image_hidden_t1,
-            shapes1,
-            out.aux["image_reasoning_batch_ids_t1"],
-        )
-        reasoning_t2 = make_batched_image_token_set(
-            out.image_hidden_t2,
-            shapes2,
-            out.aux["image_reasoning_batch_ids_t2"],
-        )
-
-        if dense1.shape[0] != dense2.shape[0]:
-            raise RuntimeError("Aligned 2D batch has different total T1/T2 token counts")
-
-        prediction = self.decoder(
-            dense_t1=dense_t1,
-            dense_t2=dense_t2,
-            reasoning_t1=reasoning_t1,
-            reasoning_t2=reasoning_t2,
-            task_hidden=out.task_hidden,
-            links_t1_to_t2=build_identity_temporal_links(
-                dense1.shape[0],
-                device=dense1.device,
+        prediction = self.decoder.forward_2d_cg(
+            feat_pyramid_t1=feat_pyramid_t1,
+            feat_pyramid_t2=feat_pyramid_t2,
+            prediction_mode=prediction_mode,
+            class_names=class_names if prediction_mode == "scd" else None,
+            qwen_backbone=(
+                self.qwen_backbone if prediction_mode == "scd" else None
             ),
-            links_t2_to_t1=build_identity_temporal_links(
-                dense2.shape[0],
-                device=dense2.device,
-            ),
-            class_names=class_names,
-            qwen_backbone=self.qwen_backbone,
             detach_qwen_class_encoder=True,
-            prediction_type="binary",
         )
 
-        return restore_2d_prediction_batch(
-            prediction,
-            shapes1,
-            shapes2,
-            output_sizes,
-            decoder=self.decoder,
-            semantic_upsampler=self.semantic_upsampler_2d,
-            change_upsampler=self.change_upsampler_2d,
-            semantic_prototypes=prediction.semantic_prototypes,
-        )
+        return restore_2d_cg_prediction_batch(prediction, output_sizes)
 
     # -------------------------------------------------------------------------
     # 3D: semantic + 3-class event path (unchanged)
