@@ -9,17 +9,14 @@ Design:
 - reasoning token = Qwen hidden + xyz + modality id + time id
 - sparse TemporalLinks provide cross-time correspondence
 - semantic prediction uses Qwen language class prototypes
-- 2D keeps the existing binary change head
-- 3D uses a fixed 6-class event head:
+- 2D keeps the binary change head
+- 3D uses one shared 3-class event head:
     0 unchanged
     1 added
     2 removed
-    3 class_change
-    4 height_up
-    5 height_down
 
-The decoder core is modality-agnostic. Dataset-specific active event classes
-belong to the loss/metrics layer, not here.
+The decoder core is modality-agnostic. Dataset-specific active event support
+belongs to the loss/metrics layer, not here.
 """
 
 from __future__ import annotations
@@ -36,27 +33,43 @@ import torch.nn.functional as F
 # Unified structures
 # =============================================================================
 
+
 @dataclass
 class UnifiedTokenSet:
     """Flat ragged token representation shared by 2D / 3D / 2D3D."""
+
     features: torch.Tensor
     positions: torch.Tensor
     modality_ids: torch.Tensor
     batch_ids: torch.Tensor
 
-    def validate(self, *, feature_dim: Optional[int] = None, name: str = "tokens") -> None:
+    def validate(
+        self,
+        *,
+        feature_dim: Optional[int] = None,
+        name: str = "tokens",
+    ) -> None:
         if self.features.ndim != 2:
-            raise ValueError(f"{name}.features must be [N,D], got {tuple(self.features.shape)}")
-
+            raise ValueError(
+                f"{name}.features must be [N,D], got {tuple(self.features.shape)}"
+            )
         n = self.features.shape[0]
         if self.positions.shape != (n, 3):
-            raise ValueError(f"{name}.positions must be [N,3], got {tuple(self.positions.shape)}")
+            raise ValueError(
+                f"{name}.positions must be [N,3], got {tuple(self.positions.shape)}"
+            )
         if self.modality_ids.shape != (n,):
-            raise ValueError(f"{name}.modality_ids must be [N], got {tuple(self.modality_ids.shape)}")
+            raise ValueError(
+                f"{name}.modality_ids must be [N], got {tuple(self.modality_ids.shape)}"
+            )
         if self.batch_ids.shape != (n,):
-            raise ValueError(f"{name}.batch_ids must be [N], got {tuple(self.batch_ids.shape)}")
+            raise ValueError(
+                f"{name}.batch_ids must be [N], got {tuple(self.batch_ids.shape)}"
+            )
         if feature_dim is not None and self.features.shape[1] != int(feature_dim):
-            raise ValueError(f"{name}.features dim must be {feature_dim}, got {self.features.shape[1]}")
+            raise ValueError(
+                f"{name}.features dim must be {feature_dim}, got {self.features.shape[1]}"
+            )
         if self.modality_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError(f"{name}.modality_ids must be integer tensor")
         if self.batch_ids.dtype not in (torch.int32, torch.int64):
@@ -75,14 +88,23 @@ class TemporalLinks:
     source_indices: [N_target,K], invalid source entries use -1
     weights: [N_target,K] or None
     """
+
     source_indices: torch.Tensor
     weights: Optional[torch.Tensor] = None
 
-    def validate(self, *, num_target: int, num_source: int, name: str = "links") -> None:
+    def validate(
+        self,
+        *,
+        num_target: int,
+        num_source: int,
+        name: str = "links",
+    ) -> None:
         if self.source_indices.ndim != 2:
             raise ValueError(f"{name}.source_indices must be [N,K]")
         if self.source_indices.shape[0] != int(num_target):
-            raise ValueError(f"{name}: expected {num_target} rows, got {self.source_indices.shape[0]}")
+            raise ValueError(
+                f"{name}: expected {num_target} rows, got {self.source_indices.shape[0]}"
+            )
         if self.source_indices.dtype not in (torch.int32, torch.int64):
             raise TypeError(f"{name}.source_indices must be integer tensor")
 
@@ -90,7 +112,9 @@ class TemporalLinks:
         if valid.any():
             max_index = int(self.source_indices[valid].max().item())
             if max_index >= int(num_source):
-                raise IndexError(f"{name}: source index {max_index} exceeds source token count {num_source}")
+                raise IndexError(
+                    f"{name}: source index {max_index} exceeds source token count {num_source}"
+                )
 
         if self.weights is not None:
             if self.weights.shape != self.source_indices.shape:
@@ -109,6 +133,11 @@ class UnifiedDecoderOutput:
     semantic_logits_t1: torch.Tensor
     semantic_logits_t2: torch.Tensor
 
+    # The already-computed normalized dataset language prototypes [K,D].
+    # 2D uses these again AFTER spatial feature upsampling, avoiding a second
+    # Qwen text pass while leaving the shared decoder representation unchanged.
+    semantic_prototypes: torch.Tensor
+
     # 2D binary path.
     change_logits_t1: Optional[torch.Tensor]
     change_logits_t2: Optional[torch.Tensor]
@@ -125,10 +154,15 @@ class UnifiedDecoderOutput:
 # Unified token embedding
 # =============================================================================
 
+
 class CoordinateEncoder(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(3, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.net = nn.Sequential(
+            nn.Linear(3, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
 
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
         return self.net(xyz.float())
@@ -146,9 +180,17 @@ class UnifiedTokenEmbedding(nn.Module):
 
     def forward(self, tokens: UnifiedTokenSet, *, time_id: int) -> torch.Tensor:
         x = tokens.features
-        pos = self.position_encoder(tokens.positions).to(dtype=x.dtype, device=x.device)
+        pos = self.position_encoder(tokens.positions).to(
+            dtype=x.dtype,
+            device=x.device,
+        )
         mod = self.modality_embedding(tokens.modality_ids.long()).to(dtype=x.dtype)
-        time_ids = torch.full((x.shape[0],), int(time_id), dtype=torch.long, device=x.device)
+        time_ids = torch.full(
+            (x.shape[0],),
+            int(time_id),
+            dtype=torch.long,
+            device=x.device,
+        )
         time = self.time_embedding(time_ids).to(dtype=x.dtype)
         return self.norm(x + pos + mod + time)
 
@@ -157,21 +199,36 @@ class UnifiedTokenEmbedding(nn.Module):
 # Dense <- Qwen reasoning injection
 # =============================================================================
 
+
 class ReasoningInjection(nn.Module):
     """Dense queries attend to a much smaller reasoning-token set."""
 
-    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0, query_chunk_size: int = 4096):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        query_chunk_size: int = 4096,
+    ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-
         self.query_chunk_size = int(query_chunk_size)
-        self.attention = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
         self.out_norm = nn.LayerNorm(dim)
 
-    def _one_batch(self, dense: torch.Tensor, reasoning: torch.Tensor) -> torch.Tensor:
+    def _one_batch(
+        self,
+        dense: torch.Tensor,
+        reasoning: torch.Tensor,
+    ) -> torch.Tensor:
         if dense.shape[0] == 0 or reasoning.shape[0] == 0:
             return dense
 
@@ -198,7 +255,10 @@ class ReasoningInjection(nn.Module):
         for batch_id in torch.unique(dense_batch_ids).tolist():
             dense_mask = dense_batch_ids == int(batch_id)
             reasoning_mask = reasoning_batch_ids == int(batch_id)
-            output[dense_mask] = self._one_batch(dense[dense_mask], reasoning[reasoning_mask])
+            output[dense_mask] = self._one_batch(
+                dense[dense_mask],
+                reasoning[reasoning_mask],
+            )
         return output
 
 
@@ -206,22 +266,33 @@ class ReasoningInjection(nn.Module):
 # Sparse T1 <-> T2 fusion
 # =============================================================================
 
+
 class SparseTemporalFusion(nn.Module):
     """O(N*K) local temporal interaction using externally supplied links."""
 
     def __init__(self, dim: int):
         super().__init__()
-        self.fuse = nn.Sequential(nn.Linear(dim * 4, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim))
+        self.fuse = nn.Sequential(
+            nn.Linear(dim * 4, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
         self.norm = nn.LayerNorm(dim)
 
     @staticmethod
-    def gather_cross_context(*, source: torch.Tensor, links: TemporalLinks) -> torch.Tensor:
+    def gather_cross_context(
+        *,
+        source: torch.Tensor,
+        links: TemporalLinks,
+    ) -> torch.Tensor:
         index = links.source_indices.long()
         valid = index >= 0
 
         if source.shape[0] == 0:
             if valid.any():
-                raise IndexError("Temporal links reference a source tensor with zero tokens")
+                raise IndexError(
+                    "Temporal links reference a source tensor with zero tokens"
+                )
             return source.new_zeros((index.shape[0], source.shape[-1]))
 
         safe_index = index.clamp(min=0)
@@ -230,7 +301,10 @@ class SparseTemporalFusion(nn.Module):
         if links.weights is None:
             weights = valid.to(dtype=source.dtype)
         else:
-            weights = links.weights.to(dtype=source.dtype, device=source.device)
+            weights = links.weights.to(
+                dtype=source.dtype,
+                device=source.device,
+            )
             weights = weights * valid.to(dtype=weights.dtype)
 
         denominator = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -239,16 +313,37 @@ class SparseTemporalFusion(nn.Module):
         has_neighbor = valid.any(dim=1, keepdim=True)
         return torch.where(has_neighbor, cross, torch.zeros_like(cross))
 
-    def forward(self, *, target: torch.Tensor, source: torch.Tensor, links: TemporalLinks) -> torch.Tensor:
-        links.validate(num_target=target.shape[0], num_source=source.shape[0], name="temporal_links")
+    def forward(
+        self,
+        *,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        links: TemporalLinks,
+    ) -> torch.Tensor:
+        links.validate(
+            num_target=target.shape[0],
+            num_source=source.shape[0],
+            name="temporal_links",
+        )
         cross = self.gather_cross_context(source=source, links=links)
-        fused = self.fuse(torch.cat([target, cross, torch.abs(target - cross), target * cross], dim=-1))
+        fused = self.fuse(
+            torch.cat(
+                [
+                    target,
+                    cross,
+                    torch.abs(target - cross),
+                    target * cross,
+                ],
+                dim=-1,
+            )
+        )
         return self.norm(target + fused)
 
 
 # =============================================================================
 # Task conditioning
 # =============================================================================
+
 
 class TaskConditioning(nn.Module):
     """<TASK> hidden -> FiLM conditioning over every dense token."""
@@ -258,9 +353,17 @@ class TaskConditioning(nn.Module):
         self.to_film = nn.Linear(qwen_dim, decoder_dim * 2)
         self.norm = nn.LayerNorm(decoder_dim)
 
-    def forward(self, *, x: torch.Tensor, batch_ids: torch.Tensor, task_hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        *,
+        x: torch.Tensor,
+        batch_ids: torch.Tensor,
+        task_hidden: torch.Tensor,
+    ) -> torch.Tensor:
         if task_hidden.ndim != 2:
-            raise ValueError(f"task_hidden must be [B,D], got {tuple(task_hidden.shape)}")
+            raise ValueError(
+                f"task_hidden must be [B,D], got {tuple(task_hidden.shape)}"
+            )
 
         gamma, beta = self.to_film(task_hidden).chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
@@ -273,8 +376,14 @@ class TaskConditioning(nn.Module):
 # Shared decoder block
 # =============================================================================
 
+
 class SharedDenseBlock(nn.Module):
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         hidden_dim = int(dim * float(mlp_ratio))
         self.norm = nn.LayerNorm(dim)
@@ -293,6 +402,7 @@ class SharedDenseBlock(nn.Module):
 # =============================================================================
 # Qwen class prototype encoder
 # =============================================================================
+
 
 class QwenClassPrototypeEncoder(nn.Module):
     """
@@ -313,10 +423,15 @@ class QwenClassPrototypeEncoder(nn.Module):
         self.qwen_dim = int(qwen_dim)
         self.decoder_dim = int(decoder_dim)
         self.prompt_template = str(prompt_template)
-        self.projection = nn.Sequential(nn.Linear(self.qwen_dim, self.decoder_dim), nn.LayerNorm(self.decoder_dim))
+        self.projection = nn.Sequential(
+            nn.Linear(self.qwen_dim, self.decoder_dim),
+            nn.LayerNorm(self.decoder_dim),
+        )
 
     @staticmethod
-    def normalize_class_dict(class_names: Dict[int, str]) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
+    def normalize_class_dict(
+        class_names: Dict[int, str],
+    ) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
         if not isinstance(class_names, dict):
             raise TypeError("DatasetSpec.class_names must be Dict[int, str]")
         if not class_names:
@@ -327,7 +442,9 @@ class QwenClassPrototypeEncoder(nn.Module):
             if isinstance(raw_id, bool) or not isinstance(raw_id, int):
                 raise TypeError(f"class ID must be int, got {raw_id!r}")
             if not isinstance(name, str) or not name.strip():
-                raise TypeError(f"class name for ID {raw_id} must be non-empty str")
+                raise TypeError(
+                    f"class name for ID {raw_id} must be non-empty str"
+                )
             normalized[int(raw_id)] = name.strip()
 
         raw_ids = tuple(sorted(normalized))
@@ -335,20 +452,39 @@ class QwenClassPrototypeEncoder(nn.Module):
         return raw_ids, names
 
     @staticmethod
-    def _masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def _masked_mean(
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         mask = attention_mask.to(dtype=hidden.dtype).unsqueeze(-1)
-        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        return (
+            (hidden * mask).sum(dim=1)
+            / mask.sum(dim=1).clamp_min(1.0)
+        )
 
-    def forward(self, *, class_names: Dict[int, str], qwen_backbone, detach_qwen: bool = True):
+    def forward(
+        self,
+        *,
+        class_names: Dict[int, str],
+        qwen_backbone,
+        detach_qwen: bool = True,
+    ):
         raw_ids, names = self.normalize_class_dict(class_names)
         prompts = [self.prompt_template.format(name=name) for name in names]
 
         tokenizer = qwen_backbone.tokenizer
         qwen_model = qwen_backbone.model
         device = next(qwen_model.parameters()).device
-
-        encoded = tokenizer(prompts, padding=True, add_special_tokens=True, return_tensors="pt")
-        encoded = {key: value.to(device) for key, value in encoded.items()}
+        encoded = tokenizer(
+            prompts,
+            padding=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        encoded = {
+            key: value.to(device)
+            for key, value in encoded.items()
+        }
 
         def run_qwen():
             output = qwen_model(
@@ -358,7 +494,10 @@ class QwenClassPrototypeEncoder(nn.Module):
                 return_dict=True,
                 use_cache=False,
             )
-            return self._masked_mean(output.hidden_states[-1], encoded["attention_mask"])
+            return self._masked_mean(
+                output.hidden_states[-1],
+                encoded["attention_mask"],
+            )
 
         if detach_qwen:
             with torch.no_grad():
@@ -367,7 +506,9 @@ class QwenClassPrototypeEncoder(nn.Module):
             language_hidden = run_qwen()
 
         projection_dtype = self.projection[0].weight.dtype
-        prototypes = self.projection(language_hidden.to(dtype=projection_dtype))
+        prototypes = self.projection(
+            language_hidden.to(dtype=projection_dtype)
+        )
         prototypes = F.normalize(prototypes.float(), dim=-1)
         return raw_ids, names, prototypes
 
@@ -376,13 +517,14 @@ class QwenClassPrototypeEncoder(nn.Module):
 # Unified decoder
 # =============================================================================
 
+
 class UnifiedChangeDecoder(nn.Module):
     """
     One shared decoder core for 2D / 3D / 2D3D.
 
     prediction_type:
-        "binary" -> existing 2D binary change logits
-        "event"  -> 3D six-class event logits
+        "binary" -> 2D binary change logits
+        "event"  -> 3D three-class event logits
 
     This is an internal routing argument, not a user config field.
     """
@@ -391,9 +533,6 @@ class UnifiedChangeDecoder(nn.Module):
         "unchanged",
         "added",
         "removed",
-        "class_change",
-        "height_up",
-        "height_down",
     )
 
     def __init__(
@@ -409,11 +548,13 @@ class UnifiedChangeDecoder(nn.Module):
         initial_logit_scale: float = 10.0,
     ):
         super().__init__()
-
         self.decoder_dim = int(decoder_dim)
         self.qwen_dim = int(qwen_dim)
 
-        self.token_embedding = UnifiedTokenEmbedding(self.decoder_dim, num_modalities=num_modalities)
+        self.token_embedding = UnifiedTokenEmbedding(
+            self.decoder_dim,
+            num_modalities=num_modalities,
+        )
         self.reasoning_projection = nn.Sequential(
             nn.Linear(self.qwen_dim, self.decoder_dim),
             nn.LayerNorm(self.decoder_dim),
@@ -425,11 +566,20 @@ class UnifiedChangeDecoder(nn.Module):
             query_chunk_size=reasoning_chunk_size,
         )
         self.temporal_fusion = SparseTemporalFusion(self.decoder_dim)
-        self.task_conditioning = TaskConditioning(self.qwen_dim, self.decoder_dim)
-        self.shared_blocks = nn.ModuleList([
-            SharedDenseBlock(self.decoder_dim, mlp_ratio=4.0, dropout=dropout)
-            for _ in range(int(num_shared_blocks))
-        ])
+        self.task_conditioning = TaskConditioning(
+            self.qwen_dim,
+            self.decoder_dim,
+        )
+        self.shared_blocks = nn.ModuleList(
+            [
+                SharedDenseBlock(
+                    self.decoder_dim,
+                    mlp_ratio=4.0,
+                    dropout=dropout,
+                )
+                for _ in range(int(num_shared_blocks))
+            ]
+        )
 
         # Shared latent representations.
         self.semantic_head = nn.Sequential(
@@ -443,22 +593,38 @@ class UnifiedChangeDecoder(nn.Module):
             nn.GELU(),
         )
 
-        # Output heads. Binary is kept for the existing 2D path only.
+        # Output heads.
         self.binary_change_classifier = nn.Linear(self.decoder_dim, 1)
         self.event_head = nn.Linear(self.decoder_dim, 3)
 
-        self.class_encoder = QwenClassPrototypeEncoder(qwen_dim=self.qwen_dim, decoder_dim=self.decoder_dim)
-        self.logit_scale = nn.Parameter(torch.tensor(float(initial_logit_scale)).log())
+        self.class_encoder = QwenClassPrototypeEncoder(
+            qwen_dim=self.qwen_dim,
+            decoder_dim=self.decoder_dim,
+        )
+        self.logit_scale = nn.Parameter(
+            torch.tensor(float(initial_logit_scale)).log()
+        )
 
     @staticmethod
     def _normalize_prediction_type(prediction_type: str) -> str:
         prediction_type = str(prediction_type).lower().strip()
         if prediction_type not in ("binary", "event"):
-            raise ValueError(f"prediction_type must be 'binary' or 'event', got {prediction_type!r}")
+            raise ValueError(
+                "prediction_type must be 'binary' or 'event', "
+                f"got {prediction_type!r}"
+            )
         return prediction_type
 
-    def _prepare_reasoning(self, tokens: UnifiedTokenSet, *, time_id: int):
-        tokens.validate(feature_dim=self.qwen_dim, name="reasoning_tokens")
+    def _prepare_reasoning(
+        self,
+        tokens: UnifiedTokenSet,
+        *,
+        time_id: int,
+    ):
+        tokens.validate(
+            feature_dim=self.qwen_dim,
+            name="reasoning_tokens",
+        )
         projected = UnifiedTokenSet(
             features=self.reasoning_projection(tokens.features),
             positions=tokens.positions,
@@ -468,7 +634,11 @@ class UnifiedChangeDecoder(nn.Module):
         embedded = self.token_embedding(projected, time_id=time_id)
         return embedded, tokens.batch_ids
 
-    def _semantic_logits(self, feature: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
+    def _semantic_logits(
+        self,
+        feature: torch.Tensor,
+        prototypes: torch.Tensor,
+    ) -> torch.Tensor:
         feature = F.normalize(feature.float(), dim=-1)
         scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
         return scale * (feature @ prototypes.T)
@@ -482,16 +652,29 @@ class UnifiedChangeDecoder(nn.Module):
         reasoning_time_id: int,
         task_hidden: torch.Tensor,
     ) -> torch.Tensor:
-        dense_tokens.validate(feature_dim=self.decoder_dim, name="dense_tokens")
-        x = self.token_embedding(dense_tokens, time_id=dense_time_id)
-        reasoning, reasoning_batch_ids = self._prepare_reasoning(reasoning_tokens, time_id=reasoning_time_id)
+        dense_tokens.validate(
+            feature_dim=self.decoder_dim,
+            name="dense_tokens",
+        )
+        x = self.token_embedding(
+            dense_tokens,
+            time_id=dense_time_id,
+        )
+        reasoning, reasoning_batch_ids = self._prepare_reasoning(
+            reasoning_tokens,
+            time_id=reasoning_time_id,
+        )
         x = self.reasoning_injection(
             dense=x,
             dense_batch_ids=dense_tokens.batch_ids,
             reasoning=reasoning,
             reasoning_batch_ids=reasoning_batch_ids,
         )
-        return self.task_conditioning(x=x, batch_ids=dense_tokens.batch_ids, task_hidden=task_hidden)
+        return self.task_conditioning(
+            x=x,
+            batch_ids=dense_tokens.batch_ids,
+            task_hidden=task_hidden,
+        )
 
     def forward(
         self,
@@ -510,10 +693,22 @@ class UnifiedChangeDecoder(nn.Module):
     ) -> UnifiedDecoderOutput:
         prediction_type = self._normalize_prediction_type(prediction_type)
 
-        dense_t1.validate(feature_dim=self.decoder_dim, name="dense_t1")
-        dense_t2.validate(feature_dim=self.decoder_dim, name="dense_t2")
-        reasoning_t1.validate(feature_dim=self.qwen_dim, name="reasoning_t1")
-        reasoning_t2.validate(feature_dim=self.qwen_dim, name="reasoning_t2")
+        dense_t1.validate(
+            feature_dim=self.decoder_dim,
+            name="dense_t1",
+        )
+        dense_t2.validate(
+            feature_dim=self.decoder_dim,
+            name="dense_t2",
+        )
+        reasoning_t1.validate(
+            feature_dim=self.qwen_dim,
+            name="reasoning_t1",
+        )
+        reasoning_t2.validate(
+            feature_dim=self.qwen_dim,
+            name="reasoning_t2",
+        )
 
         # 1) Qwen reasoning -> dense space.
         x1 = self._decode_one_time(
@@ -532,8 +727,16 @@ class UnifiedChangeDecoder(nn.Module):
         )
 
         # 2) Sparse T1 <-> T2 interaction. Both directions use pre-fusion x1/x2.
-        temporal_x1 = self.temporal_fusion(target=x1, source=x2, links=links_t1_to_t2)
-        temporal_x2 = self.temporal_fusion(target=x2, source=x1, links=links_t2_to_t1)
+        temporal_x1 = self.temporal_fusion(
+            target=x1,
+            source=x2,
+            links=links_t1_to_t2,
+        )
+        temporal_x2 = self.temporal_fusion(
+            target=x2,
+            source=x1,
+            links=links_t2_to_t1,
+        )
         x1, x2 = temporal_x1, temporal_x2
 
         # 3) Shared dense refinement.
@@ -553,13 +756,23 @@ class UnifiedChangeDecoder(nn.Module):
             qwen_backbone=qwen_backbone,
             detach_qwen=detach_qwen_class_encoder,
         )
-        semantic_logits_t1 = self._semantic_logits(semantic_feature_t1, prototypes)
-        semantic_logits_t2 = self._semantic_logits(semantic_feature_t2, prototypes)
+        semantic_logits_t1 = self._semantic_logits(
+            semantic_feature_t1,
+            prototypes,
+        )
+        semantic_logits_t2 = self._semantic_logits(
+            semantic_feature_t2,
+            prototypes,
+        )
 
         # 6) Route only the final change/event classifier.
         if prediction_type == "binary":
-            change_logits_t1 = self.binary_change_classifier(change_feature_t1)[:, 0]
-            change_logits_t2 = self.binary_change_classifier(change_feature_t2)[:, 0]
+            change_logits_t1 = self.binary_change_classifier(
+                change_feature_t1
+            )[:, 0]
+            change_logits_t2 = self.binary_change_classifier(
+                change_feature_t2
+            )[:, 0]
             event_logits_t1 = None
             event_logits_t2 = None
         else:
@@ -575,6 +788,7 @@ class UnifiedChangeDecoder(nn.Module):
             change_feature_t2=change_feature_t2,
             semantic_logits_t1=semantic_logits_t1,
             semantic_logits_t2=semantic_logits_t2,
+            semantic_prototypes=prototypes,
             change_logits_t1=change_logits_t1,
             change_logits_t2=change_logits_t2,
             event_logits_t1=event_logits_t1,
@@ -588,8 +802,24 @@ class UnifiedChangeDecoder(nn.Module):
 # Small helper for aligned 2D testing
 # =============================================================================
 
-def build_identity_temporal_links(num_tokens: int, *, device: torch.device) -> TemporalLinks:
+
+def build_identity_temporal_links(
+    num_tokens: int,
+    *,
+    device: torch.device,
+) -> TemporalLinks:
     """Same-position T1/T2 links for an already co-registered flat 2D token grid."""
-    source_indices = torch.arange(int(num_tokens), dtype=torch.long, device=device).unsqueeze(1)
-    weights = torch.ones((int(num_tokens), 1), dtype=torch.float32, device=device)
-    return TemporalLinks(source_indices=source_indices, weights=weights)
+    source_indices = torch.arange(
+        int(num_tokens),
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(1)
+    weights = torch.ones(
+        (int(num_tokens), 1),
+        dtype=torch.float32,
+        device=device,
+    )
+    return TemporalLinks(
+        source_indices=source_indices,
+        weights=weights,
+    )

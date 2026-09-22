@@ -6,26 +6,27 @@ Unified temporal backbone/model for:
     point-cloud pair            -> 3d
     image + point-cloud pair    -> 2d3d
 
-Routing is inferred from supplied modalities. An explicit task_mode is accepted
-only as a consistency check.
+V1 2D spatial reconstruction update
+-----------------------------------
+The shared UnifiedChangeDecoder is kept unchanged. For 2D only, the shared
+semantic/change latent features are reshaped back to their image-token grid and
+passed through two lightweight, independent learnable upsampling heads:
 
-3D path:
-    point_dict T1/T2
-        -> frozen Utonia
-        -> PointAdapter
-             dense [N, decoder_dim]      -> UnifiedChangeDecoder
-             reasoning [K, qwen_dim]     -> Qwen <POINT> tokens
-        -> Qwen reasoning hidden
-        -> semantic + event prediction
+    16 -> 32 -> 64 -> 128   (for a 512x512 input with a 16x16 Qwen token grid)
+
+Semantic classification with Qwen language prototypes and binary-change
+classification are performed AFTER this feature reconstruction. Only the final
+low-channel logits are bilinearly resized from the reconstructed feature grid to
+the exact target raster size.
+
+The 3D path is unchanged:
+    semantic feature -> prototype classifier
+    change feature   -> 3-class event classifier
 
 Point protocol at the PAIR boundary:
     coord      [N,3] mandatory
     rgb        [N,3] optional
     intensity  [N,1] optional
-
-Missing optional fields are never fabricated at dataset level. During ragged
-batching, zero tensors are created only when another sample in the same batch
-contains that field, and a matching validity mask is emitted.
 """
 
 from __future__ import annotations
@@ -80,8 +81,14 @@ class PAIROutput:
 # Backbone orchestration
 # =============================================================================
 
+
 class PAIRBackbone(nn.Module):
-    def __init__(self, qwen_backbone: nn.Module, point_encoder: Optional[nn.Module] = None, point_adapter: Optional[nn.Module] = None):
+    def __init__(
+        self,
+        qwen_backbone: nn.Module,
+        point_encoder: Optional[nn.Module] = None,
+        point_adapter: Optional[nn.Module] = None,
+    ):
         super().__init__()
         self.qwen_backbone = qwen_backbone
         self.point_encoder = point_encoder
@@ -94,17 +101,34 @@ class PAIRBackbone(nn.Module):
     @staticmethod
     def _normalize_task_mode(task_mode: str) -> str:
         aliases = {
-            "2d": "2d", "image": "2d", "image_only": "2d",
-            "3d": "3d", "point": "3d", "point_only": "3d",
-            "2d3d": "2d3d", "2d+3d": "2d3d", "image_point": "2d3d", "multimodal": "2d3d",
+            "2d": "2d",
+            "image": "2d",
+            "image_only": "2d",
+            "3d": "3d",
+            "point": "3d",
+            "point_only": "3d",
+            "2d3d": "2d3d",
+            "2d+3d": "2d3d",
+            "image_point": "2d3d",
+            "multimodal": "2d3d",
         }
         task_mode = str(task_mode).lower().strip()
         if task_mode not in aliases:
-            raise ValueError(f"Unsupported task_mode={task_mode!r}. Supported: {SUPPORTED_TASK_MODES}")
+            raise ValueError(
+                f"Unsupported task_mode={task_mode!r}. Supported: {SUPPORTED_TASK_MODES}"
+            )
         return aliases[task_mode]
 
     @classmethod
-    def _resolve_task_mode(cls, *, task_mode, images_t1, images_t2, point_dict_t1, point_dict_t2) -> str:
+    def _resolve_task_mode(
+        cls,
+        *,
+        task_mode,
+        images_t1,
+        images_t2,
+        point_dict_t1,
+        point_dict_t2,
+    ) -> str:
         has_image_t1, has_image_t2 = images_t1 is not None, images_t2 is not None
         has_point_t1, has_point_t2 = point_dict_t1 is not None, point_dict_t2 is not None
 
@@ -127,7 +151,10 @@ class PAIRBackbone(nn.Module):
         if task_mode is not None:
             explicit = cls._normalize_task_mode(task_mode)
             if explicit != inferred:
-                raise ValueError(f"task_mode={explicit!r} conflicts with supplied modalities, which imply {inferred!r}")
+                raise ValueError(
+                    f"task_mode={explicit!r} conflicts with supplied modalities, "
+                    f"which imply {inferred!r}"
+                )
         return inferred
 
     def _validate_modules(self, task_mode: str):
@@ -174,10 +201,6 @@ class PAIRBackbone(nn.Module):
             -> PointAdapter
                  dense [N,decoder_dim]
                  reasoning [K,qwen_dim]
-
-        intensity is carried through PointEncoder and fused inside PointAdapter.
-        rgb is passed through the point protocol; whether Utonia consumes it is
-        owned by the PointEncoder wrapper, not by PAIR.
         """
         point_encoded = self.point_encoder(point_dict)
         adapter_out = self.point_adapter.forward_with_metadata(point_encoded)
@@ -204,7 +227,10 @@ class PAIRBackbone(nn.Module):
 
     @staticmethod
     def _dense_point_fields(point_out) -> Tuple[
-        Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
     ]:
         if point_out is None:
             return None, None, None, None
@@ -248,7 +274,14 @@ class PAIRBackbone(nn.Module):
             if item.shape[0] == 0:
                 continue
             parts.append(item)
-            ids.append(torch.full((item.shape[0],), batch_id, dtype=torch.long, device=item.device))
+            ids.append(
+                torch.full(
+                    (item.shape[0],),
+                    batch_id,
+                    dtype=torch.long,
+                    device=item.device,
+                )
+            )
 
         if not parts:
             return None, None
@@ -259,7 +292,9 @@ class PAIRBackbone(nn.Module):
     # -------------------------------------------------------------------------
 
     def _point_batch(self, point_tokens, batch_size):
-        return self.qwen_backbone._point_token_batch(point_tokens, batch_size, "point_tokens")
+        return self.qwen_backbone._point_token_batch(
+            point_tokens, batch_size, "point_tokens"
+        )
 
     def _concat_point_tokens(self, t1, t2, batch_size):
         a = self._point_batch(t1, batch_size)
@@ -278,9 +313,18 @@ class PAIRBackbone(nn.Module):
             expected = 0 if tokens is None else int(tokens.shape[0])
             actual = int(point_mask[batch_id].sum().item())
             if expected != actual:
-                raise RuntimeError(f"Batch {batch_id}: prepared {expected} point tokens but prompt has {actual}")
+                raise RuntimeError(
+                    f"Batch {batch_id}: prepared {expected} point tokens but prompt has {actual}"
+                )
 
-    def _make_point_injection_hook(self, *, point_tokens, point_mask, full_seq_len, stats):
+    def _make_point_injection_hook(
+        self,
+        *,
+        point_tokens,
+        point_mask,
+        full_seq_len,
+        stats,
+    ):
         self._validate_point_layout(point_tokens, point_mask)
         hidden_size = self.qwen_backbone.hidden_size
         batch_size = len(point_tokens)
@@ -316,6 +360,7 @@ class PAIRBackbone(nn.Module):
                 store["dense"] = output[0]
             elif torch.is_tensor(output):
                 store["dense"] = output
+
         return hook
 
     @staticmethod
@@ -326,6 +371,7 @@ class PAIRBackbone(nn.Module):
                 hidden = output[0]
             if hidden is not None:
                 store["last_hidden"] = hidden
+
         return hook
 
     # -------------------------------------------------------------------------
@@ -355,10 +401,10 @@ class PAIRBackbone(nn.Module):
         batch_size = prepared["batch_size"]
         t1_parts = [[] for _ in range(batch_size)]
         t2_parts = [[] for _ in range(batch_size)]
-        cursor = 0
 
+        cursor = 0
         for (batch_id, label), count in zip(records, counts):
-            part = vision_dense[cursor:cursor + count]
+            part = vision_dense[cursor : cursor + count]
             if part.shape[0] != count:
                 raise RuntimeError("Vision dense token accounting mismatch")
             if label == "t1":
@@ -368,7 +414,9 @@ class PAIRBackbone(nn.Module):
             cursor += count
 
         if cursor != vision_dense.shape[0]:
-            raise RuntimeError(f"Vision dense count {vision_dense.shape[0]} != consumed {cursor}")
+            raise RuntimeError(
+                f"Vision dense count {vision_dense.shape[0]} != consumed {cursor}"
+            )
 
         def flatten(parts):
             features, batch_ids = [], []
@@ -377,7 +425,14 @@ class PAIRBackbone(nn.Module):
                     continue
                 x = torch.cat(chunks, dim=0)
                 features.append(x)
-                batch_ids.append(torch.full((x.shape[0],), batch_id, dtype=torch.long, device=x.device))
+                batch_ids.append(
+                    torch.full(
+                        (x.shape[0],),
+                        batch_id,
+                        dtype=torch.long,
+                        device=x.device,
+                    )
+                )
             if not features:
                 return None, None
             return torch.cat(features, dim=0), torch.cat(batch_ids, dim=0)
@@ -392,13 +447,18 @@ class PAIRBackbone(nn.Module):
             return None
         t, h, w = shape
         if tokens.shape[0] != t * h * w:
-            raise RuntimeError(f"Image token count {tokens.shape[0]} does not match grid {shape}")
+            raise RuntimeError(
+                f"Image token count {tokens.shape[0]} does not match grid {shape}"
+            )
         return tokens.reshape(t, h, w, tokens.shape[-1])
 
     def _split_by_batch(self, tokens, batch_ids, shapes):
         if tokens is None:
             return [None for _ in shapes]
-        return [self._reshape_single(tokens[batch_ids == batch_id], shape) for batch_id, shape in enumerate(shapes)]
+        return [
+            self._reshape_single(tokens[batch_ids == batch_id], shape)
+            for batch_id, shape in enumerate(shapes)
+        ]
 
     # -------------------------------------------------------------------------
     # Qwen hidden extraction
@@ -407,6 +467,7 @@ class PAIRBackbone(nn.Module):
     def _extract_multimodal_hidden(self, *, last_hidden, prepared, inputs):
         device = last_hidden.device
         batch_size = prepared["batch_size"]
+
         image_mask_t1 = prepared["image_mask_t1"].to(device)
         image_mask_t2 = prepared["image_mask_t2"].to(device)
         point_mask_t1 = prepared["point_mask_t1"].to(device)
@@ -420,7 +481,14 @@ class PAIRBackbone(nn.Module):
                 if selected.numel() == 0:
                     continue
                 parts.append(selected)
-                batch_ids.append(torch.full((selected.shape[0],), batch_id, dtype=torch.long, device=device))
+                batch_ids.append(
+                    torch.full(
+                        (selected.shape[0],),
+                        batch_id,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                )
             if not parts:
                 return None, None
             return torch.cat(parts, dim=0), torch.cat(batch_ids, dim=0)
@@ -434,12 +502,18 @@ class PAIRBackbone(nn.Module):
         for batch_id in range(batch_size):
             x = last_hidden[batch_id][task_mask[batch_id]]
             if x.shape[0] != 1:
-                raise RuntimeError(f"Batch {batch_id}: expected one task hidden, got {x.shape[0]}")
+                raise RuntimeError(
+                    f"Batch {batch_id}: expected one task hidden, got {x.shape[0]}"
+                )
             task_parts.append(x[0])
         task_hidden = torch.stack(task_parts, dim=0)
 
-        shapes_t1 = self._image_token_shapes(inputs, prepared["image_grid_indices_t1"])
-        shapes_t2 = self._image_token_shapes(inputs, prepared["image_grid_indices_t2"])
+        shapes_t1 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t1"]
+        )
+        shapes_t2 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t2"]
+        )
 
         return {
             "image_hidden_t1": image_hidden_t1,
@@ -451,15 +525,27 @@ class PAIRBackbone(nn.Module):
             "image_batch_ids_t2": image_batch_t2,
             "point_batch_ids_t1": point_batch_t1,
             "point_batch_ids_t2": point_batch_t2,
-            "image_hidden_2d_t1_list": self._split_by_batch(image_hidden_t1, image_batch_t1, shapes_t1),
-            "image_hidden_2d_t2_list": self._split_by_batch(image_hidden_t2, image_batch_t2, shapes_t2),
+            "image_hidden_2d_t1_list": self._split_by_batch(
+                image_hidden_t1, image_batch_t1, shapes_t1
+            ),
+            "image_hidden_2d_t2_list": self._split_by_batch(
+                image_hidden_t2, image_batch_t2, shapes_t2
+            ),
         }
 
     # -------------------------------------------------------------------------
     # Qwen preparation
     # -------------------------------------------------------------------------
 
-    def _prepare_qwen(self, *, prompt, images_t1, images_t2, point_tokens_t1, point_tokens_t2):
+    def _prepare_qwen(
+        self,
+        *,
+        prompt,
+        images_t1,
+        images_t2,
+        point_tokens_t1,
+        point_tokens_t2,
+    ):
         prepared = self.qwen_backbone.prepare_inputs(
             prompt=prompt,
             images_t1=images_t1,
@@ -468,8 +554,15 @@ class PAIRBackbone(nn.Module):
             point_tokens_t2=point_tokens_t2,
         )
         device = self.qwen_backbone.model_device
-        inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in prepared["inputs"].items()}
-        point_tokens = self._concat_point_tokens(point_tokens_t1, point_tokens_t2, prepared["batch_size"])
+        inputs = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in prepared["inputs"].items()
+        }
+        point_tokens = self._concat_point_tokens(
+            point_tokens_t1,
+            point_tokens_t2,
+            prepared["batch_size"],
+        )
         return {**prepared, "inputs": inputs, "point_tokens": point_tokens}
 
     # -------------------------------------------------------------------------
@@ -517,6 +610,7 @@ class PAIRBackbone(nn.Module):
         )
         inputs = prepared["inputs"]
         point_tokens = prepared["point_tokens"]
+
         stats = {"calls": 0, "replaced": False}
         visual_capture, language_capture, handles = {}, {}, []
 
@@ -533,32 +627,51 @@ class PAIRBackbone(nn.Module):
             )
 
         if return_dense_features and task_mode in ("2d", "2d3d"):
-            handles.append(self.visual_module().register_forward_hook(self._make_visual_capture_hook(visual_capture)))
+            handles.append(
+                self.visual_module().register_forward_hook(
+                    self._make_visual_capture_hook(visual_capture)
+                )
+            )
         if return_hidden_states:
-            handles.append(self.language_model_module().register_forward_hook(self._make_language_capture_hook(language_capture)))
+            handles.append(
+                self.language_model_module().register_forward_hook(
+                    self._make_language_capture_hook(language_capture)
+                )
+            )
+
         if not return_logits and "logits_to_keep" not in qwen_kwargs:
             qwen_kwargs["logits_to_keep"] = 1
 
         try:
             qwen_outputs = self.qwen_backbone.model(
-                **inputs, return_dict=True, use_cache=use_cache, **qwen_kwargs
+                **inputs,
+                return_dict=True,
+                use_cache=use_cache,
+                **qwen_kwargs,
             )
         finally:
             for handle in handles:
                 handle.remove()
 
         if any(item is not None for item in point_tokens) and not stats["replaced"]:
-            raise RuntimeError("Temporal point tokens were prepared but not injected into Qwen")
+            raise RuntimeError(
+                "Temporal point tokens were prepared but not injected into Qwen"
+            )
 
         # Image dense features.
         image_dense_t1 = image_dense_t2 = None
         image_dense_batch_t1 = image_dense_batch_t2 = None
         if return_dense_features and task_mode in ("2d", "2d3d"):
             if "dense" not in visual_capture:
-                raise RuntimeError("Qwen vision forward ran but image dense features were not captured")
-            image_dense_t1, image_dense_t2, image_dense_batch_t1, image_dense_batch_t2 = self._split_visual_dense(
-                visual_capture["dense"], prepared
-            )
+                raise RuntimeError(
+                    "Qwen vision forward ran but image dense features were not captured"
+                )
+            (
+                image_dense_t1,
+                image_dense_t2,
+                image_dense_batch_t1,
+                image_dense_batch_t2,
+            ) = self._split_visual_dense(visual_capture["dense"], prepared)
 
         # Qwen reasoning features.
         hidden = {}
@@ -566,12 +679,24 @@ class PAIRBackbone(nn.Module):
             if "last_hidden" not in language_capture:
                 raise RuntimeError("Qwen language hidden state was not captured")
             hidden = self._extract_multimodal_hidden(
-                last_hidden=language_capture["last_hidden"], prepared=prepared, inputs=inputs
+                last_hidden=language_capture["last_hidden"],
+                prepared=prepared,
+                inputs=inputs,
             )
 
         # Point dense topology from PointAdapter.
-        point_dense_t1, point_dense_coord_t1, point_dense_batch_t1, point_dense_offset_t1 = self._dense_point_fields(point_out_t1)
-        point_dense_t2, point_dense_coord_t2, point_dense_batch_t2, point_dense_offset_t2 = self._dense_point_fields(point_out_t2)
+        (
+            point_dense_t1,
+            point_dense_coord_t1,
+            point_dense_batch_t1,
+            point_dense_offset_t1,
+        ) = self._dense_point_fields(point_out_t1)
+        (
+            point_dense_t2,
+            point_dense_coord_t2,
+            point_dense_batch_t2,
+            point_dense_offset_t2,
+        ) = self._dense_point_fields(point_out_t2)
         if not return_dense_features:
             point_dense_t1 = point_dense_t2 = None
 
@@ -589,20 +714,38 @@ class PAIRBackbone(nn.Module):
 
         if return_hidden_states:
             checks = (
-                ("t1", hidden.get("point_hidden_t1"), point_reasoning_coord_t1, hidden.get("point_batch_ids_t1"), point_coord_batch_t1),
-                ("t2", hidden.get("point_hidden_t2"), point_reasoning_coord_t2, hidden.get("point_batch_ids_t2"), point_coord_batch_t2),
+                (
+                    "t1",
+                    hidden.get("point_hidden_t1"),
+                    point_reasoning_coord_t1,
+                    hidden.get("point_batch_ids_t1"),
+                    point_coord_batch_t1,
+                ),
+                (
+                    "t2",
+                    hidden.get("point_hidden_t2"),
+                    point_reasoning_coord_t2,
+                    hidden.get("point_batch_ids_t2"),
+                    point_coord_batch_t2,
+                ),
             )
             for name, reasoning_hidden, reasoning_coord, hidden_batch, coord_batch in checks:
                 if reasoning_hidden is None:
                     if reasoning_coord is not None:
-                        raise RuntimeError(f"Point reasoning coordinates exist for {name} but Qwen reasoning hidden is missing")
+                        raise RuntimeError(
+                            f"Point reasoning coordinates exist for {name} but "
+                            "Qwen reasoning hidden is missing"
+                        )
                     continue
                 if reasoning_coord is None:
-                    raise RuntimeError(f"Qwen point hidden exists for {name} but reasoning coordinates are missing")
+                    raise RuntimeError(
+                        f"Qwen point hidden exists for {name} but reasoning coordinates are missing"
+                    )
                 if reasoning_hidden.shape[0] != reasoning_coord.shape[0]:
                     raise RuntimeError(
                         f"Point reasoning topology mismatch at {name}: "
-                        f"hidden={reasoning_hidden.shape[0]}, coord={reasoning_coord.shape[0]}"
+                        f"hidden={reasoning_hidden.shape[0]}, "
+                        f"coord={reasoning_coord.shape[0]}"
                     )
                 if hidden_batch is None or coord_batch is None:
                     raise RuntimeError(f"Point reasoning batch metadata missing at {name}")
@@ -610,11 +753,19 @@ class PAIRBackbone(nn.Module):
                     raise RuntimeError(f"Point reasoning batch IDs mismatch at {name}")
 
         # 2D topology metadata.
-        shapes_t1 = self._image_token_shapes(inputs, prepared["image_grid_indices_t1"])
-        shapes_t2 = self._image_token_shapes(inputs, prepared["image_grid_indices_t2"])
+        shapes_t1 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t1"]
+        )
+        shapes_t2 = self._image_token_shapes(
+            inputs, prepared["image_grid_indices_t2"]
+        )
         single = prepared["single_input"]
-        dense_2d_t1 = self._split_by_batch(image_dense_t1, image_dense_batch_t1, shapes_t1)
-        dense_2d_t2 = self._split_by_batch(image_dense_t2, image_dense_batch_t2, shapes_t2)
+        dense_2d_t1 = self._split_by_batch(
+            image_dense_t1, image_dense_batch_t1, shapes_t1
+        )
+        dense_2d_t2 = self._split_by_batch(
+            image_dense_t2, image_dense_batch_t2, shapes_t2
+        )
 
         aux = {
             "task_mode": task_mode,
@@ -665,14 +816,20 @@ class PAIRBackbone(nn.Module):
         }
 
         if single:
-            aux.update({
-                "image_token_shape_t1": shapes_t1[0],
-                "image_token_shape_t2": shapes_t2[0],
-                "image_dense_2d_t1": dense_2d_t1[0],
-                "image_dense_2d_t2": dense_2d_t2[0],
-                "image_hidden_2d_t1": (hidden.get("image_hidden_2d_t1_list") or [None])[0],
-                "image_hidden_2d_t2": (hidden.get("image_hidden_2d_t2_list") or [None])[0],
-            })
+            aux.update(
+                {
+                    "image_token_shape_t1": shapes_t1[0],
+                    "image_token_shape_t2": shapes_t2[0],
+                    "image_dense_2d_t1": dense_2d_t1[0],
+                    "image_dense_2d_t2": dense_2d_t2[0],
+                    "image_hidden_2d_t1": (
+                        hidden.get("image_hidden_2d_t1_list") or [None]
+                    )[0],
+                    "image_hidden_2d_t2": (
+                        hidden.get("image_hidden_2d_t2_list") or [None]
+                    )[0],
+                }
+            )
 
         return PAIROutput(
             image_dense_t1=image_dense_t1,
@@ -731,9 +888,9 @@ class PAIRBackbone(nn.Module):
         )
         inputs = prepared["inputs"]
         point_tokens = prepared["point_tokens"]
+
         stats = {"calls": 0, "replaced": False}
         handle = None
-
         if any(item is not None for item in point_tokens):
             handle = self.qwen_backbone.model.get_input_embeddings().register_forward_hook(
                 self._make_point_injection_hook(
@@ -746,7 +903,10 @@ class PAIRBackbone(nn.Module):
 
         try:
             ids = self.qwen_backbone.model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, **generate_kwargs
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                **generate_kwargs,
             )
         finally:
             if handle is not None:
@@ -763,8 +923,13 @@ class PAIRBackbone(nn.Module):
 
         texts = []
         for batch_id, prompt_len in enumerate(prompt_lens):
-            new_ids = ids[batch_id, int(prompt_len):]
-            texts.append(self.qwen_backbone.processor.decode(new_ids, skip_special_tokens=True))
+            new_ids = ids[batch_id, int(prompt_len) :]
+            texts.append(
+                self.qwen_backbone.processor.decode(
+                    new_ids,
+                    skip_special_tokens=True,
+                )
+            )
 
         return PAIROutput(
             generated_ids=ids,
@@ -777,13 +942,123 @@ class PAIRBackbone(nn.Module):
 # Dense model helpers
 # =============================================================================
 
+
 class ImageDenseAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.proj = nn.Sequential(nn.Linear(in_dim, out_dim), nn.LayerNorm(out_dim))
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
 
     def forward(self, x):
         return self.proj(x)
+
+
+# =============================================================================
+# 2D feature upsampling heads (V1)
+# =============================================================================
+
+
+def _init_depthwise_bilinear_deconv(layer: nn.ConvTranspose2d) -> None:
+    """Initialize a depthwise x2 transposed convolution as bilinear upsampling."""
+    if layer.groups != layer.in_channels:
+        raise ValueError("Expected depthwise ConvTranspose2d")
+    if layer.in_channels != layer.out_channels:
+        raise ValueError("Expected equal in/out channels")
+    if layer.kernel_size[0] != layer.kernel_size[1]:
+        raise ValueError("Expected a square upsampling kernel")
+
+    kernel_size = int(layer.kernel_size[0])
+    factor = (kernel_size + 1) // 2
+    center = factor - 1 if kernel_size % 2 == 1 else factor - 0.5
+    axis = torch.arange(kernel_size, dtype=torch.float32)
+    filt = 1.0 - torch.abs(axis - center) / factor
+    kernel = filt[:, None] * filt[None, :]
+
+    with torch.no_grad():
+        layer.weight.zero_()
+        layer.weight[:, 0].copy_(
+            kernel.to(device=layer.weight.device, dtype=layer.weight.dtype)
+            .unsqueeze(0)
+            .expand(layer.in_channels, -1, -1)
+        )
+
+
+class FeatureUpsampleBlock2D(nn.Module):
+    """
+    One lightweight learnable x2 feature-reconstruction stage.
+
+    The depthwise transposed convolution is initialized as bilinear x2 but is
+    trainable. A small depthwise + pointwise residual refinement is added after
+    upsampling. Its last projection is zero-initialized, so the stage starts
+    close to ordinary bilinear feature interpolation.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = int(dim)
+
+        self.up = nn.ConvTranspose2d(
+            self.dim,
+            self.dim,
+            kernel_size=4,
+            stride=2,
+            padding=1,
+            groups=self.dim,
+            bias=False,
+        )
+        _init_depthwise_bilinear_deconv(self.up)
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(
+                self.dim,
+                self.dim,
+                kernel_size=3,
+                padding=1,
+                groups=self.dim,
+                bias=False,
+            ),
+            nn.GELU(),
+            nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=True),
+        )
+        nn.init.zeros_(self.refine[-1].weight)
+        nn.init.zeros_(self.refine[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        return x + self.refine(x)
+
+
+class FeatureUpsampler2D(nn.Module):
+    """
+    Progressive learnable feature upsampling for the 2D path only.
+
+    Default V1 uses three x2 stages. For a 16x16 token grid this gives:
+        16 -> 32 -> 64 -> 128.
+    """
+
+    def __init__(self, dim: int = 256, num_stages: int = 3):
+        super().__init__()
+        self.dim = int(dim)
+        self.stages = nn.ModuleList(
+            [FeatureUpsampleBlock2D(self.dim) for _ in range(int(num_stages))]
+        )
+
+    def forward(self, x: torch.Tensor, output_size) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1] != self.dim:
+            raise ValueError(
+                f"FeatureUpsampler2D expects [B,{self.dim},H,W], got {tuple(x.shape)}"
+            )
+
+        target_h, target_w = [int(v) for v in output_size]
+        for stage in self.stages:
+            next_h = int(x.shape[-2]) * 2
+            next_w = int(x.shape[-1]) * 2
+            if next_h > target_h or next_w > target_w:
+                break
+            x = stage(x)
+        return x
 
 
 def tensor_to_pil(image):
@@ -798,7 +1073,9 @@ def tensor_to_pil(image):
     if not torch.isfinite(x).all():
         raise ValueError("Image contains NaN/Inf")
     if float(x.min()) < -1e-4 or float(x.max()) > 1.0001:
-        raise ValueError(f"Expected image in [0,1], got [{float(x.min())}, {float(x.max())}]")
+        raise ValueError(
+            f"Expected image in [0,1], got [{float(x.min())}, {float(x.max())}]"
+        )
 
     x = x.clamp(0, 1).mul(255).round().to(torch.uint8)
     arr = x.permute(1, 2, 0).contiguous().numpy()
@@ -829,16 +1106,27 @@ def make_batched_image_token_set(features, shapes, batch_ids):
     for batch_id, shape in enumerate(shapes):
         pos = make_grid_positions(shape, features.device)
         positions.append(pos)
-        expected_ids.append(torch.full((pos.shape[0],), batch_id, dtype=torch.long, device=features.device))
+        expected_ids.append(
+            torch.full(
+                (pos.shape[0],),
+                batch_id,
+                dtype=torch.long,
+                device=features.device,
+            )
+        )
 
     positions = torch.cat(positions, dim=0)
     expected_ids = torch.cat(expected_ids, dim=0)
     batch_ids = batch_ids.to(features.device).long()
 
     if features.shape[0] != positions.shape[0]:
-        raise RuntimeError(f"Feature/position count mismatch: {features.shape[0]} vs {positions.shape[0]}")
+        raise RuntimeError(
+            f"Feature/position count mismatch: {features.shape[0]} vs {positions.shape[0]}"
+        )
     if not torch.equal(batch_ids, expected_ids):
-        raise RuntimeError("PAIR image token order/batch IDs do not match sample-major layout")
+        raise RuntimeError(
+            "PAIR image token order/batch IDs do not match sample-major layout"
+        )
 
     n = features.shape[0]
     return UnifiedTokenSet(
@@ -853,7 +1141,9 @@ def make_point_token_set(features, positions, batch_ids, feature_dim):
     if features is None or positions is None or batch_ids is None:
         raise RuntimeError("Missing point feature/position/batch metadata")
     if features.ndim != 2 or features.shape[1] != feature_dim:
-        raise ValueError(f"Point features must be [N,{feature_dim}], got {tuple(features.shape)}")
+        raise ValueError(
+            f"Point features must be [N,{feature_dim}], got {tuple(features.shape)}"
+        )
 
     n = features.shape[0]
     positions = positions.to(features.device, dtype=torch.float32)
@@ -871,50 +1161,159 @@ def make_point_token_set(features, positions, batch_ids, feature_dim):
     )
 
 
-def restore_2d_prediction_batch(prediction, shapes_t1, shapes_t2, output_sizes):
-    def restore_semantic(logits, shapes):
+def restore_2d_prediction_batch(
+    prediction,
+    shapes_t1,
+    shapes_t2,
+    output_sizes,
+    *,
+    decoder,
+    semantic_upsampler,
+    change_upsampler,
+    semantic_prototypes,
+):
+    """
+    Restore 2D predictions by reconstructing 256-D features before classification.
+
+    Semantic:
+        shared semantic_feature -> learnable upsample -> prototype classifier
+        -> final bilinear logit alignment.
+
+    Binary change:
+        shared change_feature -> learnable upsample -> binary classifier
+        -> final bilinear logit alignment.
+    """
+    if semantic_prototypes is None:
+        raise RuntimeError("2D semantic prototypes were not captured from the decoder")
+
+    decoder_dim = int(decoder.decoder_dim)
+
+    def to_feature_map(part, *, h, w, name):
+        n = int(h) * int(w)
+        if part.shape != (n, decoder_dim):
+            raise RuntimeError(
+                f"{name} feature shape must be [{n},{decoder_dim}], got {tuple(part.shape)}"
+            )
+        return (
+            part.reshape(h, w, decoder_dim)
+            .permute(2, 0, 1)
+            .contiguous()
+            .unsqueeze(0)
+        )
+
+    def restore_semantic(features, shapes):
         chunks, cursor = [], 0
-        k = logits.shape[1]
         for shape, output_size in zip(shapes, output_sizes):
             t, h, w = shape
             n = t * h * w
             if t != 1:
                 raise RuntimeError(f"Expected T=1, got {shape}")
-            part = logits[cursor:cursor + n]
+
+            part = features[cursor : cursor + n]
             if part.shape[0] != n:
-                raise RuntimeError("Semantic token split mismatch")
-            x = part.T.reshape(1, k, h, w)
-            x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
-            chunks.append(x[0].permute(1, 2, 0).reshape(-1, k))
+                raise RuntimeError("Semantic feature split mismatch")
+
+            x = to_feature_map(part, h=h, w=w, name="semantic")
+            x = semantic_upsampler(x, output_size)
+            hh, ww = int(x.shape[-2]), int(x.shape[-1])
+
+            flat_feature = (
+                x[0]
+                .permute(1, 2, 0)
+                .contiguous()
+                .reshape(hh * ww, decoder_dim)
+            )
+
+            # The original shared prototype classifier is used AFTER upsampling.
+            logits = decoder._semantic_logits(flat_feature, semantic_prototypes)
+            k = int(logits.shape[1])
+            logits = (
+                logits.reshape(hh, ww, k)
+                .permute(2, 0, 1)
+                .contiguous()
+                .unsqueeze(0)
+            )
+
+            target_size = tuple(int(v) for v in output_size)
+            if logits.shape[-2:] != target_size:
+                logits = F.interpolate(
+                    logits,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            chunks.append(
+                logits[0]
+                .permute(1, 2, 0)
+                .contiguous()
+                .reshape(-1, k)
+            )
             cursor += n
-        if cursor != logits.shape[0]:
-            raise RuntimeError("Unconsumed semantic logits after 2D restore")
+
+        if cursor != features.shape[0]:
+            raise RuntimeError("Unconsumed semantic features after 2D restore")
         return torch.cat(chunks, dim=0)
 
-    def restore_change(logits, shapes):
-        if logits is None:
-            raise RuntimeError("2D decoder returned no binary change logits")
+    def restore_change(features, shapes):
         chunks, cursor = [], 0
         for shape, output_size in zip(shapes, output_sizes):
             t, h, w = shape
             n = t * h * w
             if t != 1:
                 raise RuntimeError(f"Expected T=1, got {shape}")
-            part = logits[cursor:cursor + n]
-            if part.numel() != n:
-                raise RuntimeError("Change token split mismatch")
-            x = part.reshape(1, 1, h, w)
-            x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
-            chunks.append(x[0, 0].reshape(-1))
+
+            part = features[cursor : cursor + n]
+            if part.shape[0] != n:
+                raise RuntimeError("Change feature split mismatch")
+
+            x = to_feature_map(part, h=h, w=w, name="change")
+            x = change_upsampler(x, output_size)
+            hh, ww = int(x.shape[-2]), int(x.shape[-1])
+
+            flat_feature = (
+                x[0]
+                .permute(1, 2, 0)
+                .contiguous()
+                .reshape(hh * ww, decoder_dim)
+            )
+
+            # The original shared binary classifier is used AFTER upsampling.
+            logits = decoder.binary_change_classifier(flat_feature)[:, 0]
+            logits = logits.reshape(1, 1, hh, ww)
+
+            target_size = tuple(int(v) for v in output_size)
+            if logits.shape[-2:] != target_size:
+                logits = F.interpolate(
+                    logits,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            chunks.append(logits[0, 0].reshape(-1))
             cursor += n
-        if cursor != logits.numel():
-            raise RuntimeError("Unconsumed change logits after 2D restore")
+
+        if cursor != features.shape[0]:
+            raise RuntimeError("Unconsumed change features after 2D restore")
         return torch.cat(chunks, dim=0)
 
-    prediction.semantic_logits_t1 = restore_semantic(prediction.semantic_logits_t1, shapes_t1)
-    prediction.semantic_logits_t2 = restore_semantic(prediction.semantic_logits_t2, shapes_t2)
-    prediction.change_logits_t1 = restore_change(prediction.change_logits_t1, shapes_t1)
-    prediction.change_logits_t2 = restore_change(prediction.change_logits_t2, shapes_t2)
+    prediction.semantic_logits_t1 = restore_semantic(
+        prediction.semantic_feature_t1,
+        shapes_t1,
+    )
+    prediction.semantic_logits_t2 = restore_semantic(
+        prediction.semantic_feature_t2,
+        shapes_t2,
+    )
+    prediction.change_logits_t1 = restore_change(
+        prediction.change_feature_t1,
+        shapes_t1,
+    )
+    prediction.change_logits_t2 = restore_change(
+        prediction.change_feature_t2,
+        shapes_t2,
+    )
     return prediction
 
 
@@ -922,12 +1321,17 @@ def restore_2d_prediction_batch(prediction, shapes_t1, shapes_t2, output_sizes):
 # Ragged point protocol batching
 # =============================================================================
 
+
 def _as_point_list(value, name):
     if isinstance(value, dict):
         return [value]
-    if isinstance(value, (list, tuple)) and value and all(isinstance(x, dict) for x in value):
+    if isinstance(value, (list, tuple)) and value and all(
+        isinstance(x, dict) for x in value
+    ):
         return list(value)
-    raise TypeError(f"{name} must be a point dictionary or non-empty list of point dictionaries")
+    raise TypeError(
+        f"{name} must be a point dictionary or non-empty list of point dictionaries"
+    )
 
 
 def _validate_optional_mask(mask, n, name, device):
@@ -967,13 +1371,21 @@ def batch_point_dicts(point_dicts, device):
         if coord is None or not torch.is_tensor(coord):
             raise TypeError(f"point_dicts[{batch_id}]['coord'] must be a Tensor")
         if coord.ndim != 2 or coord.shape[1] != 3 or coord.shape[0] == 0:
-            raise ValueError(f"point_dicts[{batch_id}]['coord'] must be non-empty [N,3]")
+            raise ValueError(
+                f"point_dicts[{batch_id}]['coord'] must be non-empty [N,3]"
+            )
 
-        coord = coord.to(device=device, dtype=torch.float32, non_blocking=True)
+        coord = coord.to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
         n = coord.shape[0]
         coords.append(coord)
         counts.append(n)
-        batch_ids.append(torch.full((n,), batch_id, dtype=torch.long, device=device))
+        batch_ids.append(
+            torch.full((n,), batch_id, dtype=torch.long, device=device)
+        )
 
         if any_rgb:
             rgb = item.get("rgb")
@@ -983,8 +1395,16 @@ def batch_point_dicts(point_dicts, device):
             else:
                 rgb = torch.as_tensor(rgb, dtype=torch.float32, device=device)
                 if rgb.shape != (n, 3):
-                    raise ValueError(f"point_dicts[{batch_id}]['rgb'] must be [N,3], got {tuple(rgb.shape)}")
-                rgb_mask = _validate_optional_mask(item.get("rgb_mask"), n, f"point_dicts[{batch_id}]['rgb_mask']", device)
+                    raise ValueError(
+                        f"point_dicts[{batch_id}]['rgb'] must be [N,3], "
+                        f"got {tuple(rgb.shape)}"
+                    )
+                rgb_mask = _validate_optional_mask(
+                    item.get("rgb_mask"),
+                    n,
+                    f"point_dicts[{batch_id}]['rgb_mask']",
+                    device,
+                )
             rgbs.append(rgb)
             rgb_masks.append(rgb_mask)
 
@@ -994,15 +1414,23 @@ def batch_point_dicts(point_dicts, device):
                 intensity = torch.zeros((n, 1), dtype=torch.float32, device=device)
                 intensity_mask = torch.zeros((n, 1), dtype=torch.bool, device=device)
             else:
-                intensity = torch.as_tensor(intensity, dtype=torch.float32, device=device)
+                intensity = torch.as_tensor(
+                    intensity,
+                    dtype=torch.float32,
+                    device=device,
+                )
                 if intensity.ndim == 1:
                     intensity = intensity.unsqueeze(1)
                 if intensity.shape != (n, 1):
                     raise ValueError(
-                        f"point_dicts[{batch_id}]['intensity'] must be [N] or [N,1], got {tuple(intensity.shape)}"
+                        f"point_dicts[{batch_id}]['intensity'] must be [N] or [N,1], "
+                        f"got {tuple(intensity.shape)}"
                     )
                 intensity_mask = _validate_optional_mask(
-                    item.get("intensity_mask"), n, f"point_dicts[{batch_id}]['intensity_mask']", device
+                    item.get("intensity_mask"),
+                    n,
+                    f"point_dicts[{batch_id}]['intensity_mask']",
+                    device,
                 )
             intensities.append(intensity)
             intensity_masks.append(intensity_mask)
@@ -1024,6 +1452,7 @@ def batch_point_dicts(point_dicts, device):
 # =============================================================================
 # 3D temporal links
 # =============================================================================
+
 
 @torch.no_grad()
 def build_batched_knn_temporal_links(
@@ -1056,17 +1485,34 @@ def build_batched_knn_temporal_links(
     source_xyz = source_positions.to(device).float()
 
     for batch_id in torch.unique(target_batch_ids).tolist():
-        target_global = torch.nonzero(target_batch_ids == batch_id, as_tuple=False).flatten()
-        source_global = torch.nonzero(source_batch_ids == batch_id, as_tuple=False).flatten()
+        target_global = torch.nonzero(
+            target_batch_ids == batch_id,
+            as_tuple=False,
+        ).flatten()
+        source_global = torch.nonzero(
+            source_batch_ids == batch_id,
+            as_tuple=False,
+        ).flatten()
         if source_global.numel() == 0:
-            raise RuntimeError(f"3D temporal link source is empty for batch item {batch_id}")
+            raise RuntimeError(
+                f"3D temporal link source is empty for batch item {batch_id}"
+            )
 
         kk = min(int(k), int(source_global.numel()))
         source_local_xyz = source_xyz[source_global]
         for start in range(0, target_global.numel(), chunk_size):
-            target_chunk_global = target_global[start:start + chunk_size]
-            distances = torch.cdist(target_xyz[target_chunk_global], source_local_xyz)
-            dist, local_index = torch.topk(distances, k=kk, dim=1, largest=False, sorted=True)
+            target_chunk_global = target_global[start : start + chunk_size]
+            distances = torch.cdist(
+                target_xyz[target_chunk_global],
+                source_local_xyz,
+            )
+            dist, local_index = torch.topk(
+                distances,
+                k=kk,
+                dim=1,
+                largest=False,
+                sorted=True,
+            )
             indices[target_chunk_global, :kk] = source_global[local_index]
             weights[target_chunk_global, :kk] = 1.0 / dist.clamp_min(1e-3)
 
@@ -1077,20 +1523,13 @@ def build_batched_knn_temporal_links(
 # Full PAIR model
 # =============================================================================
 
+
 class PAIRModel(nn.Module):
     """
     Complete PAIR model.
 
     train.py should construct only:
         model = PAIRModel.from_config(experiment.model, device)
-
-    Modules:
-        Qwen3-VL Vision      frozen in frozen/LoRA modes
-        Qwen language       frozen / LoRA / full
-        Utonia              always frozen
-        PointAdapter         trainable
-        ImageDenseAdapter    trainable
-        Unified decoder      trainable
     """
 
     def __init__(self, backbone, decoder, image_adapter, qwen_tuning):
@@ -1099,6 +1538,17 @@ class PAIRModel(nn.Module):
         self.decoder = decoder
         self.image_adapter = image_adapter
         self.qwen_tuning = str(qwen_tuning).lower()
+
+        # 2D only. T1/T2 share one module inside each branch, while semantic
+        # and binary-change reconstruction keep independent parameters.
+        self.semantic_upsampler_2d = FeatureUpsampler2D(
+            dim=self.decoder.decoder_dim,
+            num_stages=3,
+        )
+        self.change_upsampler_2d = FeatureUpsampler2D(
+            dim=self.decoder.decoder_dim,
+            num_stages=3,
+        )
 
     @property
     def qwen_backbone(self):
@@ -1133,7 +1583,10 @@ class PAIRModel(nn.Module):
             qwen.unfreeze()
         elif qwen_tuning == "lora":
             lora = dict(cfg.get("lora", {}))
-            targets = lora.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+            targets = lora.get(
+                "target_modules",
+                ["q_proj", "k_proj", "v_proj", "o_proj"],
+            )
             if isinstance(targets, str):
                 targets = [x.strip() for x in targets.split(",") if x.strip()]
             apply_qwen_lora(
@@ -1158,6 +1611,7 @@ class PAIRModel(nn.Module):
                 voxel_size=float(point_cfg.get("voxel_size", 0.5)),
             )
         ).to(device)
+
         point_adapter = PointAdapter(
             PointAdapterConfig(
                 in_dim=point_encoder.output_dim,
@@ -1167,9 +1621,16 @@ class PAIRModel(nn.Module):
             )
         ).to(device)
 
-        backbone = PAIRBackbone(qwen_backbone=qwen, point_encoder=point_encoder, point_adapter=point_adapter)
+        backbone = PAIRBackbone(
+            qwen_backbone=qwen,
+            point_encoder=point_encoder,
+            point_adapter=point_adapter,
+        )
         image_adapter = ImageDenseAdapter(qwen.hidden_size, decoder_dim).to(device)
-        decoder = UnifiedChangeDecoder(qwen_dim=qwen.hidden_size, decoder_dim=decoder_dim).to(device)
+        decoder = UnifiedChangeDecoder(
+            qwen_dim=qwen.hidden_size,
+            decoder_dim=decoder_dim,
+        ).to(device)
         return cls(backbone, decoder, image_adapter, qwen_tuning).to(device)
 
     def train(self, mode=True):
@@ -1181,11 +1642,23 @@ class PAIRModel(nn.Module):
         return self
 
     # -------------------------------------------------------------------------
-    # 2D: existing binary-change path
+    # 2D: semantic + binary change with feature upsampling before classifiers
     # -------------------------------------------------------------------------
 
-    def forward_2d(self, images_t1, images_t2, prompts, class_names, output_sizes):
-        if not (len(images_t1) == len(images_t2) == len(prompts) == len(output_sizes)):
+    def forward_2d(
+        self,
+        images_t1,
+        images_t2,
+        prompts,
+        class_names,
+        output_sizes,
+    ):
+        if not (
+            len(images_t1)
+            == len(images_t2)
+            == len(prompts)
+            == len(output_sizes)
+        ):
             raise ValueError("Batched 2D inputs have inconsistent lengths")
 
         images_t1 = [tensor_to_pil(x) for x in images_t1]
@@ -1210,7 +1683,11 @@ class PAIRModel(nn.Module):
 
         if out.image_dense_t1 is None or out.image_dense_t2 is None:
             raise RuntimeError("PAIR did not expose Qwen Vision dense features")
-        if out.image_hidden_t1 is None or out.image_hidden_t2 is None or out.task_hidden is None:
+        if (
+            out.image_hidden_t1 is None
+            or out.image_hidden_t2 is None
+            or out.task_hidden is None
+        ):
             raise RuntimeError("PAIR did not expose Qwen reasoning features")
 
         shapes1 = out.aux["image_token_shapes_t1"]
@@ -1218,19 +1695,31 @@ class PAIRModel(nn.Module):
         for batch_id, (shape1, shape2) in enumerate(zip(shapes1, shapes2)):
             if shape1 != shape2:
                 raise RuntimeError(
-                    f"Aligned 2D temporal links require identical T1/T2 grids; "
+                    "Aligned 2D temporal links require identical T1/T2 grids; "
                     f"batch {batch_id}: {shape1} vs {shape2}"
                 )
 
         dense1 = self.image_adapter(out.image_dense_t1)
         dense2 = self.image_adapter(out.image_dense_t2)
-        dense_t1 = make_batched_image_token_set(dense1, shapes1, out.aux["image_dense_batch_ids_t1"])
-        dense_t2 = make_batched_image_token_set(dense2, shapes2, out.aux["image_dense_batch_ids_t2"])
+        dense_t1 = make_batched_image_token_set(
+            dense1,
+            shapes1,
+            out.aux["image_dense_batch_ids_t1"],
+        )
+        dense_t2 = make_batched_image_token_set(
+            dense2,
+            shapes2,
+            out.aux["image_dense_batch_ids_t2"],
+        )
         reasoning_t1 = make_batched_image_token_set(
-            out.image_hidden_t1, shapes1, out.aux["image_reasoning_batch_ids_t1"]
+            out.image_hidden_t1,
+            shapes1,
+            out.aux["image_reasoning_batch_ids_t1"],
         )
         reasoning_t2 = make_batched_image_token_set(
-            out.image_hidden_t2, shapes2, out.aux["image_reasoning_batch_ids_t2"]
+            out.image_hidden_t2,
+            shapes2,
+            out.aux["image_reasoning_batch_ids_t2"],
         )
 
         if dense1.shape[0] != dense2.shape[0]:
@@ -1242,23 +1731,47 @@ class PAIRModel(nn.Module):
             reasoning_t1=reasoning_t1,
             reasoning_t2=reasoning_t2,
             task_hidden=out.task_hidden,
-            links_t1_to_t2=build_identity_temporal_links(dense1.shape[0], device=dense1.device),
-            links_t2_to_t1=build_identity_temporal_links(dense2.shape[0], device=dense2.device),
+            links_t1_to_t2=build_identity_temporal_links(
+                dense1.shape[0],
+                device=dense1.device,
+            ),
+            links_t2_to_t1=build_identity_temporal_links(
+                dense2.shape[0],
+                device=dense2.device,
+            ),
             class_names=class_names,
             qwen_backbone=self.qwen_backbone,
             detach_qwen_class_encoder=True,
             prediction_type="binary",
         )
-        return restore_2d_prediction_batch(prediction, shapes1, shapes2, output_sizes)
+
+        return restore_2d_prediction_batch(
+            prediction,
+            shapes1,
+            shapes2,
+            output_sizes,
+            decoder=self.decoder,
+            semantic_upsampler=self.semantic_upsampler_2d,
+            change_upsampler=self.change_upsampler_2d,
+            semantic_prototypes=prediction.semantic_prototypes,
+        )
 
     # -------------------------------------------------------------------------
-    # 3D: semantic + 3-class event path
+    # 3D: semantic + 3-class event path (unchanged)
     # -------------------------------------------------------------------------
 
-    def forward_3d(self, point_dicts_t1, point_dicts_t2, prompts, class_names):
+    def forward_3d(
+        self,
+        point_dicts_t1,
+        point_dicts_t2,
+        prompts,
+        class_names,
+    ):
         point_dicts_t1 = _as_point_list(point_dicts_t1, "point_dicts_t1")
         point_dicts_t2 = _as_point_list(point_dicts_t2, "point_dicts_t2")
-        if not (len(point_dicts_t1) == len(point_dicts_t2) == len(prompts)):
+        if not (
+            len(point_dicts_t1) == len(point_dicts_t2) == len(prompts)
+        ):
             raise ValueError("Batched 3D inputs have inconsistent lengths")
 
         device = self.qwen_backbone.model_device
@@ -1280,7 +1793,11 @@ class PAIRModel(nn.Module):
 
         if out.point_dense_t1 is None or out.point_dense_t2 is None:
             raise RuntimeError("PAIR did not expose PointAdapter dense features")
-        if out.point_hidden_t1 is None or out.point_hidden_t2 is None or out.task_hidden is None:
+        if (
+            out.point_hidden_t1 is None
+            or out.point_hidden_t2 is None
+            or out.task_hidden is None
+        ):
             raise RuntimeError("PAIR did not expose Qwen point reasoning features")
 
         dense_t1 = make_point_token_set(
@@ -1309,10 +1826,16 @@ class PAIRModel(nn.Module):
         )
 
         links_t1_to_t2 = build_batched_knn_temporal_links(
-            dense_t1.positions, dense_t1.batch_ids, dense_t2.positions, dense_t2.batch_ids
+            dense_t1.positions,
+            dense_t1.batch_ids,
+            dense_t2.positions,
+            dense_t2.batch_ids,
         )
         links_t2_to_t1 = build_batched_knn_temporal_links(
-            dense_t2.positions, dense_t2.batch_ids, dense_t1.positions, dense_t1.batch_ids
+            dense_t2.positions,
+            dense_t2.batch_ids,
+            dense_t1.positions,
+            dense_t1.batch_ids,
         )
 
         prediction = self.decoder(
@@ -1334,10 +1857,13 @@ class PAIRModel(nn.Module):
         if prediction.event_logits_t1 is None or prediction.event_logits_t2 is None:
             raise RuntimeError("3D decoder did not return event logits")
         if prediction.event_logits_t1.shape != (dense_t1.features.shape[0], 3):
-            raise RuntimeError(f"Unexpected T1 event shape: {tuple(prediction.event_logits_t1.shape)}")
+            raise RuntimeError(
+                f"Unexpected T1 event shape: {tuple(prediction.event_logits_t1.shape)}"
+            )
         if prediction.event_logits_t2.shape != (dense_t2.features.shape[0], 3):
-            raise RuntimeError(f"Unexpected T2 event shape: {tuple(prediction.event_logits_t2.shape)}")
-
+            raise RuntimeError(
+                f"Unexpected T2 event shape: {tuple(prediction.event_logits_t2.shape)}"
+            )
         return prediction
 
     def forward_2d3d(self, **kwargs):
@@ -1349,8 +1875,14 @@ class PAIRModel(nn.Module):
 
     def forward(self, task_mode=None, **kwargs):
         if task_mode is None:
-            has_images = kwargs.get("images_t1") is not None or kwargs.get("images_t2") is not None
-            has_points = kwargs.get("point_dicts_t1") is not None or kwargs.get("point_dicts_t2") is not None
+            has_images = (
+                kwargs.get("images_t1") is not None
+                or kwargs.get("images_t2") is not None
+            )
+            has_points = (
+                kwargs.get("point_dicts_t1") is not None
+                or kwargs.get("point_dicts_t2") is not None
+            )
             if has_images and has_points:
                 task_mode = "2d3d"
             elif has_images:

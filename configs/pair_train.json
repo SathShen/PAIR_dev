@@ -2,7 +2,7 @@
   "experiment": {
     "name": "PAIR_multidataset_Newloss",
     "seed": 42,
-    "epochs": 10
+    "epochs": 50
   },
   "model": {
     "qwen_model": "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct",
