@@ -152,12 +152,26 @@ class UnifiedDecoderOutput:
 
 @dataclass
 class Cascade2DDecoderOutput:
-    """Final prediction output of the PAIR V2 2D Cascade Gated Decoder."""
+    """Final prediction output of the PAIR V2 2D Cascade Gated Decoder.
+
+    Keep the same branch-discovery protocol as UnifiedDecoderOutput so the
+    unified PAIR loss/metrics can inspect optional branches without special
+    casing the 2D CG route. 2D never produces 3D event logits.
+    """
 
     semantic_logits_t1: Optional[torch.Tensor]
     semantic_logits_t2: Optional[torch.Tensor]
     change_logits_t1: torch.Tensor
     change_logits_t2: torch.Tensor
+
+    # Keep the same semantic-class ordering metadata as UnifiedDecoderOutput.
+    # Metrics uses raw_class_ids to verify that prototype/logit channel order
+    # matches DatasetSpec.class_names.
+    raw_class_ids: Tuple[int, ...]
+    class_names: Tuple[str, ...]
+
+    event_logits_t1: Optional[torch.Tensor] = None
+    event_logits_t2: Optional[torch.Tensor] = None
 
 
 # =============================================================================
@@ -1110,7 +1124,7 @@ class UnifiedChangeDecoder(nn.Module):
             if qwen_backbone is None:
                 raise ValueError("SCD route requires qwen_backbone")
 
-            _, _, prototypes = self.class_encoder(
+            raw_class_ids, ordered_class_names, prototypes = self.class_encoder(
                 class_names=class_names,
                 qwen_backbone=qwen_backbone,
                 detach_qwen=detach_qwen_class_encoder,
@@ -1120,12 +1134,16 @@ class UnifiedChangeDecoder(nn.Module):
         else:
             semantic_logits_t1 = None
             semantic_logits_t2 = None
+            raw_class_ids = tuple()
+            ordered_class_names = tuple()
 
         return Cascade2DDecoderOutput(
             semantic_logits_t1=semantic_logits_t1,
             semantic_logits_t2=semantic_logits_t2,
             change_logits_t1=change_logits_t1,
             change_logits_t2=change_logits_t2,
+            raw_class_ids=raw_class_ids,
+            class_names=ordered_class_names,
         )
 
     @staticmethod

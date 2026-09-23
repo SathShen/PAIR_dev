@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_upsample",
+    "name": "PAIR_SECOND_cgdecoder",
     "seed": 42,
     "epochs": 50
   },
