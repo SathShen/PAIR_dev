@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_Lssc",
+    "name": "PAIR_SECOND_AUG",
     "seed": 42,
     "epochs": 50
   },

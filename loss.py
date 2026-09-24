@@ -25,6 +25,8 @@ Routes
 ------
 2D SCD:
     semantic_logits_t1/t2 + binary change_logits_t1/t2
+    semantic CE/Lovasz are applied on changed pixels only when
+    semantic_changed_only=True (the train.py semantic_pair protocol).
 
 2D BCD:
     semantic supervision may be fully masked out; binary change remains active.
@@ -376,7 +378,14 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         return cls._lovasz_softmax_flat(probas, labels)
 
-    def _semantic_losses(self, prediction, target, class_names):
+    def _semantic_losses(
+        self,
+        prediction,
+        target,
+        class_names,
+        *,
+        changed_only: bool = False,
+    ):
         raw1 = target["semantic_t1"]
         raw2 = target["semantic_t2"]
 
@@ -392,6 +401,57 @@ class PAIRSemanticChangeLoss(nn.Module):
             raw2,
             prediction.semantic_logits_t2.device,
         )
+
+        # Keep track of whether semantic supervision exists BEFORE the
+        # changed-only restriction. SSCLoss still needs the unchanged pixels
+        # on 2D SCD batches, so its activation must not depend on whether the
+        # current crop happens to contain a changed semantic pixel.
+        semantic_supervision_active = bool(
+            valid1.any().item() or valid2.any().item()
+        )
+
+        if changed_only:
+            # 2D semantic change detection protocol:
+            #   - binary branch learns changed vs unchanged over the full
+            #     valid image;
+            #   - semantic CE/Lovasz learn semantic discrimination only where
+            #     the binary target says the pixel changed.
+            #
+            # Use the temporal-aware helper so future change_t1/change_t2
+            # targets remain compatible without changing the present SECOND /
+            # LandsatSCD shared-change convention.
+            change1, change_valid1 = self._change_target(target, 1)
+            change2, change_valid2 = self._change_target(target, 2)
+
+            change1 = change1.to(valid1.device).reshape(-1)
+            change2 = change2.to(valid2.device).reshape(-1)
+            change_valid1 = change_valid1.to(valid1.device).reshape(-1).bool()
+            change_valid2 = change_valid2.to(valid2.device).reshape(-1).bool()
+
+            if (
+                change1.numel() != valid1.numel()
+                or change_valid1.numel() != valid1.numel()
+                or change2.numel() != valid2.numel()
+                or change_valid2.numel() != valid2.numel()
+            ):
+                raise ValueError(
+                    "changed-only semantic mask must match semantic target size"
+                )
+
+            for change, change_valid, name in (
+                (change1, change_valid1, "change_t1"),
+                (change2, change_valid2, "change_t2"),
+            ):
+                if change_valid.any():
+                    values = change[change_valid]
+                    if not torch.all((values == 0) | (values == 1)):
+                        bad = torch.unique(values).detach().cpu().tolist()
+                        raise ValueError(
+                            f"{name} valid target must contain only 0/1, got {bad}"
+                        )
+
+            valid1 = valid1 & change_valid1 & (change1 == 1)
+            valid2 = valid2 & change_valid2 & (change2 == 1)
 
         active1 = bool(valid1.any().item())
         active2 = bool(valid2.any().item())
@@ -443,6 +503,7 @@ class PAIRSemanticChangeLoss(nn.Module):
             sem_lovasz,
             semantic,
             semantic_active,
+            semantic_supervision_active,
         )
 
     # ------------------------------------------------------------------
@@ -1006,6 +1067,7 @@ class PAIRSemanticChangeLoss(nn.Module):
         target,
         class_names: Dict[int, str],
         dataset_name: Optional[str] = None,
+        semantic_changed_only: bool = False,
     ):
         # Kept for API compatibility. The supervision actually present in the
         # batch determines which task groups are active.
@@ -1020,10 +1082,12 @@ class PAIRSemanticChangeLoss(nn.Module):
             sem_lovasz,
             semantic,
             semantic_active,
+            semantic_supervision_active,
         ) = self._semantic_losses(
             prediction,
             target,
             class_names,
+            changed_only=bool(semantic_changed_only),
         )
 
         has_binary_t1 = prediction.change_logits_t1 is not None
@@ -1088,7 +1152,7 @@ class PAIRSemanticChangeLoss(nn.Module):
                 prediction,
                 target,
                 class_names,
-                semantic_active,
+                semantic_supervision_active,
             )
 
         if has_event:
@@ -1148,7 +1212,7 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         # PerASCD adds SSCLoss as an auxiliary term with unit coefficient.
         # `ssc_weight` exposes that coefficient without changing PAIR's task
-        # normalization. Default=1.0 matches the released PerASCD recipe.
+        # normalization. Current PAIR default=0.01 keeps SSC auxiliary at the measured gradient scale.
         if ssc_active and self.ssc_weight > 0:
             total = total + self.ssc_weight * ssc
 
@@ -1264,6 +1328,72 @@ def _self_test():
     assert out_scd.ssc.item() >= 0.0
     assert torch.allclose(
         out_scd.total, expected_scd, atol=1e-6, rtol=1e-6
+    )
+
+    # Changed-only semantic supervision must ignore unchanged pixels for BOTH
+    # CE and Lovasz while keeping the same binary and SSC targets.
+    out_scd_changed_only = criterion(
+        prediction=pred_scd,
+        target=target_scd,
+        class_names=class_names_scd,
+        semantic_changed_only=True,
+    )
+    changed = target_scd["change"].bool()
+    expected_ce_t1 = F.cross_entropy(
+        pred_scd.semantic_logits_t1[changed].float(),
+        target_scd["semantic_t1"][changed],
+    )
+    expected_ce_t2 = F.cross_entropy(
+        pred_scd.semantic_logits_t2[changed].float(),
+        target_scd["semantic_t2"][changed],
+    )
+    assert torch.allclose(
+        out_scd_changed_only.semantic_t1, expected_ce_t1, atol=1e-6, rtol=1e-6
+    )
+    assert torch.allclose(
+        out_scd_changed_only.semantic_t2, expected_ce_t2, atol=1e-6, rtol=1e-6
+    )
+    # Binary change and SSC definitions themselves are unchanged.
+    assert torch.allclose(
+        out_scd_changed_only.change, out_scd.change, atol=1e-6, rtol=1e-6
+    )
+    assert torch.allclose(
+        out_scd_changed_only.ssc, out_scd.ssc, atol=1e-6, rtol=1e-6
+    )
+
+    # A crop containing only unchanged pixels has no active semantic CE/Lovasz
+    # task under the changed-only protocol, but SSC must still remain active on
+    # the unchanged pair instead of being disabled accidentally.
+    pred_unchanged = SimpleNamespace(
+        semantic_logits_t1=torch.randn(4, 4, requires_grad=True),
+        semantic_logits_t2=torch.randn(4, 4, requires_grad=True),
+        change_logits_t1=torch.randn(4, requires_grad=True),
+        change_logits_t2=torch.randn(4, requires_grad=True),
+        event_logits_t1=None,
+        event_logits_t2=None,
+    )
+    target_unchanged = {
+        "semantic_t1": torch.zeros(4, dtype=torch.long),
+        "semantic_t2": torch.zeros(4, dtype=torch.long),
+        "semantic_valid_t1": torch.ones(4, dtype=torch.bool),
+        "semantic_valid_t2": torch.ones(4, dtype=torch.bool),
+        "change": torch.zeros(4, dtype=torch.long),
+        "change_valid": torch.ones(4, dtype=torch.bool),
+    }
+    out_unchanged = criterion(
+        prediction=pred_unchanged,
+        target=target_unchanged,
+        class_names=class_names_scd,
+        semantic_changed_only=True,
+    )
+    assert torch.allclose(out_unchanged.semantic, torch.tensor(0.0))
+    assert torch.isfinite(out_unchanged.ssc)
+    assert out_unchanged.ssc.item() >= 0.0
+    expected_unchanged_total = (
+        out_unchanged.change + criterion.ssc_weight * out_unchanged.ssc
+    )
+    assert torch.allclose(
+        out_unchanged.total, expected_unchanged_total, atol=1e-6, rtol=1e-6
     )
 
     out_scd.total.backward()

@@ -79,6 +79,8 @@ from torch.utils.data import Dataset
 from PIL import Image
 from tqdm.auto import tqdm
 
+from datasets.augmentation import augment_pair_2d
+
 
 VALID_MODALITIES = {"image", "point"}
 
@@ -1822,6 +1824,20 @@ class UnifiedPAIRDataset(Dataset):
             sample.update(point_part)
 
         sample["target"] = point_target if self.spec.has_point else self._load_targets(record)
+
+        # Train-only 2D augmentation. Keep 3D and future 2D+3D routes untouched:
+        # geometric augmentation would otherwise require synchronized world-coordinate
+        # transformations for point data and geospatial metadata.
+        if self.route == "2d" and self.split == "train":
+            (
+                sample["images_t1"],
+                sample["images_t2"],
+                sample["target"],
+            ) = augment_pair_2d(
+                sample["images_t1"],
+                sample["images_t2"],
+                sample["target"],
+            )
 
         if self.spec.has_image and not self.spec.has_point:
             h, w = sample["images_t1"].shape[-2:]

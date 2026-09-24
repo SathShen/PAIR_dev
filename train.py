@@ -283,7 +283,26 @@ def forward_loss(model, criterion, samples, spec):
     else:
         raise NotImplementedError("PAIR 2D+3D training waits for real world-coordinate image/point correspondence")
     target = merge_targets(samples, spec.route)
-    loss_output = criterion(prediction=prediction, target=target, class_names=spec.class_names)
+
+    # 2D semantic-pair SCD follows the same supervision split used by the
+    # reference SCD implementations: the binary branch learns changed vs
+    # unchanged over the full valid image, while semantic CE/Lovasz learn
+    # semantic discrimination only on changed pixels.
+    #
+    # Keep every other route unchanged:
+    #   - 2D BCD: semantic supervision remains inactive
+    #   - 3D: semantic loss stays full-valid
+    #   - post_semantic / future routes keep their existing protocol
+    semantic_changed_only = (
+        spec.route == "2d" and spec.label_mode == "semantic_pair"
+    )
+
+    loss_output = criterion(
+        prediction=prediction,
+        target=target,
+        class_names=spec.class_names,
+        semantic_changed_only=semantic_changed_only,
+    )
     return prediction, loss_output, target
 
 
