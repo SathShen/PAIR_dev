@@ -8,6 +8,7 @@ Design goals
 2) Use the same small set of robust primitives across 2D and 3D:
       semantic: CE + Lovasz-Softmax
       binary change: BCE + Dice
+      2D SCD auxiliary: PerASCD Soft Semantic Consistency Loss (SSCLoss)
       3D event: active-support CE + derived change Dice
 3) Normalize across ACTIVE task groups so a batch with more annotated heads
    does not automatically contribute a proportionally larger total loss.
@@ -70,6 +71,9 @@ class ChangeLossOutput:
     change_dice: torch.Tensor
     change: torch.Tensor
 
+    # PerASCD Soft Semantic Consistency auxiliary loss.
+    ssc: torch.Tensor
+
     # 3D event. event_t1/t2 remain the active-support CE terms.
     event_t1: torch.Tensor
     event_t2: torch.Tensor
@@ -97,6 +101,7 @@ class ChangeLossOutput:
             "loss_change_bce": self.change_bce,
             "loss_change_dice": self.change_dice,
             "loss_change": self.change,
+            "loss_ssc": self.ssc,
             "loss_event_t1": self.event_t1,
             "loss_event_t2": self.event_t2,
             "loss_event_ce": self.event_ce,
@@ -122,6 +127,11 @@ class PAIRSemanticChangeLoss(nn.Module):
         change_weight=1.0,
         event_dice_weight=1.0,
         normalize_active_tasks=True,
+        # PerASCD SSCLoss. Appended to preserve old positional arguments.
+        ssc_weight=0.01,
+        ssc_margin=0.1,
+        ssc_tau=0.01,
+        ssc_eps=1e-8,
     ):
         super().__init__()
 
@@ -139,6 +149,18 @@ class PAIRSemanticChangeLoss(nn.Module):
         self.dice_eps = float(dice_eps)
         self.normalize_active_tasks = bool(normalize_active_tasks)
 
+        # PerASCD SSCLoss:
+        #   unchanged: 1 - cos(x1, x2)
+        #   changed  : tau * softplus((cos(x1, x2) - margin) / tau)
+        #
+        # PerASCD computes it from the two semantic outputs after removing the
+        # explicit unchanged channel. SECOND uses a small temperature; the
+        # released PerASCD training entry defaults to tau=0.01.
+        self.ssc_weight = float(ssc_weight)
+        self.ssc_margin = float(ssc_margin)
+        self.ssc_tau = float(ssc_tau)
+        self.ssc_eps = float(ssc_eps)
+
         for name, value in (
             ("semantic_weight", self.semantic_weight),
             ("change_weight", self.change_weight),
@@ -147,10 +169,20 @@ class PAIRSemanticChangeLoss(nn.Module):
             ("change_bce_weight", self.change_bce_weight),
             ("change_dice_weight", self.change_dice_weight),
             ("event_dice_weight", self.event_dice_weight),
+            ("ssc_weight", self.ssc_weight),
+            ("ssc_eps", self.ssc_eps),
             ("dice_eps", self.dice_eps),
         ):
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
+
+        if self.ssc_tau <= 0:
+            raise ValueError(f"ssc_tau must be > 0, got {self.ssc_tau}")
+        if not (-1.0 <= self.ssc_margin <= 1.0):
+            raise ValueError(
+                "ssc_margin must lie in [-1, 1] for cosine similarity, "
+                f"got {self.ssc_margin}"
+            )
 
     # ------------------------------------------------------------------
     # Generic helpers
@@ -412,6 +444,220 @@ class PAIRSemanticChangeLoss(nn.Module):
             semantic,
             semantic_active,
         )
+
+    # ------------------------------------------------------------------
+    # PerASCD Soft Semantic Consistency Loss (SSCLoss)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_class_name(name: str) -> str:
+        return " ".join(
+            str(name)
+            .strip()
+            .lower()
+            .replace("_", " ")
+            .replace("-", " ")
+            .split()
+        )
+
+    @classmethod
+    def _unchanged_local_index(
+        cls,
+        class_names: Dict[int, str],
+    ) -> Optional[int]:
+        """
+        Find the model-local index of an explicit unchanged/no-change class.
+
+        Do not reinterpret a generic "background" class as unchanged. PerASCD
+        removes its explicit class-0 unchanged channel before SSCLoss.
+        """
+        aliases = {"unchanged", "no change", "non change"}
+        matches = [
+            int(raw_id)
+            for raw_id, class_name in class_names.items()
+            if cls._normalize_class_name(class_name) in aliases
+        ]
+
+        if not matches:
+            return None
+
+        if len(matches) != 1:
+            raise ValueError(
+                "SSCLoss requires at most one explicit unchanged/no-change "
+                f"class, got raw IDs {matches}"
+            )
+
+        return cls.make_raw_to_local(class_names)[matches[0]]
+
+    def soft_semantic_consistency(
+        self,
+        logits_t1: torch.Tensor,
+        logits_t2: torch.Tensor,
+        change_target: torch.Tensor,
+        valid_mask: torch.Tensor,
+        unchanged_local_index: int,
+    ) -> torch.Tensor:
+        """
+        PerASCD SSCLoss adapted to PAIR's flattened semantic logits [N,K].
+
+        PerASCD uses the semantic outputs after excluding the unchanged channel:
+
+            unchanged:
+                1 - cos(x1, x2)
+
+            changed:
+                tau * softplus((cos(x1, x2) - margin) / tau)
+
+        PAIR's binary convention is 0=unchanged, 1=changed.
+        """
+        if logits_t1 is None or logits_t2 is None:
+            raise ValueError("SSCLoss requires both T1/T2 semantic logits")
+
+        if logits_t1.ndim != 2 or logits_t2.ndim != 2:
+            raise ValueError(
+                "SSCLoss semantic logits must be [N,K], got "
+                f"{tuple(logits_t1.shape)} and {tuple(logits_t2.shape)}"
+            )
+
+        if logits_t1.shape != logits_t2.shape:
+            raise ValueError(
+                "SSCLoss requires aligned T1/T2 semantic logits, got "
+                f"{tuple(logits_t1.shape)} vs {tuple(logits_t2.shape)}"
+            )
+
+        n, k = logits_t1.shape
+        unchanged_local_index = int(unchanged_local_index)
+
+        if not (0 <= unchanged_local_index < k):
+            raise ValueError(
+                f"SSCLoss unchanged index {unchanged_local_index} "
+                f"is outside K={k}"
+            )
+        if k <= 1:
+            raise ValueError(
+                "SSCLoss needs at least one semantic class after removing "
+                "the unchanged channel"
+            )
+
+        device = logits_t1.device
+        change_target = change_target.to(device).reshape(-1)
+        valid_mask = valid_mask.to(device).reshape(-1).bool()
+
+        if change_target.numel() != n or valid_mask.numel() != n:
+            raise ValueError(
+                "SSCLoss logits/target/mask size mismatch: "
+                f"N={n}, target={change_target.numel()}, "
+                f"mask={valid_mask.numel()}"
+            )
+
+        if valid_mask.any():
+            y = change_target[valid_mask]
+            if not torch.all((y == 0) | (y == 1)):
+                values = torch.unique(y).detach().cpu().tolist()
+                raise ValueError(
+                    "SSCLoss valid change target must contain only 0/1, "
+                    f"got {values}"
+                )
+
+        if not valid_mask.any():
+            return (logits_t1.sum() + logits_t2.sum()) * 0.0
+
+        keep = torch.ones(k, dtype=torch.bool, device=device)
+        keep[unchanged_local_index] = False
+
+        # PerASCD constrains semantic outputs, not softmax probabilities.
+        # Promote to FP32 so BF16/AMP does not weaken the softplus transition.
+        x1 = logits_t1[valid_mask][:, keep].float()
+        x2 = logits_t2[valid_mask][:, keep].float()
+
+        cosine = F.cosine_similarity(
+            x1,
+            x2,
+            dim=1,
+            eps=self.ssc_eps,
+        ).clamp(-1.0, 1.0)
+
+        changed = change_target[valid_mask].float()
+
+        unchanged_loss = 1.0 - cosine
+        changed_loss = self.ssc_tau * F.softplus(
+            (cosine - self.ssc_margin) / self.ssc_tau
+        )
+
+        per_pixel = torch.where(
+            changed > 0.5,
+            changed_loss,
+            unchanged_loss,
+        )
+        return per_pixel.mean()
+
+    def _ssc_loss(
+        self,
+        prediction,
+        target,
+        class_names: Dict[int, str],
+        semantic_active: bool,
+    ) -> Tuple[torch.Tensor, bool]:
+        """
+        Apply SSCLoss only to aligned 2D semantic-change batches.
+
+        Conditions:
+        - shared 2D binary target `change` exists;
+        - semantic supervision is active;
+        - class_names has one explicit unchanged/no-change class.
+
+        Therefore NYC-SCD's 3D event route and pure BCD batches are unchanged.
+        """
+        zero = self._zero_from(prediction.semantic_logits_t1)
+
+        if self.ssc_weight <= 0 or not semantic_active:
+            return zero, False
+        if "change" not in target:
+            return zero, False
+
+        unchanged_local = self._unchanged_local_index(class_names)
+        if unchanged_local is None:
+            return zero, False
+
+        raw1 = target["semantic_t1"]
+        raw2 = target["semantic_t2"]
+
+        valid_sem1 = self._valid_or_true(
+            target,
+            "semantic_valid_t1",
+            raw1,
+            prediction.semantic_logits_t1.device,
+        )
+        valid_sem2 = self._valid_or_true(
+            target,
+            "semantic_valid_t2",
+            raw2,
+            prediction.semantic_logits_t2.device,
+        )
+
+        change = target["change"]
+        change_valid = target.get("change_valid")
+        if change_valid is None:
+            change_valid = torch.ones_like(change, dtype=torch.bool)
+
+        device = prediction.semantic_logits_t1.device
+        valid = (
+            valid_sem1.to(device).reshape(-1).bool()
+            & valid_sem2.to(device).reshape(-1).bool()
+            & change_valid.to(device).reshape(-1).bool()
+        )
+
+        if not valid.any():
+            return zero, False
+
+        ssc = self.soft_semantic_consistency(
+            prediction.semantic_logits_t1,
+            prediction.semantic_logits_t2,
+            change,
+            valid,
+            unchanged_local,
+        )
+        return ssc, True
 
     # ------------------------------------------------------------------
     # Binary change task: BCE + Dice
@@ -819,6 +1065,9 @@ class PAIRSemanticChangeLoss(nn.Module):
         event = zero
         event_active = False
 
+        ssc = zero
+        ssc_active = False
+
         if has_binary:
             (
                 change_bce,
@@ -828,6 +1077,18 @@ class PAIRSemanticChangeLoss(nn.Module):
             ) = self._binary_losses(
                 prediction,
                 target,
+            )
+
+        # SSCLoss couples the paired 2D semantic outputs with binary change
+        # supervision. Keep it outside the active-task denominator so adding
+        # it does not silently turn PAIR's existing 1/2 semantic + 1/2 change
+        # balance into three 1/3 task groups.
+        if has_binary:
+            ssc, ssc_active = self._ssc_loss(
+                prediction,
+                target,
+                class_names,
+                semantic_active,
             )
 
         if has_event:
@@ -885,6 +1146,12 @@ class PAIRSemanticChangeLoss(nn.Module):
         else:
             total = numerator
 
+        # PerASCD adds SSCLoss as an auxiliary term with unit coefficient.
+        # `ssc_weight` exposes that coefficient without changing PAIR's task
+        # normalization. Default=1.0 matches the released PerASCD recipe.
+        if ssc_active and self.ssc_weight > 0:
+            total = total + self.ssc_weight * ssc
+
         active_weight_sum = numerator.new_tensor(
             weight_sum_value
         )
@@ -901,6 +1168,7 @@ class PAIRSemanticChangeLoss(nn.Module):
             change_bce=change_bce,
             change_dice=change_dice,
             change=change,
+            ssc=ssc,
             event_t1=event_t1,
             event_t2=event_t2,
             event_ce=event_ce,
@@ -911,28 +1179,26 @@ class PAIRSemanticChangeLoss(nn.Module):
             active_weight_sum=active_weight_sum,
         )
 
-
 def _self_test():
     from types import SimpleNamespace
 
     torch.manual_seed(0)
-
     criterion = PAIRSemanticChangeLoss()
 
-    class_names = {
+    # ------------------------------------------------------------------
+    # Legacy-like semantic pair without an explicit "unchanged" class:
+    # SSCLoss must remain inactive and baseline arithmetic must not change.
+    # ------------------------------------------------------------------
+    class_names_plain = {
         0: "ground",
         1: "building",
         2: "vegetation",
         3: "clutter",
     }
+    sem1_plain = torch.tensor([0, 1, 2, 3, 1, 2])
+    sem2_plain = torch.tensor([0, 1, 2, 3, 1, 2])
 
-    semantic_t1 = torch.tensor([0, 1, 2, 3, 1, 2])
-    semantic_t2 = torch.tensor([0, 1, 2, 3, 1, 2])
-
-    # ------------------------------------------------------------------
-    # 2D SCD: semantic + binary change
-    # ------------------------------------------------------------------
-    pred_2d = SimpleNamespace(
+    pred_plain = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
         change_logits_t1=torch.randn(6, requires_grad=True),
@@ -940,32 +1206,86 @@ def _self_test():
         event_logits_t1=None,
         event_logits_t2=None,
     )
-
-    target_2d = {
-        "semantic_t1": semantic_t1,
-        "semantic_t2": semantic_t2,
-        "change_t1": torch.tensor([0, 1, 0, 1, 1, 0]),
-        "change_t2": torch.tensor([0, 1, 0, 1, 1, 0]),
+    target_plain = {
+        "semantic_t1": sem1_plain,
+        "semantic_t2": sem2_plain,
+        "change": torch.tensor([0, 1, 0, 1, 1, 0]),
+        "change_valid": torch.ones(6, dtype=torch.bool),
     }
 
-    out_2d = criterion(
-        prediction=pred_2d,
-        target=target_2d,
-        class_names=class_names,
+    out_plain = criterion(
+        prediction=pred_plain,
+        target=target_plain,
+        class_names=class_names_plain,
+    )
+    expected_plain = 0.5 * (out_plain.semantic + out_plain.change)
+    assert torch.allclose(out_plain.ssc, torch.tensor(0.0))
+    assert torch.allclose(
+        out_plain.total, expected_plain, atol=1e-6, rtol=1e-6
     )
 
-    assert torch.isfinite(out_2d.total)
-    assert torch.allclose(out_2d.active_weight_sum, torch.tensor(2.0))
-    expected_2d = 0.5 * (out_2d.semantic + out_2d.change)
-    assert torch.allclose(out_2d.total, expected_2d, atol=1e-6, rtol=1e-6)
+    # ------------------------------------------------------------------
+    # SECOND-like 2D SCD: explicit unchanged class activates SSCLoss.
+    # ------------------------------------------------------------------
+    class_names_scd = {
+        0: "unchanged",
+        1: "water",
+        2: "building",
+        3: "tree",
+    }
 
-    out_2d.total.backward()
-    assert pred_2d.semantic_logits_t1.grad is not None
-    assert pred_2d.change_logits_t1.grad is not None
+    pred_scd = SimpleNamespace(
+        semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
+        semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
+        change_logits_t1=torch.randn(6, requires_grad=True),
+        change_logits_t2=torch.randn(6, requires_grad=True),
+        event_logits_t1=None,
+        event_logits_t2=None,
+    )
+    target_scd = {
+        "semantic_t1": torch.tensor([0, 1, 0, 2, 3, 0]),
+        "semantic_t2": torch.tensor([0, 2, 0, 3, 1, 0]),
+        "semantic_valid_t1": torch.ones(6, dtype=torch.bool),
+        "semantic_valid_t2": torch.ones(6, dtype=torch.bool),
+        "change": torch.tensor([0, 1, 0, 1, 1, 0]),
+        "change_valid": torch.ones(6, dtype=torch.bool),
+    }
+
+    out_scd = criterion(
+        prediction=pred_scd,
+        target=target_scd,
+        class_names=class_names_scd,
+    )
+    expected_scd = (
+        0.5 * (out_scd.semantic + out_scd.change)
+        + criterion.ssc_weight * out_scd.ssc
+    )
+    assert torch.isfinite(out_scd.ssc)
+    assert out_scd.ssc.item() >= 0.0
+    assert torch.allclose(
+        out_scd.total, expected_scd, atol=1e-6, rtol=1e-6
+    )
+
+    out_scd.total.backward()
+    assert pred_scd.semantic_logits_t1.grad is not None
+    assert pred_scd.semantic_logits_t2.grad is not None
+    assert pred_scd.change_logits_t1.grad is not None
+
+    # Formula sanity check:
+    # identical semantic vectors at an unchanged pixel -> zero SSC.
+    identical_t1 = torch.tensor([[9.0, 1.0, 2.0, 3.0]])
+    identical_t2 = identical_t1.clone()
+    direct = criterion.soft_semantic_consistency(
+        identical_t1,
+        identical_t2,
+        torch.tensor([0]),
+        torch.tensor([True]),
+        unchanged_local_index=0,
+    )
+    assert torch.allclose(direct, torch.tensor(0.0), atol=1e-6)
 
     # ------------------------------------------------------------------
-    # 2D BCD: semantic supervision fully masked out.
-    # Total must be the binary task itself, NOT half of it.
+    # 2D BCD: semantic supervision fully masked -> SSCLoss inactive.
     # ------------------------------------------------------------------
     pred_bcd = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
@@ -975,32 +1295,35 @@ def _self_test():
         event_logits_t1=None,
         event_logits_t2=None,
     )
-
     target_bcd = {
-        "semantic_t1": semantic_t1,
-        "semantic_t2": semantic_t2,
+        "semantic_t1": torch.zeros(6, dtype=torch.long),
+        "semantic_t2": torch.zeros(6, dtype=torch.long),
         "semantic_valid_t1": torch.zeros(6, dtype=torch.bool),
         "semantic_valid_t2": torch.zeros(6, dtype=torch.bool),
-        "change_t1": torch.tensor([0, 1, 0, 1, 1, 0]),
-        "change_t2": torch.tensor([0, 1, 0, 1, 1, 0]),
+        "change": torch.tensor([0, 1, 0, 1, 1, 0]),
+        "change_valid": torch.ones(6, dtype=torch.bool),
     }
 
     out_bcd = criterion(
         prediction=pred_bcd,
         target=target_bcd,
-        class_names=class_names,
+        class_names=class_names_scd,
+    )
+    assert torch.allclose(out_bcd.ssc, torch.tensor(0.0))
+    assert torch.allclose(
+        out_bcd.total, out_bcd.change, atol=1e-6, rtol=1e-6
     )
 
-    assert torch.isfinite(out_bcd.total)
-    assert torch.allclose(out_bcd.active_weight_sum, torch.tensor(1.0))
-    assert torch.allclose(out_bcd.total, out_bcd.change, atol=1e-6, rtol=1e-6)
-
-    out_bcd.total.backward()
-    assert pred_bcd.change_logits_t1.grad is not None
-
     # ------------------------------------------------------------------
-    # 3D: semantic + event. No binary head.
+    # 3D: no shared binary `change` target -> SSCLoss stays inactive.
+    # Event active-support behavior must remain unchanged.
     # ------------------------------------------------------------------
+    class_names_3d = {
+        0: "ground",
+        1: "building",
+        2: "vegetation",
+        3: "clutter",
+    }
     pred_3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
@@ -1009,10 +1332,9 @@ def _self_test():
         event_logits_t1=torch.randn(6, 3, requires_grad=True),
         event_logits_t2=torch.randn(6, 3, requires_grad=True),
     )
-
     target_3d = {
-        "semantic_t1": semantic_t1,
-        "semantic_t2": semantic_t2,
+        "semantic_t1": torch.tensor([0, 1, 2, 3, 1, 2]),
+        "semantic_t2": torch.tensor([0, 1, 2, 3, 1, 2]),
         "event_t1": torch.tensor([0, 2, 0, 2, 0, 2]),
         "event_t2": torch.tensor([0, 1, 0, 1, 0, 1]),
         "event_valid_t1": torch.ones(6, dtype=torch.bool),
@@ -1022,20 +1344,18 @@ def _self_test():
     out_3d = criterion(
         prediction=pred_3d,
         target=target_3d,
-        class_names=class_names,
+        class_names=class_names_3d,
         dataset_name="NYC-SCD",
     )
-
-    assert torch.isfinite(out_3d.total)
-    assert torch.allclose(out_3d.active_weight_sum, torch.tensor(2.0))
+    assert torch.allclose(out_3d.ssc, torch.tensor(0.0))
     expected_3d = 0.5 * (out_3d.semantic + out_3d.event)
-    assert torch.allclose(out_3d.total, expected_3d, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        out_3d.total, expected_3d, atol=1e-6, rtol=1e-6
+    )
 
     out_3d.total.backward()
 
-    # Illegal event classes must still receive exactly zero gradient even
-    # after adding derived event Dice, because both CE and Dice operate only
-    # inside the active support.
+    # T1 illegal class Added(1); T2 illegal class Removed(2).
     assert torch.allclose(
         pred_3d.event_logits_t1.grad[:, 1],
         torch.zeros_like(pred_3d.event_logits_t1.grad[:, 1]),
@@ -1049,66 +1369,30 @@ def _self_test():
         rtol=0.0,
     )
 
-    # ------------------------------------------------------------------
-    # Future 2D+3D: semantic + binary + event -> three active groups.
-    # ------------------------------------------------------------------
-    pred_2d3d = SimpleNamespace(
-        semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
-        semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
-        change_logits_t1=torch.randn(6, requires_grad=True),
-        change_logits_t2=torch.randn(6, requires_grad=True),
-        event_logits_t1=torch.randn(6, 3, requires_grad=True),
-        event_logits_t2=torch.randn(6, 3, requires_grad=True),
-    )
-
-    target_2d3d = {
-        "semantic_t1": semantic_t1,
-        "semantic_t2": semantic_t2,
-        "change_t1": torch.tensor([0, 1, 0, 1, 1, 0]),
-        "change_t2": torch.tensor([0, 1, 0, 1, 1, 0]),
-        "event_t1": torch.tensor([0, 2, 0, 2, 0, 2]),
-        "event_t2": torch.tensor([0, 1, 0, 1, 0, 1]),
-        "event_valid_t1": torch.ones(6, dtype=torch.bool),
-        "event_valid_t2": torch.ones(6, dtype=torch.bool),
-    }
-
-    out_2d3d = criterion(
-        prediction=pred_2d3d,
-        target=target_2d3d,
-        class_names=class_names,
-    )
-
-    assert torch.isfinite(out_2d3d.total)
-    assert torch.allclose(out_2d3d.active_weight_sum, torch.tensor(3.0))
-
-    out_2d3d.total.backward()
-
-    assert pred_2d3d.change_logits_t1.grad is not None
-    assert pred_2d3d.event_logits_t1.grad is not None
-
-    print("loss.py V1 self-test: PASS")
+    print("loss.py V2 + PerASCD SSCLoss self-test: PASS")
     print(
-        "2D SCD total=%.6f | semantic=%.6f | change=%.6f"
+        "2D SCD total=%.6f | semantic=%.6f | change=%.6f | ssc=%.6f"
         % (
-            float(out_2d.total.detach()),
-            float(out_2d.semantic.detach()),
-            float(out_2d.change.detach()),
+            float(out_scd.total.detach()),
+            float(out_scd.semantic.detach()),
+            float(out_scd.change.detach()),
+            float(out_scd.ssc.detach()),
         )
     )
     print(
-        "2D BCD total=%.6f | change=%.6f"
+        "2D BCD total=%.6f | ssc=%.6f"
         % (
             float(out_bcd.total.detach()),
-            float(out_bcd.change.detach()),
+            float(out_bcd.ssc.detach()),
         )
     )
     print(
-        "3D total=%.6f | semantic=%.6f | eventCE=%.6f | eventDice=%.6f"
+        "3D total=%.6f | semantic=%.6f | event=%.6f | ssc=%.6f"
         % (
             float(out_3d.total.detach()),
             float(out_3d.semantic.detach()),
-            float(out_3d.event_ce.detach()),
-            float(out_3d.event_dice.detach()),
+            float(out_3d.event.detach()),
+            float(out_3d.ssc.detach()),
         )
     )
 

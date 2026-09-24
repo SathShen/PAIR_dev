@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_cgdecoder",
+    "name": "PAIR_SECOND_Lssc",
     "seed": 42,
     "epochs": 50
   },
@@ -26,7 +26,7 @@
     "max_point_reasoning_tokens": 512
   },
   "optimizer": {
-    "lr": 0.0001,
+    "lr": 1e-4,
     "lora_lr": 2e-05,
     "weight_decay": 0.01,
     "scheduler": "cosine",
