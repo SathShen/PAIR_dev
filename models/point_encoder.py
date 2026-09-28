@@ -1,11 +1,11 @@
 """
-Frozen Utonia point-cloud encoder for PAIR.
+Utonia point-cloud encoder for PAIR (frozen base + optional attention LoRA).
 
 PAIR 3D path
 ------------
 cropped point cloud [N, 3]
     -> voxel sampling
-    -> Utonia pretrained encoder (frozen)
+    -> Utonia pretrained encoder (frozen base; optional attention LoRA)
     -> concatenate all five encoder-scale features
     -> map sampled features back to the original cropped point topology
     -> dense point features [N, D]
@@ -56,6 +56,8 @@ import importlib.util
 import torch
 import torch.nn as nn
 
+from models.lora import apply_utonia_lora, custom_lora_parameter_count, set_custom_lora_training
+
 
 UTONIA_INTERNAL_GRID_SIZE = 0.01
 
@@ -64,6 +66,10 @@ UTONIA_INTERNAL_GRID_SIZE = 0.01
 class UtoniaPointEncoderConfig:
     checkpoint: str = "/data2/sht/checkpoints/Utonia/utonia.pth"
     voxel_size: float = 0.5
+    lora_enabled: bool = False
+    lora_r: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.05
 
 
 @dataclass
@@ -364,12 +370,12 @@ def _select_voxel_representatives(
 
 class UtoniaPointEncoder(nn.Module):
     """
-    Frozen Utonia foundation encoder used by PAIR.
+    Utonia foundation encoder used by PAIR.
 
-    The Utonia parameters are always frozen. Calling parent_model.train()
-    keeps this wrapper's preprocessing in train mode (random voxel
-    representative selection), while the pretrained Utonia network itself
-    remains in eval mode.
+    Pretrained Utonia base parameters are always frozen.  Optional attention
+    LoRA parameters can be trainable. Calling parent_model.train() keeps this
+    wrapper's preprocessing in train mode (random voxel representative
+    selection), while the pretrained Utonia base itself remains in eval mode.
     """
 
     def __init__(
@@ -530,11 +536,27 @@ class UtoniaPointEncoder(nn.Module):
             strict=True,
         )
 
-        # Foundation encoder is frozen by design.
+        # Foundation encoder base weights are frozen by design.  Optional
+        # task adaptation is provided only through low-rank attention adapters.
         self.model.requires_grad_(
             False
         )
         self.model.eval()
+
+        self.lora_enabled = bool(self.config.lora_enabled)
+        self.lora_info = {
+            "attention_modules": 0,
+            "wrapped_linears": 0,
+            "trainable_parameters": 0,
+        }
+        if self.lora_enabled:
+            self.lora_info = apply_utonia_lora(
+                self.model,
+                r=int(self.config.lora_r),
+                alpha=float(self.config.lora_alpha),
+                dropout=float(self.config.lora_dropout),
+            )
+            set_custom_lora_training(self.model, True)
 
         self.checkpoint_path = str(
             checkpoint_path
@@ -563,10 +585,19 @@ class UtoniaPointEncoder(nn.Module):
 
         total_params = self.parameter_count()
 
+        lora_trainable, _ = custom_lora_parameter_count(self.model, kind="utonia")
+        tuning_text = (
+            f"base frozen + LoRA(r={int(self.config.lora_r)}, "
+            f"alpha={float(self.config.lora_alpha):g}, "
+            f"dropout={float(self.config.lora_dropout):g}, "
+            f"trainable={lora_trainable / 1e6:.3f}M)"
+            if self.lora_enabled
+            else "frozen"
+        )
         print(
             "Utonia point encoder loaded: "
             f"{total_params / 1e6:.2f}M parameters | "
-            "frozen | "
+            f"{tuning_text} | "
             f"voxel_size={self.voxel_size:g} m | "
             f"dense_dim={self.output_dim}"
         )
@@ -576,7 +607,7 @@ class UtoniaPointEncoder(nn.Module):
         mode: bool = True,
     ):
         """
-        Keep the frozen Utonia network in eval mode.
+        Keep the frozen Utonia base in eval mode while LoRA follows PAIR train/eval.
 
         self.training still follows `mode`, so preprocessing may use random
         voxel representatives during training and deterministic selection
@@ -587,6 +618,7 @@ class UtoniaPointEncoder(nn.Module):
         )
 
         self.model.eval()
+        set_custom_lora_training(self.model, bool(mode) and self.lora_enabled)
 
         return self
 
@@ -1124,7 +1156,7 @@ class UtoniaPointEncoder(nn.Module):
         device: torch.device,
     ):
         """
-        Carry optional per-point LiDAR intensity through the frozen Utonia
+        Carry optional per-point LiDAR intensity through the Utonia branch
         backbone without feeding it into Utonia.
 
         intensity:
@@ -1216,10 +1248,15 @@ class UtoniaPointEncoder(nn.Module):
             "utonia_input"
         ]
 
-        # Use no_grad rather than inference_mode: downstream trainable PAIR
-        # adapters must be allowed to consume and save these frozen features
-        # during their own backward pass.
-        with torch.no_grad():
+        # Frozen Utonia can run under no_grad.  When point LoRA is enabled,
+        # autograd must remain active so gradients reach only the low-rank
+        # adapters while all pretrained base weights stay frozen.
+        grad_context = (
+            torch.enable_grad()
+            if self.lora_enabled and self.training
+            else torch.no_grad()
+        )
+        with grad_context:
             point = self.model(
                 utonia_input
             )

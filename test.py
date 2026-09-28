@@ -171,8 +171,15 @@ def parameter_group(name: str) -> str:
     """
     n = name.lower()
 
+    if "pair_lora_" in n:
+        if "qwen_backbone" in n and "visual" in n:
+            return "qwen_vision_lora"
+        if "point_encoder" in n:
+            return "utonia_lora"
+        return "custom_lora_other"
+
     if "lora_" in n:
-        return "qwen_lora"
+        return "qwen_llm_lora"
 
     if "cg_decoder_2d" in n:
         return "2d_cg_decoder"
@@ -1039,16 +1046,44 @@ def main():
 
         named_params = trainable_parameters(model)
         total_trainable = sum(p.numel() for _, p in named_params)
-        lora_trainable = sum(
+        llm_lora_trainable = sum(
             p.numel()
             for name, p in named_params
-            if "lora_" in name.lower()
+            if "lora_" in name.lower() and "pair_lora_" not in name.lower()
+        )
+        vision_lora_trainable = sum(
+            p.numel()
+            for name, p in named_params
+            if "pair_lora_" in name.lower()
+            and "qwen_backbone" in name.lower()
+            and "visual" in name.lower()
+        )
+        point_lora_trainable = sum(
+            p.numel()
+            for name, p in named_params
+            if "pair_lora_" in name.lower() and "point_encoder" in name.lower()
+        )
+        all_lora_trainable = (
+            llm_lora_trainable + vision_lora_trainable + point_lora_trainable
         )
 
         print()
         print(f"trainable parameters     : {total_trainable:,}")
-        print(f"LoRA trainable           : {lora_trainable:,}")
-        print(f"non-LoRA trainable       : {total_trainable - lora_trainable:,}")
+        print(f"Qwen LLM LoRA trainable  : {llm_lora_trainable:,}")
+        print(f"Qwen Vision LoRA trainable: {vision_lora_trainable:,}")
+        print(f"Utonia LoRA trainable    : {point_lora_trainable:,}")
+        print(f"all LoRA trainable       : {all_lora_trainable:,}")
+        print(f"non-LoRA trainable       : {total_trainable - all_lora_trainable:,}")
+
+        diagnostic_optimizer, _, _ = train_mod.build_optimizer(model, settings)
+        group_state = train_mod.optimizer_group_snapshot(diagnostic_optimizer)
+        print("optimizer groups          :")
+        for group_name, info in group_state.items():
+            print(
+                f"  {group_name:<14} params={info['params']:,} "
+                f"lr={info['lr']:.8e} wd={info['weight_decay']:.8e}"
+            )
+        del diagnostic_optimizer
 
         handle = registry.handles[args.dataset]
         handle.train_cycle.reset(0)

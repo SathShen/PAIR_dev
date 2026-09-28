@@ -49,7 +49,11 @@ from models.change_decoder import (
     UnifiedChangeDecoder,
     UnifiedTokenSet,
 )
-from models.lora import apply_qwen_lora
+from models.lora import (
+    apply_qwen_lora,
+    apply_qwen_vision_lora,
+    set_custom_lora_training,
+)
 from models.point_adapter import PointAdapter, PointAdapterConfig
 from models.point_encoder import UtoniaPointEncoder, UtoniaPointEncoderConfig
 from models.qwen3vl_backbone import Qwen3VLBackbone
@@ -201,7 +205,7 @@ class PAIRBackbone(nn.Module):
     def encode_points(self, point_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         """
         raw point topology
-            -> frozen Utonia [N,1386]
+            -> frozen-base Utonia (+ optional LoRA) [N,1386]
             -> PointAdapter
                  dense [N,decoder_dim]
                  reasoning [K,qwen_dim]
@@ -1434,7 +1438,15 @@ class PAIRModel(nn.Module):
         model = PAIRModel.from_config(experiment.model, device)
     """
 
-    def __init__(self, backbone, decoder, image_adapter, qwen_tuning):
+    def __init__(
+        self,
+        backbone,
+        decoder,
+        image_adapter,
+        qwen_tuning,
+        vision_lora_enabled=False,
+        point_lora_enabled=False,
+    ):
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
@@ -1442,6 +1454,8 @@ class PAIRModel(nn.Module):
         # not instantiate or use the old merged-token ImageDenseAdapter.
         self.image_adapter = image_adapter
         self.qwen_tuning = str(qwen_tuning).lower()
+        self.vision_lora_enabled = bool(vision_lora_enabled)
+        self.point_lora_enabled = bool(point_lora_enabled)
 
     @property
     def qwen_backbone(self):
@@ -1492,16 +1506,46 @@ class PAIRModel(nn.Module):
         else:
             raise ValueError("model.qwen_tuning must be one of: frozen, lora, full")
 
+        vision_lora_cfg = dict(cfg.get("vision_lora", {}))
+        vision_lora_enabled = bool(vision_lora_cfg.get("enabled", False))
+        if vision_lora_enabled:
+            if qwen_tuning == "full":
+                raise ValueError(
+                    "model.vision_lora.enabled=true is incompatible with qwen_tuning='full'; "
+                    "PAIR expects the Qwen base to remain frozen when using Vision LoRA"
+                )
+            vision_info = apply_qwen_vision_lora(
+                qwen,
+                r=int(vision_lora_cfg.get("r", 16)),
+                alpha=float(vision_lora_cfg.get("alpha", 32)),
+                dropout=float(vision_lora_cfg.get("dropout", 0.05)),
+            )
+            print(
+                "Qwen Vision LoRA enabled: "
+                f"blocks={vision_info['wrapped_linears'] // 2} "
+                f"linears={vision_info['wrapped_linears']} "
+                f"trainable={vision_info['trainable_parameters'] / 1e6:.3f}M "
+                f"r={int(vision_lora_cfg.get('r', 16))} "
+                f"alpha={float(vision_lora_cfg.get('alpha', 32)):g}"
+            )
+
         decoder_dim = int(cfg.get("decoder_dim", 256))
         point_cfg = dict(cfg.get("point_encoder", {}))
         checkpoint = point_cfg.get("checkpoint")
         if not checkpoint:
             raise KeyError("model.point_encoder.checkpoint is required")
 
+        point_lora_cfg = dict(cfg.get("point_lora", {}))
+        point_lora_enabled = bool(point_lora_cfg.get("enabled", False))
+
         point_encoder = UtoniaPointEncoder(
             UtoniaPointEncoderConfig(
                 checkpoint=str(checkpoint),
                 voxel_size=float(point_cfg.get("voxel_size", 0.5)),
+                lora_enabled=point_lora_enabled,
+                lora_r=int(point_lora_cfg.get("r", 8)),
+                lora_alpha=float(point_lora_cfg.get("alpha", 16)),
+                lora_dropout=float(point_lora_cfg.get("dropout", 0.05)),
             )
         ).to(device)
 
@@ -1524,14 +1568,33 @@ class PAIRModel(nn.Module):
             vision_dim=qwen.vision_hidden_size,
             decoder_dim=decoder_dim,
         ).to(device)
-        return cls(backbone, decoder, None, qwen_tuning).to(device)
+        return cls(
+            backbone,
+            decoder,
+            None,
+            qwen_tuning,
+            vision_lora_enabled=vision_lora_enabled,
+            point_lora_enabled=point_lora_enabled,
+        ).to(device)
 
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.qwen_tuning in ("frozen", "lora"):
-            self.backbone.visual_module().eval()
+
+        # Keep frozen foundation-model bases deterministic/eval while allowing
+        # custom Vision LoRA dropout to follow PAIR's train/eval state.
+        if self.qwen_tuning in ("frozen", "lora"):
+            visual = self.backbone.visual_module()
+            visual.eval()
+            set_custom_lora_training(
+                visual,
+                bool(mode) and self.vision_lora_enabled,
+            )
+
         if mode and self.qwen_tuning == "frozen":
             self.qwen_backbone.model.eval()
+            if self.vision_lora_enabled:
+                set_custom_lora_training(self.backbone.visual_module(), True)
+
         return self
 
     # -------------------------------------------------------------------------

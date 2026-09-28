@@ -23,15 +23,34 @@
       "checkpoint": "/data2/sht/checkpoints/Utonia/utonia.pth",
       "voxel_size": 0.5
     },
-    "max_point_reasoning_tokens": 512
+    "max_point_reasoning_tokens": 512,
+        "vision_lora": {
+      "enabled": true,
+      "r": 16,
+      "alpha": 32,
+      "dropout": 0.05
+    },
+    "point_lora": {
+      "enabled": true,
+      "r": 8,
+      "alpha": 16,
+      "dropout": 0.05
+    }
   },
   "optimizer": {
-    "lr": 1e-4,
+    "lr": 0.0001,
     "lora_lr": 2e-05,
     "weight_decay": 0.01,
     "scheduler": "cosine",
     "warmup_ratio": 0.03,
-    "max_grad_norm": 1.0
+    "max_grad_norm": 1.0,
+    "llm_lora_lr": 2e-05,
+    "vision_lora_lr": 2e-05,
+    "point_lora_lr": 1e-05,
+    "main_weight_decay": 0.01,
+    "llm_lora_weight_decay": 0.01,
+    "vision_lora_weight_decay": 0.01,
+    "point_lora_weight_decay": 0.01
   },
   "training": {
     "grad_accum": 1,
@@ -51,7 +70,7 @@
   "datasets": {
     "SECOND": {
       "root": "/home/sht/Datasets/SECONDpair",
-      "per_gpu_batch_size": 8,
+      "per_gpu_batch_size": 4,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",
@@ -65,7 +84,7 @@
     },
     "LEVIR-CD": {
       "root": "/home/sht/Datasets/LEVIR-CDpair",
-      "per_gpu_batch_size": 8,
+      "per_gpu_batch_size": 4,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",
@@ -74,7 +93,7 @@
     },
     "LandsatSCD": {
       "root": "/home/sht/Datasets/LandsatSCDpair",
-      "per_gpu_batch_size": 8,
+      "per_gpu_batch_size": 4,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",

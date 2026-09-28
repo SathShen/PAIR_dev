@@ -54,7 +54,14 @@ from datasets.config_loader import ExperimentConfig, load_experiment_config
 from datasets.multi_dataset import DatasetRegistry, MultiDatasetScheduler
 from loss import PAIRSemanticChangeLoss
 from metrics import PAIRMetrics
-from models.lora import lora_parameter_count, lora_state_dict, load_lora_state_dict
+from models.lora import (
+    custom_lora_parameter_count,
+    custom_lora_state_dict,
+    load_custom_lora_state_dict,
+    lora_parameter_count,
+    lora_state_dict,
+    load_lora_state_dict,
+)
 from models.pair import PAIRModel
 
 
@@ -88,8 +95,15 @@ def build_settings(experiment: ExperimentConfig, cli):
 
     return SimpleNamespace(
         lr=float(o.get("lr", 1e-4)),
-        lora_lr=float(o.get("lora_lr", 2e-5)),
+        lora_lr=float(o.get("lora_lr", 2e-5)),  # legacy alias for LLM LoRA
+        llm_lora_lr=float(o.get("llm_lora_lr", o.get("lora_lr", 2e-5))),
+        vision_lora_lr=float(o.get("vision_lora_lr", 2e-5)),
+        point_lora_lr=float(o.get("point_lora_lr", 1e-5)),
         weight_decay=float(o.get("weight_decay", 0.01)),
+        main_weight_decay=float(o.get("main_weight_decay", o.get("weight_decay", 0.01))),
+        llm_lora_weight_decay=float(o.get("llm_lora_weight_decay", o.get("weight_decay", 0.01))),
+        vision_lora_weight_decay=float(o.get("vision_lora_weight_decay", o.get("weight_decay", 0.01))),
+        point_lora_weight_decay=float(o.get("point_lora_weight_decay", o.get("weight_decay", 0.01))),
         scheduler=str(o.get("scheduler", "cosine")),
         warmup_ratio=float(o.get("warmup_ratio", 0.03)),
         max_grad_norm=float(o.get("max_grad_norm", 1.0)),
@@ -354,24 +368,141 @@ def validate(model, criterion, loader, spec, runtime, settings):
 # Optimizer / scheduler
 # =============================================================================
 
+def _optimizer_group_name(parameter_name: str) -> str:
+    name = parameter_name.lower()
+
+    if "pair_lora_" in name:
+        if "qwen_backbone" in name and "visual" in name:
+            return "vision_lora"
+        if "point_encoder" in name:
+            return "point_lora"
+        raise RuntimeError(
+            "Custom PAIR LoRA parameter could not be assigned to a backbone group: "
+            f"{parameter_name}"
+        )
+
+    # PEFT Qwen LLM adapters.  Custom adapters are handled above.
+    if "lora_" in name:
+        return "llm_lora"
+
+    return "main"
+
+
 def build_optimizer(model, settings):
-    main, lora = [], []
+    named_groups = {
+        "main": [],
+        "llm_lora": [],
+        "vision_lora": [],
+        "point_lora": [],
+    }
+
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if "lora_" in name:
-            lora.append(parameter)
-        else:
-            main.append(parameter)
+        group_name = _optimizer_group_name(name)
+        named_groups[group_name].append((name, parameter))
+
+    group_hparams = {
+        "main": (settings.lr, settings.main_weight_decay),
+        "llm_lora": (settings.llm_lora_lr, settings.llm_lora_weight_decay),
+        "vision_lora": (settings.vision_lora_lr, settings.vision_lora_weight_decay),
+        "point_lora": (settings.point_lora_lr, settings.point_lora_weight_decay),
+    }
+
     groups = []
-    if main:
-        groups.append({"params": main, "lr": settings.lr, "name": "pair"})
-    if lora:
-        groups.append({"params": lora, "lr": settings.lora_lr, "name": "lora"})
+    group_params = {}
+    for group_name in ("main", "llm_lora", "vision_lora", "point_lora"):
+        entries = named_groups[group_name]
+        if not entries:
+            continue
+        params = [parameter for _, parameter in entries]
+        lr, wd = group_hparams[group_name]
+        groups.append(
+            {
+                "params": params,
+                "lr": float(lr),
+                "weight_decay": float(wd),
+                "name": group_name,
+            }
+        )
+        group_params[group_name] = params
+
     if not groups:
         raise RuntimeError("PAIR has no trainable parameters")
+
+    # WD is explicit per group above; the optimizer-level default is only a
+    # fallback and does not silently override group-specific values.
     optimizer = torch.optim.AdamW(groups, weight_decay=settings.weight_decay)
-    return optimizer, main, lora
+    return optimizer, group_params, named_groups
+
+
+
+def optimizer_group_snapshot(optimizer):
+    return {
+        group.get("name", str(index)): {
+            "lr": float(group["lr"]),
+            "base_lr": float(group.get("initial_lr", group["lr"])),
+            "weight_decay": float(group.get("weight_decay", 0.0)),
+            "params": sum(p.numel() for p in group["params"]),
+            "tensors": len(group["params"]),
+        }
+        for index, group in enumerate(optimizer.param_groups)
+    }
+
+
+def print_trainable_parameter_report(model, optimizer):
+    """Print every trainable parameter plus exact optimizer LR/WD assignment."""
+    group_by_id = {}
+    for index, group in enumerate(optimizer.param_groups):
+        group_name = group.get("name", str(index))
+        for parameter in group["params"]:
+            pid = id(parameter)
+            if pid in group_by_id:
+                raise RuntimeError("A trainable parameter appears in multiple optimizer groups")
+            group_by_id[pid] = group_name
+
+    snapshots = optimizer_group_snapshot(optimizer)
+    print("=" * 112)
+    print("TRAINABLE OPTIMIZER GROUPS")
+    print("=" * 112)
+    print(
+        f"{'group':<20} {'parameters':>16} {'tensors':>10} "
+        f"{'base_lr':>14} {'current_lr':>14} {'weight_decay':>16}"
+    )
+    print("-" * 112)
+    for group_name in ("main", "llm_lora", "vision_lora", "point_lora"):
+        if group_name not in snapshots:
+            continue
+        info = snapshots[group_name]
+        print(
+            f"{group_name:<20} {info['params']:>16,d} {info['tensors']:>10,d} "
+            f"{info['base_lr']:>14.8e} {info['lr']:>14.8e} "
+            f"{info['weight_decay']:>16.8e}"
+        )
+    print("-" * 112)
+    print(f"{'TOTAL':<20} {sum(x['params'] for x in snapshots.values()):>16,d}")
+    print()
+
+    print("=" * 112)
+    print("ALL TRAINABLE PARAMETERS")
+    print("=" * 112)
+    seen = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group_name = group_by_id.get(id(parameter))
+        if group_name is None:
+            raise RuntimeError(f"Trainable parameter is missing from optimizer: {name}")
+        shape = "x".join(str(x) for x in parameter.shape) or "scalar"
+        print(
+            f"[{group_name:<11}] {name} | shape={shape:<24} "
+            f"numel={parameter.numel():>10,d} dtype={str(parameter.dtype).replace('torch.', '')}"
+        )
+        seen += parameter.numel()
+    print("-" * 112)
+    print(f"listed trainable parameters: {seen:,}")
+    print("=" * 112)
+    print()
 
 
 def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
@@ -420,6 +551,12 @@ def save_checkpoint(
         "optimizer_step": int(optimizer_step),
         "pair_trainable": non_qwen_trainable_state(model),
         "lora": lora_state_dict(base.qwen_backbone.model),
+        "vision_lora": custom_lora_state_dict(
+            base.qwen_backbone.model, kind="vision"
+        ),
+        "point_lora": custom_lora_state_dict(
+            base.point_encoder.model, kind="utonia"
+        ),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "dataset_best_values": dict(dataset_best_values or {}),
@@ -449,6 +586,16 @@ def load_checkpoint(path, model, optimizer, scheduler):
     if "image_adapter" in ckpt:
         base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
     load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
+    load_custom_lora_state_dict(
+        base.qwen_backbone.model,
+        ckpt.get("vision_lora", {}),
+        kind="vision",
+    )
+    load_custom_lora_state_dict(
+        base.point_encoder.model,
+        ckpt.get("point_lora", {}),
+        kind="utonia",
+    )
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return (
@@ -790,7 +937,13 @@ def main():
             )
 
             base = unwrap(model)
-            lora_trainable, _ = lora_parameter_count(base.qwen_backbone.model)
+            llm_lora_trainable, _ = lora_parameter_count(base.qwen_backbone.model)
+            vision_lora_trainable, _ = custom_lora_parameter_count(
+                base.qwen_backbone.model, kind="vision"
+            )
+            point_lora_trainable, _ = custom_lora_parameter_count(
+                base.point_encoder.model, kind="utonia"
+            )
             total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print("=" * 96)
             print("PAIR MULTI-DATASET TRAINING")
@@ -798,10 +951,14 @@ def main():
             print("Experiment:", experiment.experiment["name"])
             print("Datasets:", ", ".join(experiment.selected_names))
             print("Qwen tuning:", base.qwen_tuning)
-            print("Utonia frozen parameters:", f"{base.point_encoder.parameter_count() / 1e6:.2f} M")
+            print("Vision LoRA enabled:", base.vision_lora_enabled)
+            print("Point LoRA enabled:", base.point_lora_enabled)
+            print("Utonia total parameters:", f"{base.point_encoder.parameter_count() / 1e6:.2f} M")
             print("PointAdapter trainable:", f"{base.point_adapter.trainable_parameter_count() / 1e6:.2f} M")
-            print("LoRA trainable:", f"{lora_trainable / 1e6:.2f} M")
-            print("Total trainable:", f"{total_trainable / 1e6:.2f} M")
+            print("Qwen LLM LoRA trainable:", f"{llm_lora_trainable / 1e6:.3f} M")
+            print("Qwen Vision LoRA trainable:", f"{vision_lora_trainable / 1e6:.3f} M")
+            print("Utonia LoRA trainable:", f"{point_lora_trainable / 1e6:.3f} M")
+            print("Total trainable:", f"{total_trainable / 1e6:.3f} M")
             print("GPUs:", runtime["world_size"])
             print("Gradient accumulation:", settings.grad_accum)
             print("Updates/epoch:", updates_per_epoch)
@@ -821,6 +978,7 @@ def main():
             if writer is not None:
                 print("TensorBoard:", settings.output_dir / "tensorboard")
             print()
+            print_trainable_parameter_report(model, optimizer)
 
         model.train()
         log_window_dataset_counts = Counter()
@@ -839,6 +997,15 @@ def main():
             first_update = start_update_in_epoch if epoch == start_epoch else 0
             if first_update > 0:
                 registry.consume_updates(schedule[:first_update])
+
+            if runtime["is_main"]:
+                state = optimizer_group_snapshot(optimizer)
+                group_text = " ".join(
+                    f"{name}:lr={info['lr']:.8e},wd={info['weight_decay']:.8e}"
+                    for name, info in state.items()
+                )
+                print(f"EPOCH {epoch+1:03d} OPTIMIZER | {group_text}")
+                write_log_only(log_file, f"EPOCH {epoch+1:03d} OPTIMIZER | {group_text}")
 
             for update_idx in range(first_update, updates_per_epoch):
                 update = schedule[update_idx]
@@ -878,7 +1045,9 @@ def main():
                 optimizer_step += 1
 
                 means = {key: value / accumulation_steps for key, value in update_sums.items()}
-                lrs = {group.get("name", str(i)): group["lr"] for i, group in enumerate(optimizer.param_groups)}
+                optimizer_state = optimizer_group_snapshot(optimizer)
+                lrs = {name: info["lr"] for name, info in optimizer_state.items()}
+                wds = {name: info["weight_decay"] for name, info in optimizer_state.items()}
                 elapsed = time.time() - update_start
                 samples_per_sec = update_samples * runtime["world_size"] / max(elapsed, 1e-6)
 
@@ -891,8 +1060,10 @@ def main():
                             f"update_in_epoch={update_idx+1} accu={accumulation_steps} "
                             f"{iteration_loss_string(means, spec.route)} "
                             f"grad={grad_norm:.6f} "
-                            f"lr_pair={lrs.get('pair', 0.0):.8e} "
-                            f"lr_lora={lrs.get('lora', 0.0):.8e} "
+                            f"lr_main={lrs.get('main', 0.0):.8e} wd_main={wds.get('main', 0.0):.8e} "
+                            f"lr_llm_lora={lrs.get('llm_lora', 0.0):.8e} wd_llm_lora={wds.get('llm_lora', 0.0):.8e} "
+                            f"lr_vision_lora={lrs.get('vision_lora', 0.0):.8e} wd_vision_lora={wds.get('vision_lora', 0.0):.8e} "
+                            f"lr_point_lora={lrs.get('point_lora', 0.0):.8e} wd_point_lora={wds.get('point_lora', 0.0):.8e} "
                             f"sample_per_s={samples_per_sec:.4f} "
                             f"gpu_alloc_GiB={torch.cuda.memory_allocated() / 1024**3:.4f} "
                             f"gpu_reserved_GiB={torch.cuda.memory_reserved() / 1024**3:.4f}"
@@ -919,10 +1090,26 @@ def main():
                             for name in experiment.selected_names
                             if log_window_dataset_counts[name] > 0
                         )
+                        lr_text = " ".join(
+                            f"{name}={info['lr']:.3e}/wd={info['weight_decay']:.2e}"
+                            for name, info in optimizer_state.items()
+                        )
                         print(
                             f"E{epoch+1:03d} U{optimizer_step:06d} [{mix}] | "
-                            f"{window_loss_string(window_means)}"
+                            f"{window_loss_string(window_means)} | {lr_text}"
                         )
+                        if writer is not None:
+                            for group_name, info in optimizer_state.items():
+                                writer.add_scalar(
+                                    f"train/optimizer/{group_name}_lr",
+                                    info["lr"],
+                                    optimizer_step,
+                                )
+                                writer.add_scalar(
+                                    f"train/optimizer/{group_name}_weight_decay",
+                                    info["weight_decay"],
+                                    optimizer_step,
+                                )
                         for name in experiment.selected_names:
                             count = log_window_dataset_counts[name]
                             if count <= 0:
