@@ -450,135 +450,249 @@ def optimizer_group_snapshot(optimizer):
     }
 
 
-def _trainable_module_bucket(parameter_name: str) -> str:
-    """Collapse trainable parameters into architecture-level modules for logging."""
+def _architecture_module_bucket(parameter_name: str) -> str:
+    """
+    Put every model parameter into one architecture-level row.
+
+    The rows are intentionally ordered to match the actual PAIR data flow:
+        Qwen Vision -> Utonia -> PointAdapter -> Qwen LLM
+        -> decoders -> output heads
+    """
     name = parameter_name.lower()
 
-    # LoRA groups first because they live inside the backbone module paths.
-    if "pair_lora_" in name:
-        if "qwen_backbone" in name and "visual" in name:
-            return "qwen_vision_lora"
-        if "point_encoder" in name:
-            return "utonia_lora"
-    if "lora_" in name and "qwen_backbone" in name:
-        return "qwen_llm_lora"
+    # ------------------------------------------------------------------
+    # Foundation backbones / adapters
+    # ------------------------------------------------------------------
+    if name.startswith("backbone.qwen_backbone."):
+        if ".visual." in name:
+            return "Qwen Vision"
+        return "Qwen LLM"
 
+    if name.startswith("backbone.point_encoder."):
+        return "Utonia"
+
+    if name.startswith("backbone.point_adapter."):
+        return "PointAdapter"
+
+    # ------------------------------------------------------------------
+    # Decoders
+    # ------------------------------------------------------------------
     if name.startswith("decoder.cg_decoder_2d."):
-        return "2d_cg_decoder"
+        return "2D CGDecoder"
+
+    # Output heads are separated from the decoder core below.
     if name.startswith("decoder.classifier_cd."):
-        return "2d_change_head"
+        return "2D Change Head"
+
     if name.startswith("decoder.class_encoder.") or name == "decoder.logit_scale":
-        return "semantic_prototype_head"
-    if name.startswith("point_adapter."):
-        return "point_adapter"
+        return "Semantic Prototype Head"
 
-    # Remaining trainable decoder parameters belong to the unified token route
-    # used by 3D / future 2D3D. Keep them together instead of printing every
-    # individual Linear/Norm tensor.
+    if name.startswith("decoder.event_head."):
+        return "3D Event Head"
+
+    if name.startswith("decoder.binary_change_classifier."):
+        return "Legacy Binary Head"
+
+    # Everything else under decoder is the shared/unified token decoder core:
+    # token embedding, reasoning projection/injection, temporal fusion,
+    # task conditioning, shared blocks, semantic/change latent heads.
     if name.startswith("decoder."):
-        return "unified_decoder"
+        return "Unified Decoder"
 
-    # Keep unexpected future trainable modules visible instead of silently
-    # hiding them from the report.
+    # Current PAIR V2 does not instantiate image_adapter, but keep this
+    # explicit in case an old config brings it back.
+    if name.startswith("image_adapter."):
+        return "Image Adapter"
+
     prefix = parameter_name.split(".", 1)[0]
-    return f"other:{prefix}"
+    return f"Other ({prefix})"
+
+
+def _lora_rank_from_entries(entries):
+    """Infer LoRA rank from an A matrix when possible."""
+    for name, parameter in entries:
+        lname = name.lower()
+        if "pair_lora_a" in lname or ".lora_a." in lname:
+            if parameter.ndim >= 1:
+                return int(parameter.shape[0])
+    return None
+
+
+def _format_state(total_params, trainable_params, has_lora):
+    frozen_params = total_params - trainable_params
+    if trainable_params == 0:
+        return "frozen"
+    if frozen_params == 0:
+        return "trainable"
+    if has_lora:
+        return "base frozen + LoRA"
+    return "partially trainable"
 
 
 def print_trainable_parameter_report(model, optimizer):
     """
-    Compact architecture-level trainable report.
+    One consolidated architecture table.
 
-    Intentionally does NOT print every LoRA A/B tensor.  The purpose of this
-    startup report is to answer:
-        - which large modules are trainable,
-        - how many trainable parameters each has,
-        - which optimizer group / LR / WD they use.
+    For every large PAIR module it shows:
+      - whether LoRA is present,
+      - frozen/trainable state,
+      - total/trainable/frozen parameter counts,
+      - optimizer group,
+      - configured/base LR.
+
+    No individual tensor names are printed.
     """
+    base_model = unwrap(model)
+
+    # Optimizer ownership and hyperparameters.
     group_by_id = {}
     group_hparams = {}
     for index, group in enumerate(optimizer.param_groups):
         group_name = group.get("name", str(index))
         group_hparams[group_name] = {
-            "lr": float(group["lr"]),
+            # HuggingFace schedulers preserve the optimizer's original LR in
+            # initial_lr.  During warmup current lr can legitimately be 0.
+            "base_lr": float(group.get("initial_lr", group["lr"])),
+            "current_lr": float(group["lr"]),
             "weight_decay": float(group.get("weight_decay", 0.0)),
         }
         for parameter in group["params"]:
             pid = id(parameter)
             if pid in group_by_id:
-                raise RuntimeError("A trainable parameter appears in multiple optimizer groups")
+                raise RuntimeError(
+                    "A trainable parameter appears in multiple optimizer groups"
+                )
             group_by_id[pid] = group_name
 
+    # Exclusive architecture buckets over ALL parameters, not only trainable
+    # ones, so total/frozen counts are meaningful.
     modules = {}
-    seen = 0
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
+    total_model_params = 0
+    total_trainable_params = 0
 
-        optimizer_group = group_by_id.get(id(parameter))
-        if optimizer_group is None:
-            raise RuntimeError(f"Trainable parameter is missing from optimizer: {name}")
-
-        module_name = _trainable_module_bucket(name)
+    for name, parameter in base_model.named_parameters():
+        module_name = _architecture_module_bucket(name)
         info = modules.setdefault(
             module_name,
             {
-                "params": 0,
-                "optimizer_groups": set(),
+                "total": 0,
+                "trainable": 0,
+                "entries": [],
+                "trainable_groups": set(),
+                "has_lora": False,
             },
         )
-        info["params"] += parameter.numel()
-        info["optimizer_groups"].add(optimizer_group)
-        seen += parameter.numel()
+
+        numel = parameter.numel()
+        info["total"] += numel
+        info["entries"].append((name, parameter))
+        total_model_params += numel
+
+        lname = name.lower()
+        if "pair_lora_" in lname or (
+            "lora_" in lname and "pair_lora_" not in lname
+        ):
+            info["has_lora"] = True
+
+        if parameter.requires_grad:
+            info["trainable"] += numel
+            total_trainable_params += numel
+
+            group_name = group_by_id.get(id(parameter))
+            if group_name is None:
+                raise RuntimeError(
+                    f"Trainable parameter is missing from optimizer: {name}"
+                )
+            info["trainable_groups"].add(group_name)
 
     preferred_order = (
-        "2d_cg_decoder",
-        "2d_change_head",
-        "semantic_prototype_head",
-        "unified_decoder",
-        "point_adapter",
-        "qwen_llm_lora",
-        "qwen_vision_lora",
-        "utonia_lora",
+        "Qwen Vision",
+        "Utonia",
+        "PointAdapter",
+        "Qwen LLM",
+        "2D CGDecoder",
+        "Unified Decoder",
+        "Semantic Prototype Head",
+        "2D Change Head",
+        "3D Event Head",
+        "Legacy Binary Head",
+        "Image Adapter",
     )
     ordered_names = [name for name in preferred_order if name in modules]
-    ordered_names += sorted(name for name in modules if name not in preferred_order)
-
-    print("=" * 104)
-    print("TRAINABLE MODULE SUMMARY")
-    print("=" * 104)
-    print(
-        f"{'module':<28} {'trainable params':>18} {'optimizer group':>18} "
-        f"{'lr':>14} {'weight_decay':>16}"
+    ordered_names += sorted(
+        name for name in modules
+        if name not in preferred_order
     )
-    print("-" * 104)
+
+    width = 136
+    print("=" * width)
+    print("PAIR MODEL / TRAINING PARAMETER SUMMARY")
+    print("=" * width)
+    print(
+        f"{'module':<26}"
+        f"{'tuning':<14}"
+        f"{'state':<20}"
+        f"{'total(M)':>11}"
+        f"{'train(M)':>11}"
+        f"{'frozen(M)':>12}"
+        f"{'optimizer':>16}"
+        f"{'base_lr':>14}"
+    )
+    print("-" * width)
 
     for module_name in ordered_names:
         info = modules[module_name]
-        groups = sorted(info["optimizer_groups"])
+        total_params = int(info["total"])
+        trainable_params = int(info["trainable"])
+        frozen_params = total_params - trainable_params
 
-        # A module should normally live in one optimizer group. If a future
-        # change splits one module across groups, show every group explicitly
-        # rather than hiding the mismatch.
-        if len(groups) == 1:
-            group_name = groups[0]
-            hp = group_hparams[group_name]
-            lr_text = f"{hp['lr']:.8e}"
-            wd_text = f"{hp['weight_decay']:.8e}"
+        rank = _lora_rank_from_entries(info["entries"])
+        if info["has_lora"]:
+            tuning = f"LoRA(r={rank})" if rank is not None else "LoRA"
         else:
-            group_name = ",".join(groups)
-            lr_text = "mixed"
-            wd_text = "mixed"
+            tuning = "-"
 
-        print(
-            f"{module_name:<28} {info['params'] / 1e6:>15.3f} M "
-            f"{group_name:>18} {lr_text:>14} {wd_text:>16}"
+        state = _format_state(
+            total_params,
+            trainable_params,
+            info["has_lora"],
         )
 
-    print("-" * 104)
-    print(f"{'TOTAL':<28} {seen / 1e6:>15.3f} M")
-    print("=" * 104)
-    print()
+        groups = sorted(info["trainable_groups"])
+        if not groups:
+            optimizer_name = "-"
+            base_lr_text = "-"
+        elif len(groups) == 1:
+            optimizer_name = groups[0]
+            hp = group_hparams[optimizer_name]
+            base_lr_text = f"{hp['base_lr']:.3e}"
+        else:
+            optimizer_name = ",".join(groups)
+            base_lr_text = "mixed"
 
+        print(
+            f"{module_name:<26}"
+            f"{tuning:<14}"
+            f"{state:<20}"
+            f"{total_params / 1e6:>11.3f}"
+            f"{trainable_params / 1e6:>11.3f}"
+            f"{frozen_params / 1e6:>12.3f}"
+            f"{optimizer_name:>16}"
+            f"{base_lr_text:>14}"
+        )
+
+    print("-" * width)
+    total_frozen_params = total_model_params - total_trainable_params
+    print(
+        f"{'TOTAL':<26}"
+        f"{'-':<14}"
+        f"{'':<20}"
+        f"{total_model_params / 1e6:>11.3f}"
+        f"{total_trainable_params / 1e6:>11.3f}"
+        f"{total_frozen_params / 1e6:>12.3f}"
+    )
+    print("=" * width)
+    print()
 
 def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
     warmup = int(round(total_updates * warmup_ratio))
@@ -1012,28 +1126,13 @@ def main():
             )
 
             base = unwrap(model)
-            llm_lora_trainable, _ = lora_parameter_count(base.qwen_backbone.model)
-            vision_lora_trainable, _ = custom_lora_parameter_count(
-                base.qwen_backbone.model, kind="vision"
-            )
-            point_lora_trainable, _ = custom_lora_parameter_count(
-                base.point_encoder.model, kind="utonia"
-            )
-            total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print("=" * 96)
             print("PAIR MULTI-DATASET TRAINING")
             print("=" * 96)
             print("Experiment:", experiment.experiment["name"])
             print("Datasets:", ", ".join(experiment.selected_names))
-            print("Qwen tuning:", base.qwen_tuning)
-            print("Vision LoRA enabled:", base.vision_lora_enabled)
-            print("Point LoRA enabled:", base.point_lora_enabled)
-            print("Utonia total parameters:", f"{base.point_encoder.parameter_count() / 1e6:.2f} M")
-            print("PointAdapter trainable:", f"{base.point_adapter.trainable_parameter_count() / 1e6:.2f} M")
-            print("Qwen LLM LoRA trainable:", f"{llm_lora_trainable / 1e6:.3f} M")
-            print("Qwen Vision LoRA trainable:", f"{vision_lora_trainable / 1e6:.3f} M")
-            print("Utonia LoRA trainable:", f"{point_lora_trainable / 1e6:.3f} M")
-            print("Total trainable:", f"{total_trainable / 1e6:.3f} M")
+            print()
+            print_trainable_parameter_report(model, optimizer)
             print("GPUs:", runtime["world_size"])
             print("Gradient accumulation:", settings.grad_accum)
             print("Updates/epoch:", updates_per_epoch)
@@ -1053,7 +1152,6 @@ def main():
             if writer is not None:
                 print("TensorBoard:", settings.output_dir / "tensorboard")
             print()
-            print_trainable_parameter_report(model, optimizer)
 
         model.train()
         log_window_dataset_counts = Counter()
