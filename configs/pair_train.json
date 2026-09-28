@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_AUG",
+    "name": "PAIR_SECOND_allLoRA",
     "seed": 42,
     "epochs": 50
   },

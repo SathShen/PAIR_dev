@@ -450,58 +450,133 @@ def optimizer_group_snapshot(optimizer):
     }
 
 
+def _trainable_module_bucket(parameter_name: str) -> str:
+    """Collapse trainable parameters into architecture-level modules for logging."""
+    name = parameter_name.lower()
+
+    # LoRA groups first because they live inside the backbone module paths.
+    if "pair_lora_" in name:
+        if "qwen_backbone" in name and "visual" in name:
+            return "qwen_vision_lora"
+        if "point_encoder" in name:
+            return "utonia_lora"
+    if "lora_" in name and "qwen_backbone" in name:
+        return "qwen_llm_lora"
+
+    if name.startswith("decoder.cg_decoder_2d."):
+        return "2d_cg_decoder"
+    if name.startswith("decoder.classifier_cd."):
+        return "2d_change_head"
+    if name.startswith("decoder.class_encoder.") or name == "decoder.logit_scale":
+        return "semantic_prototype_head"
+    if name.startswith("point_adapter."):
+        return "point_adapter"
+
+    # Remaining trainable decoder parameters belong to the unified token route
+    # used by 3D / future 2D3D. Keep them together instead of printing every
+    # individual Linear/Norm tensor.
+    if name.startswith("decoder."):
+        return "unified_decoder"
+
+    # Keep unexpected future trainable modules visible instead of silently
+    # hiding them from the report.
+    prefix = parameter_name.split(".", 1)[0]
+    return f"other:{prefix}"
+
+
 def print_trainable_parameter_report(model, optimizer):
-    """Print every trainable parameter plus exact optimizer LR/WD assignment."""
+    """
+    Compact architecture-level trainable report.
+
+    Intentionally does NOT print every LoRA A/B tensor.  The purpose of this
+    startup report is to answer:
+        - which large modules are trainable,
+        - how many trainable parameters each has,
+        - which optimizer group / LR / WD they use.
+    """
     group_by_id = {}
+    group_hparams = {}
     for index, group in enumerate(optimizer.param_groups):
         group_name = group.get("name", str(index))
+        group_hparams[group_name] = {
+            "lr": float(group["lr"]),
+            "weight_decay": float(group.get("weight_decay", 0.0)),
+        }
         for parameter in group["params"]:
             pid = id(parameter)
             if pid in group_by_id:
                 raise RuntimeError("A trainable parameter appears in multiple optimizer groups")
             group_by_id[pid] = group_name
 
-    snapshots = optimizer_group_snapshot(optimizer)
-    print("=" * 112)
-    print("TRAINABLE OPTIMIZER GROUPS")
-    print("=" * 112)
-    print(
-        f"{'group':<20} {'parameters':>16} {'tensors':>10} "
-        f"{'base_lr':>14} {'current_lr':>14} {'weight_decay':>16}"
-    )
-    print("-" * 112)
-    for group_name in ("main", "llm_lora", "vision_lora", "point_lora"):
-        if group_name not in snapshots:
-            continue
-        info = snapshots[group_name]
-        print(
-            f"{group_name:<20} {info['params']:>16,d} {info['tensors']:>10,d} "
-            f"{info['base_lr']:>14.8e} {info['lr']:>14.8e} "
-            f"{info['weight_decay']:>16.8e}"
-        )
-    print("-" * 112)
-    print(f"{'TOTAL':<20} {sum(x['params'] for x in snapshots.values()):>16,d}")
-    print()
-
-    print("=" * 112)
-    print("ALL TRAINABLE PARAMETERS")
-    print("=" * 112)
+    modules = {}
     seen = 0
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        group_name = group_by_id.get(id(parameter))
-        if group_name is None:
+
+        optimizer_group = group_by_id.get(id(parameter))
+        if optimizer_group is None:
             raise RuntimeError(f"Trainable parameter is missing from optimizer: {name}")
-        shape = "x".join(str(x) for x in parameter.shape) or "scalar"
-        print(
-            f"[{group_name:<11}] {name} | shape={shape:<24} "
-            f"numel={parameter.numel():>10,d} dtype={str(parameter.dtype).replace('torch.', '')}"
+
+        module_name = _trainable_module_bucket(name)
+        info = modules.setdefault(
+            module_name,
+            {
+                "params": 0,
+                "optimizer_groups": set(),
+            },
         )
+        info["params"] += parameter.numel()
+        info["optimizer_groups"].add(optimizer_group)
         seen += parameter.numel()
-    print("-" * 112)
-    print(f"listed trainable parameters: {seen:,}")
-    print("=" * 112)
+
+    preferred_order = (
+        "2d_cg_decoder",
+        "2d_change_head",
+        "semantic_prototype_head",
+        "unified_decoder",
+        "point_adapter",
+        "qwen_llm_lora",
+        "qwen_vision_lora",
+        "utonia_lora",
+    )
+    ordered_names = [name for name in preferred_order if name in modules]
+    ordered_names += sorted(name for name in modules if name not in preferred_order)
+
+    print("=" * 104)
+    print("TRAINABLE MODULE SUMMARY")
+    print("=" * 104)
+    print(
+        f"{'module':<28} {'trainable params':>18} {'optimizer group':>18} "
+        f"{'lr':>14} {'weight_decay':>16}"
+    )
+    print("-" * 104)
+
+    for module_name in ordered_names:
+        info = modules[module_name]
+        groups = sorted(info["optimizer_groups"])
+
+        # A module should normally live in one optimizer group. If a future
+        # change splits one module across groups, show every group explicitly
+        # rather than hiding the mismatch.
+        if len(groups) == 1:
+            group_name = groups[0]
+            hp = group_hparams[group_name]
+            lr_text = f"{hp['lr']:.8e}"
+            wd_text = f"{hp['weight_decay']:.8e}"
+        else:
+            group_name = ",".join(groups)
+            lr_text = "mixed"
+            wd_text = "mixed"
+
+        print(
+            f"{module_name:<28} {info['params'] / 1e6:>15.3f} M "
+            f"{group_name:>18} {lr_text:>14} {wd_text:>16}"
+        )
+
+    print("-" * 104)
+    print(f"{'TOTAL':<28} {seen / 1e6:>15.3f} M")
+    print("=" * 104)
     print()
 
 
