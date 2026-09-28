@@ -8,9 +8,11 @@ Supports true vectorized 2D batching:
 
 The wrapper also keeps the single-sample API backward compatible.
 
-PAIR V2 additionally exposes Qwen vision features before spatial merging from
-ViT layers 5 / 11 / 17.  The normal Qwen forward path is left untouched: the
-features are captured with forward hooks while the native vision encoder runs.
+PAIR V2 additionally exposes the three Qwen DeepStack vision features before
+spatial merging.  Their exact block indices are checkpoint-specific (for
+example 4B and 8B use different depths) and are validated against the loaded
+checkpoint config.  The normal Qwen forward path is left untouched: features
+are captured with forward hooks while the native vision encoder runs.
 
 For point tokens the input-normalization/mask API is batch-aware, but true
 batched 3D still depends on PointAdapter producing per-sample token sets.
@@ -34,7 +36,8 @@ class Qwen3VLBackbone(nn.Module):
                  device: Union[str, torch.device] = "cuda",
                  device_map: Optional[Union[str, Dict[str, Any]]] = "cuda",
                  local_files_only: bool = True,
-                 point_token: str = "<POINT>", task_token: str = "<TASK>"):
+                 point_token: str = "<POINT>", task_token: str = "<TASK>",
+                 vision_intermediate_layers: Optional[Sequence[int]] = None):
         super().__init__()
         self.model_dir = model_dir
         self.dtype = dtype
@@ -73,18 +76,36 @@ class Qwen3VLBackbone(nn.Module):
         self.vision_patch_size = int(vision_config.patch_size)
         self.vision_spatial_merge_size = int(vision_config.spatial_merge_size)
 
-        # PAIR V2 uses the three native Qwen DeepStack depths before Qwen's
-        # spatial merger.  For the current Qwen3-VL-4B checkpoint these are
-        # exactly layers 5, 11 and 17 (zero-based block indices).
-        self.vision_intermediate_layers = (5, 11, 17)
+        # PAIR V2 uses the checkpoint's three native Qwen DeepStack depths
+        # before the spatial merger.  The compact PAIR config may provide the
+        # expected preset values; we validate them against the actual checkpoint
+        # so a mismatched 4B/8B path cannot silently run with the wrong hooks.
         configured_deepstack = tuple(
             int(x) for x in getattr(vision_config, "deepstack_visual_indexes", ())
         )
-        if configured_deepstack and configured_deepstack != self.vision_intermediate_layers:
+        if len(configured_deepstack) != 3:
             raise RuntimeError(
-                "PAIR V2 expects Qwen deepstack_visual_indexes=(5, 11, 17), "
+                "PAIR V2 requires exactly three Qwen deepstack_visual_indexes, "
                 f"but this checkpoint reports {configured_deepstack}"
             )
+
+        if vision_intermediate_layers is None:
+            requested_deepstack = configured_deepstack
+        else:
+            requested_deepstack = tuple(int(x) for x in vision_intermediate_layers)
+            if len(requested_deepstack) != 3:
+                raise ValueError(
+                    "vision_intermediate_layers must contain exactly three block "
+                    f"indices, got {requested_deepstack}"
+                )
+            if requested_deepstack != configured_deepstack:
+                raise RuntimeError(
+                    "PAIR Qwen preset/checkpoint mismatch: config requests "
+                    f"DeepStack layers {requested_deepstack}, but checkpoint "
+                    f"reports {configured_deepstack}."
+                )
+
+        self.vision_intermediate_layers = requested_deepstack
 
         self._vision_intermediate_cache: Dict[int, torch.Tensor] = {}
         self._vision_hook_handles = []

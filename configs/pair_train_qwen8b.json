@@ -1,11 +1,12 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_allLoRA",
+    "name": "PAIR_SECOND_8B_allLoRA",
     "seed": 42,
     "epochs": 50
   },
   "model": {
-    "qwen_model": "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct",
+    "qwen_variant": "8b",
+    "qwen_model": "/data2/sht/checkpoints/Qwen/Qwen3-VL-8B-Instruct",
     "qwen_tuning": "lora",
     "decoder_dim": 256,
     "lora": {
@@ -24,7 +25,7 @@
       "voxel_size": 0.5
     },
     "max_point_reasoning_tokens": 512,
-        "vision_lora": {
+    "vision_lora": {
       "enabled": true,
       "r": 16,
       "alpha": 32,

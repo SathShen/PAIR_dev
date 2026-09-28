@@ -40,6 +40,71 @@ POINT_DIRS = ("points_t1", "points_t2")
 SEMANTIC_DIRS = ("semantic_t1", "semantic_t2")
 
 
+QWEN_VARIANTS = {
+    "4b": {
+        "vision_intermediate_layers": (5, 11, 17),
+    },
+    "8b": {
+        "vision_intermediate_layers": (8, 16, 24),
+    },
+}
+
+
+def _resolve_qwen_config(model: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve the compact Qwen selector while keeping the checkpoint path explicit.
+
+    Every config must provide both:
+
+        "qwen_variant": "4b" | "8b"
+        "qwen_model": "/path/to/Qwen3-VL-...-Instruct"
+
+    qwen_variant only selects PAIR's version-specific structural protocol
+    (currently the three DeepStack visual feature layers).
+
+    qwen_model is always the user-supplied checkpoint path.  PAIR never assumes
+    where the checkpoint is stored.
+
+    Hidden sizes, vision widths/depths and other architecture values are still
+    read from the actual Hugging Face checkpoint at runtime.
+    """
+    model = dict(model)
+
+    if "qwen_variant" not in model:
+        raise KeyError(
+            "model.qwen_variant is required (expected '4b' or '8b')."
+        )
+    if "qwen_model" not in model:
+        raise KeyError(
+            "model.qwen_model is required and must explicitly point to the "
+            "local Qwen checkpoint directory."
+        )
+
+    variant = str(model["qwen_variant"]).strip().lower()
+    if variant not in QWEN_VARIANTS:
+        raise ValueError(
+            f"model.qwen_variant must be one of {tuple(QWEN_VARIANTS)}, "
+            f"got {variant!r}"
+        )
+
+    qwen_model = str(model["qwen_model"]).strip()
+    if not qwen_model:
+        raise ValueError("model.qwen_model must not be empty")
+
+    if "vision_intermediate_layers" in model:
+        raise KeyError(
+            "Do not set model.vision_intermediate_layers manually. "
+            "PAIR derives it from model.qwen_variant and verifies it against "
+            "the loaded checkpoint."
+        )
+
+    model["qwen_variant"] = variant
+    model["qwen_model"] = qwen_model
+    model["vision_intermediate_layers"] = list(
+        QWEN_VARIANTS[variant]["vision_intermediate_layers"]
+    )
+    return model
+
+
 def _require_dict(value, name):
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be a JSON object")
@@ -320,6 +385,10 @@ def load_experiment_config(
         if section not in raw:
             raise KeyError(f"Missing top-level config section: {section}")
         _require_dict(raw[section], section)
+
+    # Expand the compact Qwen selector before any model construction or
+    # resolved-config hashing.  The user-facing config only needs 4b/8b.
+    raw["model"] = _resolve_qwen_config(raw["model"])
 
     catalog = raw["datasets"]
     if not catalog:

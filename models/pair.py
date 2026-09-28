@@ -8,13 +8,10 @@ Unified temporal model for:
 
 PAIR V2 2D route
 ----------------
-Qwen3-VL provides three pre-merge ViT feature maps plus its final LLM image
-reasoning map.  For a 512x512 input:
-
-    ViT layer 5   : 32x32 -> 128x128   (1/4)
-    ViT layer 11  : 32x32 ->  64x64    (1/8)
-    ViT layer 17  : 32x32 ->  32x32    (1/16)
-    LLM reasoning :             16x16   (1/32)
+Qwen3-VL provides three checkpoint-specific pre-merge DeepStack ViT feature
+maps plus its final LLM image reasoning map.  For a 512x512 input, the three
+pre-merge maps share the native 32x32 ViT grid and are converted to 1/4, 1/8
+and 1/16 pseudo-pyramid scales; the merged LLM reasoning map is 16x16 (1/32).
 
 The four scales are sent directly to the shared CascadeGatedDecoder.  SCD and
 BCD use the same x0/x1/xc decoder; only the final prediction route differs.
@@ -623,7 +620,7 @@ class PAIRBackbone(nn.Module):
             return_dense_features and task_mode in ("2d", "2d3d")
         )
         if capture_vision_intermediate:
-            # Avoid ever reusing stale layer-5/11/17 features from a previous
+            # Avoid ever reusing stale configured DeepStack features from a previous
             # image batch.  The Qwen wrapper's permanent hooks refill this
             # cache during the native vision forward below.
             self.qwen_backbone.clear_vision_intermediate_cache()
@@ -1063,42 +1060,52 @@ def build_qwen_2d_pyramid(
     *,
     premerge_by_layer,
     llm_image_hidden_2d_list,
-    layer_indices=(5, 11, 17),
+    layer_indices,
     name="image",
 ):
     """
     Build the PAIR V2 pseudo-pyramid in shallow->deep order:
         [1/4, 1/8, 1/16, 1/32].
 
-    Qwen layer 5/11/17 maps are all native pre-merge ViT resolution.  We only
-    resample the first two maps; the LLM map is kept at its true merged-token
-    resolution and must already be exactly half the native ViT resolution.
+    The three configured Qwen DeepStack maps are all native pre-merge ViT
+    resolution.  We resample the first two maps; the third stays at native
+    resolution, while the LLM map keeps its true merged-token resolution and
+    must already be exactly half the native ViT resolution.
     """
     if not isinstance(premerge_by_layer, dict):
         raise TypeError(f"{name} premerge features must be a dict keyed by layer index")
 
-    l5, l11, l17 = [int(x) for x in layer_indices]
-    missing = [idx for idx in (l5, l11, l17) if idx not in premerge_by_layer]
+    layers = tuple(int(x) for x in layer_indices)
+    if len(layers) != 3:
+        raise ValueError(
+            f"{name} layer_indices must contain exactly three entries, got {layers}"
+        )
+    shallow_idx, middle_idx, deep_idx = layers
+    missing = [idx for idx in layers if idx not in premerge_by_layer]
     if missing:
         raise RuntimeError(f"{name} is missing Qwen pre-merge layers {missing}")
 
-    f5 = premerge_by_layer[l5]
-    f11 = premerge_by_layer[l11]
-    f17 = premerge_by_layer[l17]
-    for idx, feat in ((l5, f5), (l11, f11), (l17, f17)):
+    shallow = premerge_by_layer[shallow_idx]
+    middle = premerge_by_layer[middle_idx]
+    deep = premerge_by_layer[deep_idx]
+    for idx, feat in (
+        (shallow_idx, shallow),
+        (middle_idx, middle),
+        (deep_idx, deep),
+    ):
         if not torch.is_tensor(feat) or feat.ndim != 4:
             raise ValueError(
                 f"{name} layer {idx} must be [B,C,H,W], got "
                 f"{getattr(feat, 'shape', None)}"
             )
 
-    if f5.shape != f11.shape or f5.shape != f17.shape:
+    if shallow.shape != middle.shape or shallow.shape != deep.shape:
         raise RuntimeError(
             f"{name} Qwen pre-merge layers must share one native grid, got "
-            f"{tuple(f5.shape)}, {tuple(f11.shape)}, {tuple(f17.shape)}"
+            f"{tuple(shallow.shape)}, {tuple(middle.shape)}, {tuple(deep.shape)}"
         )
 
-    native_h, native_w = [int(v) for v in f17.shape[-2:]]
+    native_h, native_w = [int(v) for v in deep.shape[-2:]]
     if native_h % 2 or native_w % 2:
         raise RuntimeError(
             f"{name} native ViT grid {(native_h, native_w)} must be divisible by 2"
@@ -1108,9 +1115,9 @@ def build_qwen_2d_pyramid(
         llm_image_hidden_2d_list,
         name=f"{name}_llm_hidden",
     )
-    if llm.shape[0] != f17.shape[0]:
+    if llm.shape[0] != deep.shape[0]:
         raise RuntimeError(
-            f"{name} pre-merge/LLM batch mismatch: {f17.shape[0]} vs {llm.shape[0]}"
+            f"{name} pre-merge/LLM batch mismatch: {deep.shape[0]} vs {llm.shape[0]}"
         )
     expected_llm_hw = (native_h // 2, native_w // 2)
     if tuple(llm.shape[-2:]) != expected_llm_hw:
@@ -1122,18 +1129,18 @@ def build_qwen_2d_pyramid(
     # Match PerASCD's plain-ViT pseudo-pyramid construction.  There is no
     # learnable V1 upsampler here: CG-Decoder owns the coarse-to-fine decoding.
     p4 = F.interpolate(
-        f5,
+        shallow,
         size=(native_h * 4, native_w * 4),
         mode="bilinear",
         align_corners=False,
     )
     p8 = F.interpolate(
-        f11,
+        middle,
         size=(native_h * 2, native_w * 2),
         mode="bilinear",
         align_corners=False,
     )
-    p16 = f17
+    p16 = deep
     p32 = llm
     return [p4, p8, p16, p32]
 
@@ -1481,6 +1488,7 @@ class PAIRModel(nn.Module):
             device=device_str,
             device_map=device_str,
             local_files_only=True,
+            vision_intermediate_layers=cfg.get("vision_intermediate_layers"),
         )
 
         qwen_tuning = str(cfg.get("qwen_tuning", "lora")).lower()
@@ -1634,8 +1642,8 @@ class PAIRModel(nn.Module):
             images_t2=images_t2,
             return_logits=False,
             return_hidden_states=True,
-            # This flag now requests both the existing merged visual features
-            # and the new pre-merge layer-5/11/17 maps captured by Qwen hooks.
+            # This flag requests both the existing merged visual features
+            # and the three configured pre-merge DeepStack maps captured by hooks.
             return_dense_features=True,
             use_cache=False,
         )
@@ -1653,7 +1661,7 @@ class PAIRModel(nn.Module):
         llm_t1 = out.aux.get("image_hidden_2d_t1_list")
         llm_t2 = out.aux.get("image_hidden_2d_t2_list")
         if premerge_t1 is None or premerge_t2 is None:
-            raise RuntimeError("PAIR did not expose Qwen pre-merge layer 5/11/17 features")
+            raise RuntimeError("PAIR did not expose the configured Qwen pre-merge features")
         if llm_t1 is None or llm_t2 is None:
             raise RuntimeError("PAIR did not expose Qwen LLM image reasoning maps")
 

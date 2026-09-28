@@ -1,0 +1,119 @@
+{
+  "experiment": {
+    "name": "PAIR_SECOND_4B_allLoRA",
+    "seed": 42,
+    "epochs": 50
+  },
+  "model": {
+    "qwen_variant": "4b",
+    "qwen_model": "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct",
+    "qwen_tuning": "lora",
+    "decoder_dim": 256,
+    "lora": {
+      "r": 16,
+      "alpha": 32,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj"
+      ]
+    },
+    "point_encoder": {
+      "checkpoint": "/data2/sht/checkpoints/Utonia/utonia.pth",
+      "voxel_size": 0.5
+    },
+    "max_point_reasoning_tokens": 512,
+    "vision_lora": {
+      "enabled": true,
+      "r": 16,
+      "alpha": 32,
+      "dropout": 0.05
+    },
+    "point_lora": {
+      "enabled": true,
+      "r": 8,
+      "alpha": 16,
+      "dropout": 0.05
+    }
+  },
+  "optimizer": {
+    "lr": 0.0001,
+    "lora_lr": 2e-05,
+    "weight_decay": 0.01,
+    "scheduler": "cosine",
+    "warmup_ratio": 0.03,
+    "max_grad_norm": 1.0,
+    "llm_lora_lr": 2e-05,
+    "vision_lora_lr": 2e-05,
+    "point_lora_lr": 1e-05,
+    "main_weight_decay": 0.01,
+    "llm_lora_weight_decay": 0.01,
+    "vision_lora_weight_decay": 0.01,
+    "point_lora_weight_decay": 0.01
+  },
+  "training": {
+    "grad_accum": 1,
+    "num_workers": 4
+  },
+  "validation": {
+    "every_epochs": 1,
+    "max_samples": 0,
+    "change_threshold": 0.5
+  },
+  "logging": {
+    "log_every": 20,
+    "save_every_epochs": 1,
+    "tensorboard": true,
+    "output_dir": "outputs/"
+  },
+  "datasets": {
+    "SECOND": {
+      "root": "/home/sht/Datasets/SECONDpair",
+      "per_gpu_batch_size": 4,
+      "ignored_id": null,
+      "class_names": {
+        "0": "unchanged",
+        "1": "water",
+        "2": "ground",
+        "3": "low vegetation",
+        "4": "tree",
+        "5": "building",
+        "6": "sports field"
+      }
+    },
+    "LEVIR-CD": {
+      "root": "/home/sht/Datasets/LEVIR-CDpair",
+      "per_gpu_batch_size": 4,
+      "ignored_id": null,
+      "class_names": {
+        "0": "unchanged",
+        "255": "changed"
+      }
+    },
+    "LandsatSCD": {
+      "root": "/home/sht/Datasets/LandsatSCDpair",
+      "per_gpu_batch_size": 4,
+      "ignored_id": null,
+      "class_names": {
+        "0": "unchanged",
+        "1": "farmland",
+        "2": "desert",
+        "3": "building",
+        "4": "water"
+      }
+    },
+    "NYC-SCD": {
+      "root": "/home/sht/Datasets/NYC-SCDpair",
+      "per_gpu_batch_size": 1,
+      "ignored_id": -1,
+      "class_names": {
+        "0": "ground",
+        "1": "building",
+        "2": "vegetation",
+        "3": "clutter"
+      }
+    }
+  }
+}
