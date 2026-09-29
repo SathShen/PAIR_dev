@@ -54,7 +54,7 @@
     "point_lora_weight_decay": 0.01
   },
   "training": {
-    "grad_accum": 1,
+    "grad_accum": 2,
     "num_workers": 4
   },
   "validation": {
@@ -71,7 +71,7 @@
   "datasets": {
     "SECOND": {
       "root": "/home/sht/Datasets/SECONDpair",
-      "per_gpu_batch_size": 4,
+      "per_gpu_batch_size": 2,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",
@@ -85,7 +85,7 @@
     },
     "LEVIR-CD": {
       "root": "/home/sht/Datasets/LEVIR-CDpair",
-      "per_gpu_batch_size": 4,
+      "per_gpu_batch_size": 2,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",
@@ -94,7 +94,7 @@
     },
     "LandsatSCD": {
       "root": "/home/sht/Datasets/LandsatSCDpair",
-      "per_gpu_batch_size": 4,
+      "per_gpu_batch_size": 2,
       "ignored_id": null,
       "class_names": {
         "0": "unchanged",
