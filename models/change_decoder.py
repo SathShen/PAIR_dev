@@ -990,15 +990,17 @@ class QwenClassPrototypeEncoder(nn.Module):
         return raw_ids, names
 
     @staticmethod
-    def _masked_mean(
+    def _last_valid_hidden(
         hidden: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        mask = attention_mask.to(dtype=hidden.dtype).unsqueeze(-1)
-        return (
-            (hidden * mask).sum(dim=1)
-            / mask.sum(dim=1).clamp_min(1.0)
-        )
+        mask = attention_mask.to(dtype=torch.long)
+        positions = torch.arange(
+            mask.shape[1], device=mask.device, dtype=torch.long
+        ).unsqueeze(0)
+        last_index = (positions * mask).amax(dim=1)
+        batch_index = torch.arange(hidden.shape[0], device=hidden.device)
+        return hidden[batch_index, last_index]
 
     def forward(
         self,
@@ -1008,9 +1010,15 @@ class QwenClassPrototypeEncoder(nn.Module):
         detach_qwen: bool = True,
     ):
         raw_ids, names = self.normalize_class_dict(class_names)
-        prompts = [self.prompt_template.format(name=name) for name in names]
 
         tokenizer = qwen_backbone.tokenizer
+        if tokenizer.eos_token is None:
+            raise RuntimeError("Qwen tokenizer must define an EOS token")
+        prompts = [
+            self.prompt_template.format(name=name) + tokenizer.eos_token
+            for name in names
+        ]
+
         qwen_model = qwen_backbone.model
         device = next(qwen_model.parameters()).device
         encoded = tokenizer(
@@ -1032,7 +1040,7 @@ class QwenClassPrototypeEncoder(nn.Module):
                 return_dict=True,
                 use_cache=False,
             )
-            return self._masked_mean(
+            return self._last_valid_hidden(
                 output.hidden_states[-1],
                 encoded["attention_mask"],
             )
