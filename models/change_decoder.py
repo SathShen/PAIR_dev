@@ -1041,15 +1041,23 @@ class QwenClassPrototypeEncoder(nn.Module):
             )
 
         if detach_qwen:
-            # Prototype text encoding is a read-only Qwen pass. Disable dropout
-            # for deterministic class features, then restore the caller's mode.
-            qwen_was_training = qwen_model.training
+            # Prototype text encoding is a read-only Qwen pass. Temporarily
+            # disable ordinary module dropout for deterministic class features,
+            # then restore the exact pre-existing train/eval state of every
+            # Qwen submodule.  Do not call qwen_model.train(True) here: PAIR
+            # intentionally keeps some frozen foundation-model submodules
+            # (notably the Vision base) in eval mode during training.
+            module_training_states = [
+                (module, bool(module.training))
+                for module in qwen_model.modules()
+            ]
             qwen_model.eval()
             try:
                 with torch.no_grad():
                     language_hidden = run_qwen().detach()
             finally:
-                qwen_model.train(qwen_was_training)
+                for module, was_training in module_training_states:
+                    module.training = was_training
         else:
             language_hidden = run_qwen()
 
