@@ -9,6 +9,13 @@
     "qwen_model": "/data2/sht/checkpoints/Qwen/Qwen3-VL-4B-Instruct",
     "qwen_tuning": "lora",
     "decoder_dim": 256,
+    "unified_decoder": {
+      "num_tokens": 64,
+      "num_layers": 2,
+      "num_heads": 8,
+      "mlp_ratio": 2.0,
+      "dropout": 0.0
+    },
     "lora": {
       "r": 16,
       "alpha": 32,
