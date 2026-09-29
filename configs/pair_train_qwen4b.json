@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_4B_allLoRA",
+    "name": "PAIR_SECOND_4B_gc3",
     "seed": 42,
     "epochs": 50
   },
@@ -44,7 +44,7 @@
     "weight_decay": 0.01,
     "scheduler": "cosine",
     "warmup_ratio": 0.03,
-    "max_grad_norm": 1.0,
+    "max_grad_norm": 3.0,
     "llm_lora_lr": 2e-05,
     "vision_lora_lr": 2e-05,
     "point_lora_lr": 1e-05,
