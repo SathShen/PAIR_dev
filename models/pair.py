@@ -1836,6 +1836,8 @@ class PAIRModel(nn.Module):
             raise RuntimeError("PAIR did not expose final merged Qwen-ViT dense features")
         if llm_t1 is None or llm_t2 is None:
             raise RuntimeError("PAIR did not expose Qwen LLM image reasoning maps")
+        if out.task_hidden is None:
+            raise RuntimeError("PAIR did not expose the Qwen <TASK> readout")
         if self.image_adapter is None:
             raise RuntimeError("PAIR 2D dense<-LLM fusion requires image_adapter")
 
@@ -1882,6 +1884,7 @@ class PAIRModel(nn.Module):
             dense_t2=dense_tokens_t2,
             reasoning_t1=reasoning_tokens_t1,
             reasoning_t2=reasoning_tokens_t2,
+            task_hidden=out.task_hidden,
         )
         fused_map_t1 = restore_image_token_map_2d(
             fused_t1,

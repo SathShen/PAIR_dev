@@ -1466,6 +1466,7 @@ class UnifiedChangeDecoder(nn.Module):
         dense_t2: UnifiedTokenSet,
         reasoning_t1: UnifiedTokenSet,
         reasoning_t2: UnifiedTokenSet,
+        task_hidden: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Restore PAIR's 2D dense-query / LLM-KV fusion.
 
@@ -1502,6 +1503,20 @@ class UnifiedChangeDecoder(nn.Module):
             batch_ids1=dense_t1.batch_ids,
             x2=x2,
             batch_ids2=dense_t2.batch_ids,
+        )
+
+        # <TASK> is the shared full-context readout: it appears after both
+        # temporal inputs in the causal sequence, so condition both 2D dense
+        # streams with the same complete bi-temporal task representation.
+        x1 = self.task_conditioning(
+            x=x1,
+            batch_ids=dense_t1.batch_ids,
+            task_hidden=task_hidden,
+        )
+        x2 = self.task_conditioning(
+            x=x2,
+            batch_ids=dense_t2.batch_ids,
+            task_hidden=task_hidden,
         )
         return x1, x2
 
@@ -1562,8 +1577,8 @@ class UnifiedChangeDecoder(nn.Module):
             batch_ids2=dense_t2.batch_ids,
         )
 
-        # Keep the existing 3D task conditioning after the shared global
-        # decoder. The 2D CG route does not use task_hidden yet.
+        # Shared task conditioning after the global decoder.  The 2D route
+        # applies the same module at the corresponding point before CGDecoder.
         x1 = self.task_conditioning(
             x=x1,
             batch_ids=dense_t1.batch_ids,

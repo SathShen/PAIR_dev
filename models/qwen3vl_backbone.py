@@ -69,6 +69,27 @@ class Qwen3VLBackbone(nn.Module):
             self.model.to(device)
 
         self.hidden_size = self.model.config.text_config.hidden_size
+
+        # <TASK> is a PAIR-specific readout token.  The Qwen base embedding
+        # table is frozen under LoRA/frozen tuning, so keeping the newly added
+        # row inside that table would leave <TASK> random and untrainable.
+        # Maintain one tiny standalone trainable vector and replace the frozen
+        # embedding output at <TASK> positions on every embedding forward.
+        # This adds only hidden_size parameters (2560 for 4B / 4096 for 8B).
+        with torch.no_grad():
+            task_init = (
+                self.model.get_input_embeddings()
+                .weight[self.task_token_id]
+                .detach()
+                .float()
+                .clone()
+            )
+        self.task_token_embedding = nn.Parameter(task_init)
+        self._task_embedding_hook_handle = (
+            self.model.get_input_embeddings().register_forward_hook(
+                self._replace_task_token_embedding
+            )
+        )
         self.image_token_id = self.model.config.image_token_id
 
         vision_config = self.model.config.vision_config
@@ -413,38 +434,71 @@ class Qwen3VLBackbone(nn.Module):
                 raise ValueError(f"{name}[{i}] contains zero tokens")
         return values
 
+    def _replace_task_token_embedding(self, module, args, output):
+        """Replace only <TASK> embedding positions with the trainable PAIR vector."""
+        if not args or not torch.is_tensor(args[0]):
+            return output
+        input_ids = args[0]
+        if not (torch.is_tensor(output) and output.ndim == 3):
+            return output
+        if input_ids.shape != output.shape[:2]:
+            return output
+
+        task_mask = input_ids.eq(self.task_token_id)
+        if not bool(task_mask.any()):
+            return output
+
+        out = output.clone()
+        task_vector = self.task_token_embedding.to(
+            device=out.device, dtype=out.dtype
+        )
+        out[task_mask] = task_vector
+        return out
+
     def _validate_prompt(self, prompt: str):
         if self.point_token in prompt:
             raise ValueError(
                 f"Do not manually include {self.point_token}; PAIR inserts it automatically"
             )
-        if prompt.count(self.task_token) > 1:
-            raise ValueError(f"Prompt contains more than one {self.task_token}")
+        if self.task_token in prompt:
+            raise ValueError(
+                f"Do not manually include {self.task_token}; PAIR appends it as the final readout token"
+            )
 
     def _build_messages(self, prompt, image_t1, image_t2, n_point_t1, n_point_t2):
         self._validate_prompt(prompt)
-        content = []
+
+        # Causal Qwen order:
+        #   task instruction -> Time 1 modalities -> Time 2 modalities -> <TASK>.
+        # Therefore all modality-token hidden states can see the task/class
+        # instruction, while the final <TASK> readout can see the complete
+        # bi-temporal multimodal context.
+        content = [{"type": "text", "text": prompt.rstrip()}]
+
         if image_t1 is not None:
-            content += [{"type": "text", "text": "Time 1 image:"},
-                        {"type": "image", "image": image_t1}]
-        if image_t2 is not None:
-            content += [{"type": "text", "text": "Time 2 image:"},
-                        {"type": "image", "image": image_t2}]
+            content += [
+                {"type": "text", "text": "Time 1 image:"},
+                {"type": "image", "image": image_t1},
+            ]
         if n_point_t1:
             content.append({
                 "type": "text",
                 "text": "Time 1 point cloud:\n" + self.point_token * n_point_t1,
             })
+
+        if image_t2 is not None:
+            content += [
+                {"type": "text", "text": "Time 2 image:"},
+                {"type": "image", "image": image_t2},
+            ]
         if n_point_t2:
             content.append({
                 "type": "text",
                 "text": "Time 2 point cloud:\n" + self.point_token * n_point_t2,
             })
 
-        task_text = prompt.rstrip()
-        if self.task_token not in prompt:
-            task_text += "\n" + self.task_token
-        content.append({"type": "text", "text": task_text})
+        # Keep exactly one readout marker after all temporal inputs.
+        content.append({"type": "text", "text": self.task_token})
         return [{"role": "user", "content": content}]
 
     @staticmethod
