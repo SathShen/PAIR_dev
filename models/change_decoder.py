@@ -423,6 +423,219 @@ class SharedDenseBlock(nn.Module):
         return x + self.mlp(self.norm(x))
 
 
+class SelfAttentionBlock(nn.Module):
+    """Standard pre-norm self-attention + MLP block for a short token set."""
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if dim % int(num_heads) != 0:
+            raise ValueError(
+                f"dim={dim} must be divisible by num_heads={num_heads}"
+            )
+        hidden_dim = int(dim * float(mlp_ratio))
+        self.norm_attn = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            dim,
+            int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm_mlp = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(
+                f"SelfAttentionBlock expects [B,N,D], got {tuple(x.shape)}"
+            )
+        qkv = self.norm_attn(x)
+        attended, _ = self.attention(
+            qkv,
+            qkv,
+            qkv,
+            need_weights=False,
+        )
+        x = x + attended
+        x = x + self.mlp(self.norm_mlp(x))
+        return x
+
+
+class FixedTokenAttention(nn.Module):
+    """Efficient shared global attention for variable-length dense tokens.
+
+    The module keeps M learned tokens [M,D]. For each sample:
+
+        dense [N,D]
+          -> learned tokens read dense with cross-attention
+          -> self-attention runs only on M learned tokens
+          -> dense tokens read the updated learned tokens
+          -> dense [N,D]
+
+    This makes the expensive global interaction O(N*M + M^2) instead of O(N^2).
+    The same parameters are used by 2D and 3D.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_tokens: int = 64,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        dim = int(dim)
+        num_tokens = int(num_tokens)
+        num_layers = int(num_layers)
+        num_heads = int(num_heads)
+        if dim <= 0 or num_tokens <= 0 or num_layers <= 0:
+            raise ValueError(
+                "dim, num_tokens and num_layers must all be positive"
+            )
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"dim={dim} must be divisible by num_heads={num_heads}"
+            )
+
+        self.dim = dim
+        self.num_tokens = num_tokens
+        self.num_layers = num_layers
+
+        self.learned_tokens = nn.Parameter(
+            torch.empty(num_tokens, dim)
+        )
+        nn.init.trunc_normal_(self.learned_tokens, std=0.02)
+
+        # Learned tokens read the full dense set.
+        self.read_query_norm = nn.LayerNorm(dim)
+        self.read_dense_norm = nn.LayerNorm(dim)
+        self.read_attention = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.read_out_norm = nn.LayerNorm(dim)
+
+        # Global reasoning happens only on the short learned-token set.
+        self.self_blocks = nn.ModuleList(
+            [
+                SelfAttentionBlock(
+                    dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        # Dense tokens read the globally mixed learned tokens back.
+        self.write_dense_norm = nn.LayerNorm(dim)
+        self.write_token_norm = nn.LayerNorm(dim)
+        self.write_attention = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.write_out_norm = nn.LayerNorm(dim)
+
+    def _one_sample(self, dense: torch.Tensor) -> torch.Tensor:
+        if dense.ndim != 2 or dense.shape[-1] != self.dim:
+            raise ValueError(
+                f"dense must be [N,{self.dim}], got {tuple(dense.shape)}"
+            )
+        if dense.shape[0] == 0:
+            return dense
+
+        dense_b = dense.unsqueeze(0)
+        learned = self.learned_tokens.to(
+            device=dense.device,
+            dtype=dense.dtype,
+        ).unsqueeze(0)
+
+        q = self.read_query_norm(learned)
+        kv = self.read_dense_norm(dense_b)
+        read, _ = self.read_attention(q, kv, kv, need_weights=False)
+        learned = self.read_out_norm(learned + read)
+
+        for block in self.self_blocks:
+            learned = block(learned)
+
+        q = self.write_dense_norm(dense_b)
+        kv = self.write_token_norm(learned)
+        write, _ = self.write_attention(q, kv, kv, need_weights=False)
+        return self.write_out_norm(dense_b + write)[0]
+
+    def forward_pair(
+        self,
+        *,
+        x1: torch.Tensor,
+        batch_ids1: torch.Tensor,
+        x2: torch.Tensor,
+        batch_ids2: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Jointly mix T1/T2 tokens within each sample, then split them back."""
+        if x1.ndim != 2 or x2.ndim != 2:
+            raise ValueError(
+                f"x1/x2 must be [N,D], got {tuple(x1.shape)} / {tuple(x2.shape)}"
+            )
+        if x1.shape[-1] != self.dim or x2.shape[-1] != self.dim:
+            raise ValueError(
+                f"x1/x2 feature dim must be {self.dim}"
+            )
+        if batch_ids1.shape != (x1.shape[0],):
+            raise ValueError(
+                f"batch_ids1 must be [{x1.shape[0]}], got {tuple(batch_ids1.shape)}"
+            )
+        if batch_ids2.shape != (x2.shape[0],):
+            raise ValueError(
+                f"batch_ids2 must be [{x2.shape[0]}], got {tuple(batch_ids2.shape)}"
+            )
+
+        ids1 = set(int(x) for x in torch.unique(batch_ids1).tolist())
+        ids2 = set(int(x) for x in torch.unique(batch_ids2).tolist())
+        if ids1 != ids2:
+            raise ValueError(
+                f"T1/T2 batch id sets differ: {sorted(ids1)} vs {sorted(ids2)}"
+            )
+
+        out1 = torch.empty_like(x1)
+        out2 = torch.empty_like(x2)
+        for batch_id in sorted(ids1):
+            mask1 = batch_ids1 == int(batch_id)
+            mask2 = batch_ids2 == int(batch_id)
+            n1 = int(mask1.sum().item())
+            n2 = int(mask2.sum().item())
+            if n1 == 0 or n2 == 0:
+                raise ValueError(
+                    f"batch {batch_id} must contain both T1 and T2 tokens"
+                )
+
+            joined = torch.cat([x1[mask1], x2[mask2]], dim=0)
+            joined = self._one_sample(joined)
+            out1[mask1] = joined[:n1]
+            out2[mask2] = joined[n1:n1 + n2]
+
+        return out1, out2
+
+
 # =============================================================================
 # PAIR V2 2D Cascade Gated Decoder
 # Ported from PerASCD models/common.py.
@@ -872,6 +1085,11 @@ class UnifiedChangeDecoder(nn.Module):
         dropout: float = 0.0,
         num_modalities: int = 2,
         initial_logit_scale: float = 10.0,
+        unified_num_tokens: int = 64,
+        unified_num_layers: int = 2,
+        unified_num_heads: int = 8,
+        unified_mlp_ratio: float = 2.0,
+        unified_dropout: float = 0.0,
     ):
         super().__init__()
         self.decoder_dim = int(decoder_dim)
@@ -892,6 +1110,20 @@ class UnifiedChangeDecoder(nn.Module):
             dropout=dropout,
             query_chunk_size=reasoning_chunk_size,
         )
+
+        # Shared 2D/3D global decoder directly after dense<-LLM cross-attention.
+        # It compresses each sample's joint T1/T2 dense tokens to a fixed set
+        # of learned tokens, performs self-attention only on that short set,
+        # and writes the global information back to every dense token.
+        self.unified_attention = FixedTokenAttention(
+            self.decoder_dim,
+            num_tokens=unified_num_tokens,
+            num_layers=unified_num_layers,
+            num_heads=unified_num_heads,
+            mlp_ratio=unified_mlp_ratio,
+            dropout=unified_dropout,
+        )
+
         self.temporal_fusion = SparseTemporalFusion(self.decoder_dim)
         self.task_conditioning = TaskConditioning(
             self.qwen_dim,
@@ -922,14 +1154,16 @@ class UnifiedChangeDecoder(nn.Module):
 
         # PAIR V2 2D route.
         # Input order is shallow -> deep:
-        # [ViT layer5 @ 1/4, layer11 @ 1/8, layer17 @ 1/16,
-        #  LLM reasoning @ 1/32].
+        # [ViT DeepStack @ 1/4, ViT DeepStack @ 1/8,
+        #  ViT DeepStack @ 1/16, dense<-LLM fused feature @ 1/32].
+        # The deepest feature has already been projected into decoder_dim and
+        # fused by dense-query / LLM-key-value cross-attention.
         self.cg_decoder_2d = CascadeGatedDecoder(
             in_channel_list=(
                 self.vision_dim,
                 self.vision_dim,
                 self.vision_dim,
-                self.qwen_dim,
+                self.decoder_dim,
             ),
             out_channels=self.decoder_dim,
             drop_rate=dropout,
@@ -998,7 +1232,7 @@ class UnifiedChangeDecoder(nn.Module):
             self.vision_dim,
             self.vision_dim,
             self.vision_dim,
-            self.qwen_dim,
+            self.decoder_dim,
         )
         batch_size = None
         previous_hw = None
@@ -1081,11 +1315,17 @@ class UnifiedChangeDecoder(nn.Module):
         Expected feature order for both times:
             [1/4, 1/8, 1/16, 1/32]
 
-        For Qwen3-VL-4B at 512x512 this is:
-            layer5  @ 128x128, 1024 channels
-            layer11 @  64x64, 1024 channels
-            layer17 @  32x32, 1024 channels
-            LLM     @  16x16, 2560 channels
+        For Qwen3-VL-4B at 512x512 this is conceptually:
+            DeepStack shallow @ 128x128, vision_dim channels
+            DeepStack middle  @  64x64, vision_dim channels
+            DeepStack deep    @  32x32, vision_dim channels
+            dense<-LLM fused  @  16x16, decoder_dim channels
+
+        The 1/32 feature is produced before this function by:
+            Q = final merged Qwen-ViT dense feature
+            K,V = Qwen LLM image hidden states
+            + position / modality / time embeddings on both sides
+            -> shared ReasoningInjection cross-attention
 
         SCD and BCD share the exact same CG decoder and explicit xc stream.
         Only the final prediction route differs.
@@ -1184,15 +1424,22 @@ class UnifiedChangeDecoder(nn.Module):
         scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
         return scale * (feature @ prototypes.T)
 
-    def _decode_one_time(
+    def _inject_reasoning_one_time(
         self,
         *,
         dense_tokens: UnifiedTokenSet,
         dense_time_id: int,
         reasoning_tokens: UnifiedTokenSet,
         reasoning_time_id: int,
-        task_hidden: torch.Tensor,
     ) -> torch.Tensor:
+        """Fuse one temporal dense stream with Qwen reasoning.
+
+        Both Q and K/V receive the shared PAIR token embedding:
+            feature + position + modality + time.
+
+        This is used by both the 3D unified route and the restored 2D
+        dense<-LLM cross-attention route.
+        """
         dense_tokens.validate(
             feature_dim=self.decoder_dim,
             name="dense_tokens",
@@ -1205,17 +1452,58 @@ class UnifiedChangeDecoder(nn.Module):
             reasoning_tokens,
             time_id=reasoning_time_id,
         )
-        x = self.reasoning_injection(
+        return self.reasoning_injection(
             dense=x,
             dense_batch_ids=dense_tokens.batch_ids,
             reasoning=reasoning,
             reasoning_batch_ids=reasoning_batch_ids,
         )
-        return self.task_conditioning(
-            x=x,
-            batch_ids=dense_tokens.batch_ids,
-            task_hidden=task_hidden,
+
+    def fuse_2d_dense_reasoning(
+        self,
+        *,
+        dense_t1: UnifiedTokenSet,
+        dense_t2: UnifiedTokenSet,
+        reasoning_t1: UnifiedTokenSet,
+        reasoning_t2: UnifiedTokenSet,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Restore PAIR's 2D dense-query / LLM-KV fusion.
+
+        T1 and T2 share exactly the same projection, positional/modality/time
+        embeddings and cross-attention parameters.  The only temporal
+        distinction is the learned time embedding (0 for T1, 1 for T2).
+
+        Returns flat fused dense features [N1,D] and [N2,D].  The caller
+        restores them to their 2D grids and uses them as the 1/32 CGDecoder
+        features.
+        """
+        dense_t1.validate(feature_dim=self.decoder_dim, name="dense_2d_t1")
+        dense_t2.validate(feature_dim=self.decoder_dim, name="dense_2d_t2")
+        reasoning_t1.validate(feature_dim=self.qwen_dim, name="reasoning_2d_t1")
+        reasoning_t2.validate(feature_dim=self.qwen_dim, name="reasoning_2d_t2")
+
+        x1 = self._inject_reasoning_one_time(
+            dense_tokens=dense_t1,
+            dense_time_id=0,
+            reasoning_tokens=reasoning_t1,
+            reasoning_time_id=0,
         )
+        x2 = self._inject_reasoning_one_time(
+            dense_tokens=dense_t2,
+            dense_time_id=1,
+            reasoning_tokens=reasoning_t2,
+            reasoning_time_id=1,
+        )
+
+        # Shared Unified Decoder: T1/T2 are mixed jointly inside each sample.
+        # The same module/parameters are also used by the 3D route.
+        x1, x2 = self.unified_attention.forward_pair(
+            x1=x1,
+            batch_ids1=dense_t1.batch_ids,
+            x2=x2,
+            batch_ids2=dense_t2.batch_ids,
+        )
+        return x1, x2
 
     def forward(
         self,
@@ -1251,23 +1539,43 @@ class UnifiedChangeDecoder(nn.Module):
             name="reasoning_t2",
         )
 
-        # 1) Qwen reasoning -> dense space.
-        x1 = self._decode_one_time(
+        # 1) Dense Q attends to Qwen LLM K/V independently for T1/T2.
+        x1 = self._inject_reasoning_one_time(
             dense_tokens=dense_t1,
             dense_time_id=0,
             reasoning_tokens=reasoning_t1,
             reasoning_time_id=0,
-            task_hidden=task_hidden,
         )
-        x2 = self._decode_one_time(
+        x2 = self._inject_reasoning_one_time(
             dense_tokens=dense_t2,
             dense_time_id=1,
             reasoning_tokens=reasoning_t2,
             reasoning_time_id=1,
+        )
+
+        # 2) Shared 2D/3D Unified Decoder. T1 and T2 tokens from the same
+        # sample are mixed jointly through the fixed learned-token bottleneck.
+        x1, x2 = self.unified_attention.forward_pair(
+            x1=x1,
+            batch_ids1=dense_t1.batch_ids,
+            x2=x2,
+            batch_ids2=dense_t2.batch_ids,
+        )
+
+        # Keep the existing 3D task conditioning after the shared global
+        # decoder. The 2D CG route does not use task_hidden yet.
+        x1 = self.task_conditioning(
+            x=x1,
+            batch_ids=dense_t1.batch_ids,
+            task_hidden=task_hidden,
+        )
+        x2 = self.task_conditioning(
+            x=x2,
+            batch_ids=dense_t2.batch_ids,
             task_hidden=task_hidden,
         )
 
-        # 2) Sparse T1 <-> T2 interaction. Both directions use pre-fusion x1/x2.
+        # 3) Sparse T1 <-> T2 interaction. Both directions use pre-fusion x1/x2.
         temporal_x1 = self.temporal_fusion(
             target=x1,
             source=x2,
@@ -1280,18 +1588,18 @@ class UnifiedChangeDecoder(nn.Module):
         )
         x1, x2 = temporal_x1, temporal_x2
 
-        # 3) Shared dense refinement.
+        # 4) Shared dense refinement.
         for block in self.shared_blocks:
             x1 = block(x1)
             x2 = block(x2)
 
-        # 4) Shared semantic/change latent representations.
+        # 5) Shared semantic/change representations.
         semantic_feature_t1 = self.semantic_head(x1)
         semantic_feature_t2 = self.semantic_head(x2)
         change_feature_t1 = self.change_head(x1)
         change_feature_t2 = self.change_head(x2)
 
-        # 5) Dataset-specific semantic language prototypes.
+        # 6) Dataset-specific semantic language prototypes.
         raw_class_ids, ordered_class_names, prototypes = self.class_encoder(
             class_names=class_names,
             qwen_backbone=qwen_backbone,
@@ -1306,7 +1614,7 @@ class UnifiedChangeDecoder(nn.Module):
             prototypes,
         )
 
-        # 6) Route only the final change/event classifier.
+        # 7) Route only the final change/event classifier.
         if prediction_type == "binary":
             change_logits_t1 = self.binary_change_classifier(
                 change_feature_t1

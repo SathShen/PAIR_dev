@@ -9,12 +9,17 @@ Unified temporal model for:
 PAIR V2 2D route
 ----------------
 Qwen3-VL provides three checkpoint-specific pre-merge DeepStack ViT feature
-maps plus its final LLM image reasoning map.  For a 512x512 input, the three
-pre-merge maps share the native 32x32 ViT grid and are converted to 1/4, 1/8
-and 1/16 pseudo-pyramid scales; the merged LLM reasoning map is 16x16 (1/32).
+maps plus its final merged visual dense tokens and LLM image hidden states.
+For a 512x512 input, the three pre-merge maps share the native 32x32 ViT grid
+and are converted to 1/4, 1/8 and 1/16 pseudo-pyramid scales.
 
-The four scales are sent directly to the shared CascadeGatedDecoder.  SCD and
-BCD use the same x0/x1/xc decoder; only the final prediction route differs.
+At the true merged 16x16 grid, PAIR restores the original dense<-LLM fusion:
+    Q   = projected final merged Qwen-ViT dense tokens
+    K,V = projected Qwen LLM image hidden states
+Both streams receive position + modality + time embeddings before shared
+cross-attention.  The fused result is the 1/32 deepest feature sent to the
+existing CascadeGatedDecoder.  SCD and BCD use the same x0/x1/xc decoder; only
+the final prediction route differs.
 The public 2D prediction contains only:
 
     semantic_logits_t1
@@ -970,15 +975,163 @@ class PAIRBackbone(nn.Module):
 
 
 class ImageDenseAdapter(nn.Module):
+    """Project Qwen's final merged visual tokens into decoder space."""
+
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim),
+            nn.Linear(self.in_dim, self.out_dim),
+            nn.LayerNorm(self.out_dim),
         )
 
     def forward(self, x):
+        if x.ndim != 2 or x.shape[-1] != self.in_dim:
+            raise ValueError(
+                f"ImageDenseAdapter expects [N,{self.in_dim}], got {tuple(x.shape)}"
+            )
         return self.proj(x)
+
+
+def _normalized_2d_positions(
+    height: int,
+    width: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return row-major normalized image-grid coordinates [H*W,3].
+
+    x/y are normalized to [-1,1] and z is zero.  The same coordinates are
+    used for dense Q and LLM K/V so spatially corresponding tokens share the
+    same positional frame.
+    """
+    height = int(height)
+    width = int(width)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid 2D token grid {(height, width)}")
+
+    ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=torch.float32)
+    xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    zz = torch.zeros_like(xx)
+    return torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+
+
+def make_image_token_set_2d(
+    feature_list,
+    *,
+    feature_dim: int,
+    name: str,
+    adapter: Optional[nn.Module] = None,
+) -> Tuple[UnifiedTokenSet, Tuple[Tuple[int, int], ...]]:
+    """Convert per-sample [1,H,W,C] image features to UnifiedTokenSet.
+
+    Modality id 0 is reserved for image tokens; modality id 1 is used by the
+    point-cloud route.  Time ids are intentionally not stored here because the
+    shared UnifiedTokenEmbedding injects T1/T2 identity at fusion time.
+    """
+    if not isinstance(feature_list, (list, tuple)) or not feature_list:
+        raise RuntimeError(f"{name} is missing or empty")
+
+    features = []
+    positions = []
+    modality_ids = []
+    batch_ids = []
+    shapes = []
+
+    expected_dim = int(feature_dim)
+    for batch_id, feature in enumerate(feature_list):
+        if feature is None:
+            raise RuntimeError(f"{name}[{batch_id}] is missing")
+        if not torch.is_tensor(feature) or feature.ndim != 4:
+            raise ValueError(
+                f"{name}[{batch_id}] must be [T,H,W,C], got "
+                f"{getattr(feature, 'shape', None)}"
+            )
+        if feature.shape[0] != 1:
+            raise RuntimeError(
+                f"PAIR 2D expects still-image tokens with T=1, got "
+                f"{tuple(feature.shape)} for {name}[{batch_id}]"
+            )
+        if feature.shape[-1] != expected_dim:
+            raise RuntimeError(
+                f"{name}[{batch_id}] feature dim {feature.shape[-1]} "
+                f"!= expected {expected_dim}"
+            )
+        if not torch.isfinite(feature).all():
+            raise ValueError(f"{name}[{batch_id}] contains NaN/Inf")
+
+        _, height, width, _ = feature.shape
+        flat = feature[0].reshape(height * width, expected_dim)
+        if adapter is not None:
+            flat = adapter(flat)
+
+        pos = _normalized_2d_positions(
+            height,
+            width,
+            device=flat.device,
+        )
+        n = int(flat.shape[0])
+        features.append(flat)
+        positions.append(pos)
+        modality_ids.append(
+            torch.zeros(n, dtype=torch.long, device=flat.device)
+        )
+        batch_ids.append(
+            torch.full(
+                (n,),
+                int(batch_id),
+                dtype=torch.long,
+                device=flat.device,
+            )
+        )
+        shapes.append((int(height), int(width)))
+
+    tokens = UnifiedTokenSet(
+        features=torch.cat(features, dim=0),
+        positions=torch.cat(positions, dim=0),
+        modality_ids=torch.cat(modality_ids, dim=0),
+        batch_ids=torch.cat(batch_ids, dim=0),
+    )
+    return tokens, tuple(shapes)
+
+
+def restore_image_token_map_2d(
+    features: torch.Tensor,
+    batch_ids: torch.Tensor,
+    shapes: Tuple[Tuple[int, int], ...],
+    *,
+    name: str,
+) -> torch.Tensor:
+    """Restore flat fused image tokens to one [B,C,H,W] feature map."""
+    if features.ndim != 2:
+        raise ValueError(f"{name} features must be [N,D], got {tuple(features.shape)}")
+    if batch_ids.shape != (features.shape[0],):
+        raise ValueError(
+            f"{name} batch_ids must be [{features.shape[0]}], got {tuple(batch_ids.shape)}"
+        )
+
+    maps = []
+    for batch_id, (height, width) in enumerate(shapes):
+        x = features[batch_ids == int(batch_id)]
+        expected = int(height) * int(width)
+        if x.shape[0] != expected:
+            raise RuntimeError(
+                f"{name} batch {batch_id} has {x.shape[0]} tokens, expected {expected}"
+            )
+        maps.append(
+            x.reshape(int(height), int(width), x.shape[-1])
+            .permute(2, 0, 1)
+            .contiguous()
+        )
+
+    map_shapes = [tuple(x.shape) for x in maps]
+    if len(set(map_shapes)) != 1:
+        raise RuntimeError(
+            f"Cannot stack {name} maps with different shapes: {map_shapes}"
+        )
+    return torch.stack(maps, dim=0)
 
 
 
@@ -1059,7 +1212,7 @@ def _stack_llm_image_maps(image_hidden_2d_list, *, name: str) -> torch.Tensor:
 def build_qwen_2d_pyramid(
     *,
     premerge_by_layer,
-    llm_image_hidden_2d_list,
+    fused_deepest_feature,
     layer_indices,
     name="image",
 ):
@@ -1069,8 +1222,8 @@ def build_qwen_2d_pyramid(
 
     The three configured Qwen DeepStack maps are all native pre-merge ViT
     resolution.  We resample the first two maps; the third stays at native
-    resolution, while the LLM map keeps its true merged-token resolution and
-    must already be exactly half the native ViT resolution.
+    resolution.  The deepest 1/32 feature is the already-fused dense<-LLM
+    cross-attention result and must be exactly half the native ViT resolution.
     """
     if not isinstance(premerge_by_layer, dict):
         raise TypeError(f"{name} premerge features must be a dict keyed by layer index")
@@ -1111,20 +1264,24 @@ def build_qwen_2d_pyramid(
             f"{name} native ViT grid {(native_h, native_w)} must be divisible by 2"
         )
 
-    llm = _stack_llm_image_maps(
-        llm_image_hidden_2d_list,
-        name=f"{name}_llm_hidden",
-    )
-    if llm.shape[0] != deep.shape[0]:
-        raise RuntimeError(
-            f"{name} pre-merge/LLM batch mismatch: {deep.shape[0]} vs {llm.shape[0]}"
+    if not torch.is_tensor(fused_deepest_feature) or fused_deepest_feature.ndim != 4:
+        raise ValueError(
+            f"{name} fused_deepest_feature must be [B,C,H,W], got "
+            f"{getattr(fused_deepest_feature, 'shape', None)}"
         )
-    expected_llm_hw = (native_h // 2, native_w // 2)
-    if tuple(llm.shape[-2:]) != expected_llm_hw:
+    p32 = fused_deepest_feature
+    if p32.shape[0] != deep.shape[0]:
         raise RuntimeError(
-            f"{name} LLM grid must be {expected_llm_hw} for native ViT grid "
-            f"{(native_h, native_w)}, got {tuple(llm.shape[-2:])}"
+            f"{name} pre-merge/fused batch mismatch: {deep.shape[0]} vs {p32.shape[0]}"
         )
+    expected_p32_hw = (native_h // 2, native_w // 2)
+    if tuple(p32.shape[-2:]) != expected_p32_hw:
+        raise RuntimeError(
+            f"{name} fused 1/32 grid must be {expected_p32_hw} for native ViT grid "
+            f"{(native_h, native_w)}, got {tuple(p32.shape[-2:])}"
+        )
+    if not torch.isfinite(p32).all():
+        raise ValueError(f"{name} fused_deepest_feature contains NaN/Inf")
 
     # Match PerASCD's plain-ViT pseudo-pyramid construction.  There is no
     # learnable V1 upsampler here: CG-Decoder owns the coarse-to-fine decoding.
@@ -1141,7 +1298,6 @@ def build_qwen_2d_pyramid(
         align_corners=False,
     )
     p16 = deep
-    p32 = llm
     return [p4, p8, p16, p32]
 
 
@@ -1457,8 +1613,7 @@ class PAIRModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
-        # Kept only as a backward-compatible constructor slot.  PAIR V2 does
-        # not instantiate or use the old merged-token ImageDenseAdapter.
+        # 2D dense-query adapter: final merged Qwen-ViT tokens -> decoder_dim.
         self.image_adapter = image_adapter
         self.qwen_tuning = str(qwen_tuning).lower()
         self.vision_lora_enabled = bool(vision_lora_enabled)
@@ -1571,6 +1726,13 @@ class PAIRModel(nn.Module):
             point_encoder=point_encoder,
             point_adapter=point_adapter,
         )
+        # Qwen's final merged visual output is projected to decoder space and
+        # used as the dense query stream for the restored 2D cross-attention.
+        image_adapter = ImageDenseAdapter(
+            in_dim=qwen.hidden_size,
+            out_dim=decoder_dim,
+        ).to(device)
+
         decoder = UnifiedChangeDecoder(
             qwen_dim=qwen.hidden_size,
             vision_dim=qwen.vision_hidden_size,
@@ -1579,7 +1741,7 @@ class PAIRModel(nn.Module):
         return cls(
             backbone,
             decoder,
-            None,
+            image_adapter,
             qwen_tuning,
             vision_lora_enabled=vision_lora_enabled,
             point_lora_enabled=point_lora_enabled,
@@ -1606,7 +1768,7 @@ class PAIRModel(nn.Module):
         return self
 
     # -------------------------------------------------------------------------
-    # 2D V2: Qwen multi-level pseudo-pyramid -> CascadeGatedDecoder
+    # 2D V2: dense<-LLM Cross-Attn at 1/32 -> Qwen pseudo-pyramid -> CGDecoder
     # -------------------------------------------------------------------------
 
     def forward_2d(
@@ -1658,23 +1820,86 @@ class PAIRModel(nn.Module):
 
         premerge_t1 = out.aux.get("image_premerge_t1")
         premerge_t2 = out.aux.get("image_premerge_t2")
+        dense_t1_list = out.aux.get("image_dense_2d_t1_list")
+        dense_t2_list = out.aux.get("image_dense_2d_t2_list")
         llm_t1 = out.aux.get("image_hidden_2d_t1_list")
         llm_t2 = out.aux.get("image_hidden_2d_t2_list")
         if premerge_t1 is None or premerge_t2 is None:
             raise RuntimeError("PAIR did not expose the configured Qwen pre-merge features")
+        if dense_t1_list is None or dense_t2_list is None:
+            raise RuntimeError("PAIR did not expose final merged Qwen-ViT dense features")
         if llm_t1 is None or llm_t2 is None:
             raise RuntimeError("PAIR did not expose Qwen LLM image reasoning maps")
+        if self.image_adapter is None:
+            raise RuntimeError("PAIR 2D dense<-LLM fusion requires image_adapter")
+
+        # Restore the original PAIR 2D fusion protocol:
+        #   Q   = final merged Qwen-ViT dense tokens -> ImageDenseAdapter
+        #   K,V = Qwen LLM image hidden states -> reasoning_projection
+        # Both sides then receive shared position + modality + time embeddings
+        # before ReasoningInjection cross-attention.  The fused output becomes
+        # the 1/32 deepest CGDecoder feature.
+        dense_tokens_t1, dense_shapes_t1 = make_image_token_set_2d(
+            dense_t1_list,
+            feature_dim=self.qwen_backbone.hidden_size,
+            name="T1_dense",
+            adapter=self.image_adapter,
+        )
+        dense_tokens_t2, dense_shapes_t2 = make_image_token_set_2d(
+            dense_t2_list,
+            feature_dim=self.qwen_backbone.hidden_size,
+            name="T2_dense",
+            adapter=self.image_adapter,
+        )
+        reasoning_tokens_t1, reasoning_shapes_t1 = make_image_token_set_2d(
+            llm_t1,
+            feature_dim=self.qwen_backbone.hidden_size,
+            name="T1_llm",
+        )
+        reasoning_tokens_t2, reasoning_shapes_t2 = make_image_token_set_2d(
+            llm_t2,
+            feature_dim=self.qwen_backbone.hidden_size,
+            name="T2_llm",
+        )
+
+        if dense_shapes_t1 != reasoning_shapes_t1:
+            raise RuntimeError(
+                f"T1 dense/LLM topology mismatch: {dense_shapes_t1} vs {reasoning_shapes_t1}"
+            )
+        if dense_shapes_t2 != reasoning_shapes_t2:
+            raise RuntimeError(
+                f"T2 dense/LLM topology mismatch: {dense_shapes_t2} vs {reasoning_shapes_t2}"
+            )
+
+        fused_t1, fused_t2 = self.decoder.fuse_2d_dense_reasoning(
+            dense_t1=dense_tokens_t1,
+            dense_t2=dense_tokens_t2,
+            reasoning_t1=reasoning_tokens_t1,
+            reasoning_t2=reasoning_tokens_t2,
+        )
+        fused_map_t1 = restore_image_token_map_2d(
+            fused_t1,
+            dense_tokens_t1.batch_ids,
+            dense_shapes_t1,
+            name="T1_fused",
+        )
+        fused_map_t2 = restore_image_token_map_2d(
+            fused_t2,
+            dense_tokens_t2.batch_ids,
+            dense_shapes_t2,
+            name="T2_fused",
+        )
 
         layer_indices = self.qwen_backbone.vision_intermediate_layers
         feat_pyramid_t1 = build_qwen_2d_pyramid(
             premerge_by_layer=premerge_t1,
-            llm_image_hidden_2d_list=llm_t1,
+            fused_deepest_feature=fused_map_t1,
             layer_indices=layer_indices,
             name="T1",
         )
         feat_pyramid_t2 = build_qwen_2d_pyramid(
             premerge_by_layer=premerge_t2,
-            llm_image_hidden_2d_list=llm_t2,
+            fused_deepest_feature=fused_map_t2,
             layer_indices=layer_indices,
             name="T2",
         )
