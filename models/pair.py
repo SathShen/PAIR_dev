@@ -1733,10 +1733,16 @@ class PAIRModel(nn.Module):
             out_dim=decoder_dim,
         ).to(device)
 
+        unified_cfg = dict(cfg.get("unified_decoder", {}))
         decoder = UnifiedChangeDecoder(
             qwen_dim=qwen.hidden_size,
             vision_dim=qwen.vision_hidden_size,
             decoder_dim=decoder_dim,
+            unified_num_tokens=int(unified_cfg.get("num_tokens", 64)),
+            unified_num_layers=int(unified_cfg.get("num_layers", 2)),
+            unified_num_heads=int(unified_cfg.get("num_heads", 8)),
+            unified_mlp_ratio=float(unified_cfg.get("mlp_ratio", 2.0)),
+            unified_dropout=float(unified_cfg.get("dropout", 0.0)),
         ).to(device)
         return cls(
             backbone,
