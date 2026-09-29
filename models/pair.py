@@ -24,8 +24,7 @@ The public 2D prediction contains only:
 
     semantic_logits_t1
     semantic_logits_t2
-    change_logits_t1
-    change_logits_t2
+    change_logits
 
 The established 3D path remains unchanged and continues to use the unified
 token decoder with the shared 3-class event head.
@@ -1304,24 +1303,15 @@ def build_qwen_2d_pyramid(
 def restore_2d_cg_prediction_batch(prediction, output_sizes):
     """Resize CG logits to each target raster and flatten sample-major."""
     batch_size = len(output_sizes)
-    if prediction.change_logits_t1.ndim != 3 or prediction.change_logits_t2.ndim != 3:
+    if prediction.change_logits.ndim != 3:
         raise ValueError(
-            "change_logits_t1/t2 must both be [B,H,W], got "
-            f"{tuple(prediction.change_logits_t1.shape)} and "
-            f"{tuple(prediction.change_logits_t2.shape)}"
+            "change_logits must be [B,H,W], got "
+            f"{tuple(prediction.change_logits.shape)}"
         )
-    if (
-        prediction.change_logits_t1.shape[0] != batch_size
-        or prediction.change_logits_t2.shape[0] != batch_size
-    ):
+    if prediction.change_logits.shape[0] != batch_size:
         raise RuntimeError(
-            "change_logits_t1/t2 batch size must match output_sizes: "
-            f"{prediction.change_logits_t1.shape[0]}, "
-            f"{prediction.change_logits_t2.shape[0]} vs {batch_size}"
-        )
-    if prediction.change_logits_t1.shape != prediction.change_logits_t2.shape:
-        raise RuntimeError(
-            "CG T1/T2 change logits must have the same raster shape"
+            "change_logits batch size must match output_sizes: "
+            f"{prediction.change_logits.shape[0]} vs {batch_size}"
         )
 
     def restore_semantic(logits, name):
@@ -1375,13 +1365,9 @@ def restore_2d_cg_prediction_batch(prediction, output_sizes):
         prediction.semantic_logits_t2,
         "semantic_logits_t2",
     )
-    prediction.change_logits_t1 = restore_change(
-        prediction.change_logits_t1,
-        "change_logits_t1",
-    )
-    prediction.change_logits_t2 = restore_change(
-        prediction.change_logits_t2,
-        "change_logits_t2",
+    prediction.change_logits = restore_change(
+        prediction.change_logits,
+        "change_logits",
     )
     return prediction
 
@@ -1609,6 +1595,9 @@ class PAIRModel(nn.Module):
         qwen_tuning,
         vision_lora_enabled=False,
         point_lora_enabled=False,
+        enable_2d=True,
+        enable_3d=True,
+        enable_semantic=True,
     ):
         super().__init__()
         self.backbone = backbone
@@ -1618,6 +1607,9 @@ class PAIRModel(nn.Module):
         self.qwen_tuning = str(qwen_tuning).lower()
         self.vision_lora_enabled = bool(vision_lora_enabled)
         self.point_lora_enabled = bool(point_lora_enabled)
+        self.enable_2d = bool(enable_2d)
+        self.enable_3d = bool(enable_3d)
+        self.enable_semantic = bool(enable_semantic)
 
     @property
     def qwen_backbone(self):
@@ -1632,10 +1624,23 @@ class PAIRModel(nn.Module):
         return self.backbone.point_adapter
 
     @classmethod
-    def from_config(cls, model_config, device):
+    def from_config(
+        cls,
+        model_config,
+        device,
+        *,
+        enable_2d=True,
+        enable_3d=True,
+        enable_semantic=True,
+    ):
         cfg = dict(model_config)
         device = torch.device(device)
         device_str = str(device)
+        enable_2d = bool(enable_2d)
+        enable_3d = bool(enable_3d)
+        enable_semantic = bool(enable_semantic)
+        if not (enable_2d or enable_3d):
+            raise ValueError("PAIRModel needs at least one active route")
 
         qwen = Qwen3VLBackbone(
             model_dir=str(cfg["qwen_model"]),
@@ -1670,7 +1675,10 @@ class PAIRModel(nn.Module):
             raise ValueError("model.qwen_tuning must be one of: frozen, lora, full")
 
         vision_lora_cfg = dict(cfg.get("vision_lora", {}))
-        vision_lora_enabled = bool(vision_lora_cfg.get("enabled", False))
+        vision_lora_requested = bool(vision_lora_cfg.get("enabled", False))
+        vision_lora_enabled = vision_lora_requested and enable_2d
+        if vision_lora_requested and not enable_2d:
+            print("Qwen Vision LoRA skipped: no active 2D route")
         if vision_lora_enabled:
             if qwen_tuning == "full":
                 raise ValueError(
@@ -1694,32 +1702,39 @@ class PAIRModel(nn.Module):
 
         decoder_dim = int(cfg.get("decoder_dim", 256))
         point_cfg = dict(cfg.get("point_encoder", {}))
-        checkpoint = point_cfg.get("checkpoint")
-        if not checkpoint:
-            raise KeyError("model.point_encoder.checkpoint is required")
-
         point_lora_cfg = dict(cfg.get("point_lora", {}))
-        point_lora_enabled = bool(point_lora_cfg.get("enabled", False))
+        point_lora_requested = bool(point_lora_cfg.get("enabled", False))
+        point_lora_enabled = point_lora_requested and enable_3d
 
-        point_encoder = UtoniaPointEncoder(
-            UtoniaPointEncoderConfig(
-                checkpoint=str(checkpoint),
-                voxel_size=float(point_cfg.get("voxel_size", 0.5)),
-                lora_enabled=point_lora_enabled,
-                lora_r=int(point_lora_cfg.get("r", 8)),
-                lora_alpha=float(point_lora_cfg.get("alpha", 16)),
-                lora_dropout=float(point_lora_cfg.get("dropout", 0.05)),
-            )
-        ).to(device)
+        point_encoder = None
+        point_adapter = None
+        if enable_3d:
+            checkpoint = point_cfg.get("checkpoint")
+            if not checkpoint:
+                raise KeyError(
+                    "model.point_encoder.checkpoint is required when a 3D route is active"
+                )
+            point_encoder = UtoniaPointEncoder(
+                UtoniaPointEncoderConfig(
+                    checkpoint=str(checkpoint),
+                    voxel_size=float(point_cfg.get("voxel_size", 0.5)),
+                    lora_enabled=point_lora_enabled,
+                    lora_r=int(point_lora_cfg.get("r", 8)),
+                    lora_alpha=float(point_lora_cfg.get("alpha", 16)),
+                    lora_dropout=float(point_lora_cfg.get("dropout", 0.05)),
+                )
+            ).to(device)
 
-        point_adapter = PointAdapter(
-            PointAdapterConfig(
-                in_dim=point_encoder.output_dim,
-                dense_dim=decoder_dim,
-                out_dim=qwen.hidden_size,
-                num_tokens=int(cfg.get("max_point_reasoning_tokens", 512)),
-            )
-        ).to(device)
+            point_adapter = PointAdapter(
+                PointAdapterConfig(
+                    in_dim=point_encoder.output_dim,
+                    dense_dim=decoder_dim,
+                    out_dim=qwen.hidden_size,
+                    num_tokens=int(cfg.get("max_point_reasoning_tokens", 512)),
+                )
+            ).to(device)
+        elif point_lora_requested:
+            print("Utonia / PointAdapter / Point LoRA skipped: no active 3D route")
 
         backbone = PAIRBackbone(
             qwen_backbone=qwen,
@@ -1728,10 +1743,14 @@ class PAIRModel(nn.Module):
         )
         # Qwen's final merged visual output is projected to decoder space and
         # used as the dense query stream for the restored 2D cross-attention.
-        image_adapter = ImageDenseAdapter(
-            in_dim=qwen.hidden_size,
-            out_dim=decoder_dim,
-        ).to(device)
+        image_adapter = (
+            ImageDenseAdapter(
+                in_dim=qwen.hidden_size,
+                out_dim=decoder_dim,
+            ).to(device)
+            if enable_2d
+            else None
+        )
 
         unified_cfg = dict(cfg.get("unified_decoder", {}))
         decoder = UnifiedChangeDecoder(
@@ -1743,6 +1762,9 @@ class PAIRModel(nn.Module):
             unified_num_heads=int(unified_cfg.get("num_heads", 8)),
             unified_mlp_ratio=float(unified_cfg.get("mlp_ratio", 2.0)),
             unified_dropout=float(unified_cfg.get("dropout", 0.0)),
+            enable_2d=enable_2d,
+            enable_3d=enable_3d,
+            enable_semantic=enable_semantic,
         ).to(device)
         return cls(
             backbone,
@@ -1751,6 +1773,9 @@ class PAIRModel(nn.Module):
             qwen_tuning,
             vision_lora_enabled=vision_lora_enabled,
             point_lora_enabled=point_lora_enabled,
+            enable_2d=enable_2d,
+            enable_3d=enable_3d,
+            enable_semantic=enable_semantic,
         ).to(device)
 
     def train(self, mode=True):
@@ -1786,6 +1811,8 @@ class PAIRModel(nn.Module):
         output_sizes,
         prediction_mode="scd",
     ):
+        if not self.enable_2d:
+            raise RuntimeError("2D route is not configured for this PAIRModel")
         if not (
             len(images_t1)
             == len(images_t2)
@@ -1946,6 +1973,8 @@ class PAIRModel(nn.Module):
         prompts,
         class_names,
     ):
+        if not self.enable_3d:
+            raise RuntimeError("3D route is not configured for this PAIRModel")
         point_dicts_t1 = _as_point_list(point_dicts_t1, "point_dicts_t1")
         point_dicts_t2 = _as_point_list(point_dicts_t2, "point_dicts_t2")
         if not (
@@ -2028,11 +2057,8 @@ class PAIRModel(nn.Module):
             class_names=class_names,
             qwen_backbone=self.qwen_backbone,
             detach_qwen_class_encoder=True,
-            prediction_type="event",
         )
 
-        if prediction.change_logits_t1 is not None or prediction.change_logits_t2 is not None:
-            raise RuntimeError("3D decoder must not return binary change logits")
         if prediction.event_logits_t1 is None or prediction.event_logits_t2 is None:
             raise RuntimeError("3D decoder did not return event logits")
         if prediction.event_logits_t1.shape != (dense_t1.features.shape[0], 3):

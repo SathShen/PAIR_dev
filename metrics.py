@@ -2,7 +2,7 @@
 Unified streaming metrics for PAIR semantic change detection.
 
 2D:
-    semantic_logits_t1/t2 + binary change_logits_t1/t2
+    semantic_logits_t1/t2 + binary change_logits
 
 3D:
     semantic_logits_t1/t2 + 3-class event_logits_t1/t2
@@ -368,27 +368,28 @@ class PAIRMetrics:
 
         return pred.reshape(-1)
 
-    @staticmethod
-    def _change_target(target, time_id):
-        key = f"change_t{time_id}"
-        valid_key = f"change_valid_t{time_id}"
-
-        if key in target:
-            change = target[key]
-            valid = target.get(valid_key)
-            if valid is None:
-                valid = torch.ones_like(change, dtype=torch.bool)
-            return change, valid
-
-        change = target["change"]
-        valid = target.get("change_valid")
-        if valid is None:
-            valid = torch.ones_like(change, dtype=torch.bool)
-        return change, valid
-
     def _update_semantic(self, prediction, target):
         raw1 = target["semantic_t1"]
         raw2 = target["semantic_t2"]
+
+        logits1 = getattr(prediction, "semantic_logits_t1", None)
+        logits2 = getattr(prediction, "semantic_logits_t2", None)
+        if (logits1 is None) != (logits2 is None):
+            raise ValueError(
+                "semantic_logits_t1/t2 must be present together"
+            )
+        if logits1 is None:
+            valid1 = target.get("semantic_valid_t1")
+            valid2 = target.get("semantic_valid_t2")
+            if valid1 is None:
+                valid1 = torch.ones_like(raw1, dtype=torch.bool)
+            if valid2 is None:
+                valid2 = torch.ones_like(raw2, dtype=torch.bool)
+            if valid1.reshape(-1).bool().any() or valid2.reshape(-1).bool().any():
+                raise ValueError(
+                    "Semantic supervision is active but semantic logits are missing"
+                )
+            return None, None, None, None, None, None
 
         valid1 = self._mask_or_true(
             target,
@@ -407,14 +408,14 @@ class PAIRMetrics:
         gt2, valid2 = self._raw_to_local_target(raw2, valid2)
 
         pred1 = (
-            prediction.semantic_logits_t1
+            logits1
             .detach()
             .argmax(-1)
             .to(self.device)
             .reshape(-1)
         )
         pred2 = (
-            prediction.semantic_logits_t2
+            logits2
             .detach()
             .argmax(-1)
             .to(self.device)
@@ -452,117 +453,58 @@ class PAIRMetrics:
         valid1,
         valid2,
     ):
-        logits1 = getattr(prediction, "change_logits_t1", None)
-        logits2 = getattr(prediction, "change_logits_t2", None)
-
-        if (logits1 is None) != (logits2 is None):
-            raise ValueError(
-                "change_logits_t1/t2 must be present together"
-            )
-        if logits1 is None:
+        logits = getattr(prediction, "change_logits", None)
+        if logits is None:
             return False
+        if "change" not in target:
+            raise KeyError("Binary change metrics require target['change']")
 
-        cgt1, cv1 = self._change_target(target, 1)
-        cgt2, cv2 = self._change_target(target, 2)
+        cgt = target["change"].to(self.device).reshape(-1).long()
+        cv = target.get("change_valid")
+        if cv is None:
+            cv = torch.ones_like(cgt, dtype=torch.bool)
+        else:
+            cv = cv.to(self.device).reshape(-1).bool()
 
-        cgt1 = cgt1.to(self.device).reshape(-1).long()
-        cgt2 = cgt2.to(self.device).reshape(-1).long()
-        cv1 = cv1.to(self.device).reshape(-1).bool()
-        cv2 = cv2.to(self.device).reshape(-1).bool()
+        self._validate_binary_target(cgt, cv, "change")
 
-        self._validate_binary_target(cgt1, cv1, "change_t1")
-        self._validate_binary_target(cgt2, cv2, "change_t2")
-
-        prob1 = torch.sigmoid(
-            logits1.detach().float()
+        prob = torch.sigmoid(
+            logits.detach().float()
         ).to(self.device).reshape(-1)
-        prob2 = torch.sigmoid(
-            logits2.detach().float()
-        ).to(self.device).reshape(-1)
-
-        if prob1.numel() != cgt1.numel() or prob2.numel() != cgt2.numel():
+        if prob.numel() != cgt.numel():
             raise ValueError("Binary change prediction/target size mismatch")
 
-        shared_change = (
-            "change_t1" not in target
-            and "change_t2" not in target
-            and prob1.numel() == prob2.numel() == cgt1.numel()
+        cpred = (prob >= self.threshold).long()
+        self._update_confusion(
+            self.change,
+            cgt,
+            cpred,
+            cv,
+            2,
         )
 
-        if shared_change:
-            prob = 0.5 * (prob1 + prob2)
-            cpred = (prob >= self.threshold).long()
-
+        # Only SCD has semantic predictions to gate. Pure BCD deliberately
+        # stops at the binary change metric.
+        if pred1 is not None and self.unchanged_local is not None:
+            gated1 = pred1.clone()
+            gated2 = pred2.clone()
+            unchanged = ~cpred.bool()
+            gated1[unchanged] = self.unchanged_local
+            gated2[unchanged] = self.unchanged_local
             self._update_confusion(
-                self.change,
-                cgt1,
-                cpred,
-                cv1,
-                2,
-            )
-
-            if self.unchanged_local is not None:
-                gated1 = pred1.clone()
-                gated2 = pred2.clone()
-                unchanged = ~cpred.bool()
-
-                gated1[unchanged] = self.unchanged_local
-                gated2[unchanged] = self.unchanged_local
-
-                self._update_confusion(
-                    self.scd,
-                    gt1,
-                    gated1,
-                    valid1,
-                    self.k,
-                )
-                self._update_confusion(
-                    self.scd,
-                    gt2,
-                    gated2,
-                    valid2,
-                    self.k,
-                )
-        else:
-            cpred1 = (prob1 >= self.threshold).long()
-            cpred2 = (prob2 >= self.threshold).long()
-
-            self._update_confusion(
-                self.change,
-                cgt1,
-                cpred1,
-                cv1,
-                2,
+                self.scd,
+                gt1,
+                gated1,
+                valid1,
+                self.k,
             )
             self._update_confusion(
-                self.change,
-                cgt2,
-                cpred2,
-                cv2,
-                2,
+                self.scd,
+                gt2,
+                gated2,
+                valid2,
+                self.k,
             )
-
-            if self.unchanged_local is not None:
-                gated1 = pred1.clone()
-                gated2 = pred2.clone()
-
-                gated1[~cpred1.bool()] = self.unchanged_local
-                gated2[~cpred2.bool()] = self.unchanged_local
-
-                self._update_confusion(
-                    self.scd,
-                    gt1,
-                    gated1,
-                    valid1,
-                    self.k,
-                )
-                self._update_confusion(
-                    self.scd,
-                    gt2,
-                    gated2,
-                    valid2,
-                    self.k,
-                )
 
         return True
 
@@ -759,7 +701,11 @@ class PAIRMetrics:
         return True
 
     def update(self, prediction, target):
-        if tuple(prediction.raw_class_ids) != self.raw_ids:
+        has_semantic_logits = (
+            getattr(prediction, "semantic_logits_t1", None) is not None
+            or getattr(prediction, "semantic_logits_t2", None) is not None
+        )
+        if has_semantic_logits and tuple(prediction.raw_class_ids) != self.raw_ids:
             raise ValueError(
                 f"Decoder class order {prediction.raw_class_ids} != "
                 f"metric class order {self.raw_ids}"
@@ -780,6 +726,12 @@ class PAIRMetrics:
             valid1,
             valid2,
         )
+
+        if (
+            getattr(prediction, "event_logits_t1", None) is not None
+            and pred1 is None
+        ):
+            raise ValueError("3D event metrics require semantic predictions")
 
         has_event = self._update_event(
             prediction,
@@ -982,8 +934,7 @@ def _self_test():
             [0.0, 0.0, 5.0],
             [0.0, 5.0, 0.0],
         ]),
-        change_logits_t1=torch.tensor([-5.0, 5.0, 5.0, 5.0]),
-        change_logits_t2=torch.tensor([-5.0, 5.0, 5.0, 5.0]),
+        change_logits=torch.tensor([-5.0, 5.0, 5.0, 5.0]),
         event_logits_t1=None,
         event_logits_t2=None,
     )
@@ -1017,8 +968,6 @@ def _self_test():
         raw_class_ids=(0, 1, 2, 3),
         semantic_logits_t1=torch.eye(4),
         semantic_logits_t2=torch.eye(4),
-        change_logits_t1=None,
-        change_logits_t2=None,
         event_logits_t1=torch.tensor([
             [5.0, 0.0, 0.0],  # unchanged
             [0.0, 0.0, 5.0],  # removed

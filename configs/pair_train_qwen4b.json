@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_4B_gc3",
+    "name": "PAIR_SECOND_4B_ver2",
     "seed": 42,
     "epochs": 50
   },

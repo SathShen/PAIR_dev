@@ -1026,10 +1026,11 @@ def main():
         print(f"configured max_grad_norm : {settings.max_grad_norm}")
         print()
 
-        # Match current train.py exactly.
+        # Match current train.py exactly, including route-aware construction.
         model = PAIRModel.from_config(
             experiment.model,
             runtime["device"],
+            **train_mod.active_model_flags(experiment),
         )
         criterion = PAIRSemanticChangeLoss().to(runtime["device"])
 

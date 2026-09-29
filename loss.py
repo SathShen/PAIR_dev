@@ -24,7 +24,7 @@ Design goals
 Routes
 ------
 2D SCD:
-    semantic_logits_t1/t2 + binary change_logits_t1/t2
+    semantic_logits_t1/t2 + binary change_logits
     semantic CE/Lovasz are applied on changed pixels only when
     semantic_changed_only=True (the train.py semantic_pair protocol).
 
@@ -214,6 +214,20 @@ class PAIRSemanticChangeLoss(nn.Module):
     def _zero_from(tensor):
         return tensor.sum() * 0.0
 
+    @classmethod
+    def _zero_from_prediction(cls, prediction):
+        for name in (
+            "semantic_logits_t1",
+            "semantic_logits_t2",
+            "change_logits",
+            "event_logits_t1",
+            "event_logits_t2",
+        ):
+            tensor = getattr(prediction, name, None)
+            if torch.is_tensor(tensor):
+                return cls._zero_from(tensor)
+        raise ValueError("PAIR prediction contains no tensor output")
+
     @staticmethod
     def _mean_over_active(losses: Sequence[torch.Tensor], active: Sequence[bool]):
         selected = [loss for loss, is_active in zip(losses, active) if is_active]
@@ -389,17 +403,41 @@ class PAIRSemanticChangeLoss(nn.Module):
         raw1 = target["semantic_t1"]
         raw2 = target["semantic_t2"]
 
+        logits1 = getattr(prediction, "semantic_logits_t1", None)
+        logits2 = getattr(prediction, "semantic_logits_t2", None)
+        if (logits1 is None) != (logits2 is None):
+            raise ValueError(
+                "Semantic branch is incomplete: semantic_logits_t1/t2 must be present together"
+            )
+
+        if logits1 is None:
+            valid1 = target.get("semantic_valid_t1")
+            valid2 = target.get("semantic_valid_t2")
+            if valid1 is None:
+                valid1 = torch.ones_like(raw1, dtype=torch.bool)
+            if valid2 is None:
+                valid2 = torch.ones_like(raw2, dtype=torch.bool)
+            if valid1.reshape(-1).bool().any() or valid2.reshape(-1).bool().any():
+                raise ValueError(
+                    "Semantic supervision is active but semantic logits are missing"
+                )
+            zero = self._zero_from_prediction(prediction)
+            return (
+                zero, zero, zero, zero, zero, zero, zero,
+                False, False,
+            )
+
         valid1 = self._valid_or_true(
             target,
             "semantic_valid_t1",
             raw1,
-            prediction.semantic_logits_t1.device,
+            logits1.device,
         )
         valid2 = self._valid_or_true(
             target,
             "semantic_valid_t2",
             raw2,
-            prediction.semantic_logits_t2.device,
+            logits2.device,
         )
 
         # Keep track of whether semantic supervision exists BEFORE the
@@ -417,16 +455,19 @@ class PAIRSemanticChangeLoss(nn.Module):
             #   - semantic CE/Lovasz learn semantic discrimination only where
             #     the binary target says the pixel changed.
             #
-            # Use the temporal-aware helper so future change_t1/change_t2
-            # targets remain compatible without changing the present SECOND /
-            # LandsatSCD shared-change convention.
-            change1, change_valid1 = self._change_target(target, 1)
-            change2, change_valid2 = self._change_target(target, 2)
+            if "change" not in target:
+                raise KeyError(
+                    "changed-only semantic supervision requires target['change']"
+                )
+            change = target["change"]
+            change_valid = target.get("change_valid")
+            if change_valid is None:
+                change_valid = torch.ones_like(change, dtype=torch.bool)
 
-            change1 = change1.to(valid1.device).reshape(-1)
-            change2 = change2.to(valid2.device).reshape(-1)
-            change_valid1 = change_valid1.to(valid1.device).reshape(-1).bool()
-            change_valid2 = change_valid2.to(valid2.device).reshape(-1).bool()
+            change1 = change.to(valid1.device).reshape(-1)
+            change2 = change.to(valid2.device).reshape(-1)
+            change_valid1 = change_valid.to(valid1.device).reshape(-1).bool()
+            change_valid2 = change_valid.to(valid2.device).reshape(-1).bool()
 
             if (
                 change1.numel() != valid1.numel()
@@ -438,17 +479,13 @@ class PAIRSemanticChangeLoss(nn.Module):
                     "changed-only semantic mask must match semantic target size"
                 )
 
-            for change, change_valid, name in (
-                (change1, change_valid1, "change_t1"),
-                (change2, change_valid2, "change_t2"),
-            ):
-                if change_valid.any():
-                    values = change[change_valid]
-                    if not torch.all((values == 0) | (values == 1)):
-                        bad = torch.unique(values).detach().cpu().tolist()
-                        raise ValueError(
-                            f"{name} valid target must contain only 0/1, got {bad}"
-                        )
+            if change_valid1.any():
+                values = change1[change_valid1]
+                if not torch.all((values == 0) | (values == 1)):
+                    bad = torch.unique(values).detach().cpu().tolist()
+                    raise ValueError(
+                        f"change valid target must contain only 0/1, got {bad}"
+                    )
 
             valid1 = valid1 & change_valid1 & (change1 == 1)
             valid2 = valid2 & change_valid2 & (change2 == 1)
@@ -669,7 +706,7 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         Therefore NYC-SCD's 3D event route and pure BCD batches are unchanged.
         """
-        zero = self._zero_from(prediction.semantic_logits_t1)
+        zero = self._zero_from_prediction(prediction)
 
         if self.ssc_weight <= 0 or not semantic_active:
             return zero, False
@@ -784,82 +821,27 @@ class PAIRSemanticChangeLoss(nn.Module):
 
         return 1.0 - dice
 
-    @staticmethod
-    def _change_target(target, time_id):
-        key = f"change_t{time_id}"
-        valid_key = f"change_valid_t{time_id}"
-
-        if key in target:
-            change = target[key]
-            valid = target.get(valid_key)
-
-            if valid is None:
-                valid = torch.ones_like(change, dtype=torch.bool)
-
-            return change, valid
+    def _binary_losses(self, prediction, target):
+        logits = getattr(prediction, "change_logits", None)
+        if logits is None:
+            raise ValueError("Binary branch must provide change_logits")
+        if "change" not in target:
+            raise KeyError("Binary change loss requires target['change']")
 
         change = target["change"]
         valid = target.get("change_valid")
-
         if valid is None:
             valid = torch.ones_like(change, dtype=torch.bool)
+        valid = valid.to(logits.device).reshape(-1).bool()
 
-        return change, valid
-
-    def _binary_losses(self, prediction, target):
-        if prediction.change_logits_t1 is None or prediction.change_logits_t2 is None:
-            raise ValueError(
-                "Binary branch must provide both change_logits_t1 and change_logits_t2"
-            )
-
-        change_t1, valid_t1 = self._change_target(target, 1)
-        change_t2, valid_t2 = self._change_target(target, 2)
-
-        valid_t1 = valid_t1.to(prediction.change_logits_t1.device).reshape(-1).bool()
-        valid_t2 = valid_t2.to(prediction.change_logits_t2.device).reshape(-1).bool()
-
-        active1 = bool(valid_t1.any().item())
-        active2 = bool(valid_t2.any().item())
-
-        bce1 = self.change_bce(
-            prediction.change_logits_t1,
-            change_t1,
-            valid_t1,
-        )
-        bce2 = self.change_bce(
-            prediction.change_logits_t2,
-            change_t2,
-            valid_t2,
-        )
-
-        dice1 = self.change_dice(
-            prediction.change_logits_t1,
-            change_t1,
-            valid_t1,
-        )
-        dice2 = self.change_dice(
-            prediction.change_logits_t2,
-            change_t2,
-            valid_t2,
-        )
-
-        change_bce = self._mean_over_active(
-            (bce1, bce2),
-            (active1, active2),
-        )
-        change_dice = self._mean_over_active(
-            (dice1, dice2),
-            (active1, active2),
-        )
-
-        change = (
+        active = bool(valid.any().item())
+        change_bce = self.change_bce(logits, change, valid)
+        change_dice = self.change_dice(logits, change, valid)
+        change_loss = (
             self.change_bce_weight * change_bce
             + self.change_dice_weight * change_dice
         )
-
-        change_active = active1 or active2
-
-        return change_bce, change_dice, change, change_active
+        return change_bce, change_dice, change_loss, active
 
     # ------------------------------------------------------------------
     # 3D event task: active-support CE + derived change Dice
@@ -1090,22 +1072,15 @@ class PAIRSemanticChangeLoss(nn.Module):
             changed_only=bool(semantic_changed_only),
         )
 
-        has_binary_t1 = prediction.change_logits_t1 is not None
-        has_binary_t2 = prediction.change_logits_t2 is not None
-        has_event_t1 = prediction.event_logits_t1 is not None
-        has_event_t2 = prediction.event_logits_t2 is not None
-
-        if has_binary_t1 != has_binary_t2:
-            raise ValueError(
-                "Binary branch is incomplete: change_logits_t1/t2 must be present together"
-            )
+        has_binary = getattr(prediction, "change_logits", None) is not None
+        has_event_t1 = getattr(prediction, "event_logits_t1", None) is not None
+        has_event_t2 = getattr(prediction, "event_logits_t2", None) is not None
 
         if has_event_t1 != has_event_t2:
             raise ValueError(
                 "Event branch is incomplete: event_logits_t1/t2 must be present together"
             )
 
-        has_binary = has_binary_t1 and has_binary_t2
         has_event = has_event_t1 and has_event_t2
 
         if not has_binary and not has_event:
@@ -1113,7 +1088,7 @@ class PAIRSemanticChangeLoss(nn.Module):
                 "PAIR loss received neither binary-change logits nor event logits"
             )
 
-        zero = self._zero_from(prediction.semantic_logits_t1)
+        zero = self._zero_from_prediction(prediction)
 
         change_bce = zero
         change_dice = zero
@@ -1265,8 +1240,7 @@ def _self_test():
     pred_plain = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
-        change_logits_t1=torch.randn(6, requires_grad=True),
-        change_logits_t2=torch.randn(6, requires_grad=True),
+        change_logits=torch.randn(6, requires_grad=True),
         event_logits_t1=None,
         event_logits_t2=None,
     )
@@ -1301,8 +1275,7 @@ def _self_test():
     pred_scd = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
-        change_logits_t1=torch.randn(6, requires_grad=True),
-        change_logits_t2=torch.randn(6, requires_grad=True),
+        change_logits=torch.randn(6, requires_grad=True),
         event_logits_t1=None,
         event_logits_t2=None,
     )
@@ -1367,8 +1340,7 @@ def _self_test():
     pred_unchanged = SimpleNamespace(
         semantic_logits_t1=torch.randn(4, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(4, 4, requires_grad=True),
-        change_logits_t1=torch.randn(4, requires_grad=True),
-        change_logits_t2=torch.randn(4, requires_grad=True),
+        change_logits=torch.randn(4, requires_grad=True),
         event_logits_t1=None,
         event_logits_t2=None,
     )
@@ -1399,7 +1371,7 @@ def _self_test():
     out_scd.total.backward()
     assert pred_scd.semantic_logits_t1.grad is not None
     assert pred_scd.semantic_logits_t2.grad is not None
-    assert pred_scd.change_logits_t1.grad is not None
+    assert pred_scd.change_logits.grad is not None
 
     # Formula sanity check:
     # identical semantic vectors at an unchanged pixel -> zero SSC.
@@ -1418,10 +1390,9 @@ def _self_test():
     # 2D BCD: semantic supervision fully masked -> SSCLoss inactive.
     # ------------------------------------------------------------------
     pred_bcd = SimpleNamespace(
-        semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
-        semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
-        change_logits_t1=torch.randn(6, requires_grad=True),
-        change_logits_t2=torch.randn(6, requires_grad=True),
+        semantic_logits_t1=None,
+        semantic_logits_t2=None,
+        change_logits=torch.randn(6, requires_grad=True),
         event_logits_t1=None,
         event_logits_t2=None,
     )
@@ -1457,8 +1428,6 @@ def _self_test():
     pred_3d = SimpleNamespace(
         semantic_logits_t1=torch.randn(6, 4, requires_grad=True),
         semantic_logits_t2=torch.randn(6, 4, requires_grad=True),
-        change_logits_t1=None,
-        change_logits_t2=None,
         event_logits_t1=torch.randn(6, 3, requires_grad=True),
         event_logits_t2=torch.randn(6, 3, requires_grad=True),
     )

@@ -138,10 +138,6 @@ class UnifiedDecoderOutput:
     # Qwen text pass while leaving the shared decoder representation unchanged.
     semantic_prototypes: torch.Tensor
 
-    # 2D binary path.
-    change_logits_t1: Optional[torch.Tensor]
-    change_logits_t2: Optional[torch.Tensor]
-
     # 3D event path.
     event_logits_t1: Optional[torch.Tensor]
     event_logits_t2: Optional[torch.Tensor]
@@ -161,8 +157,7 @@ class Cascade2DDecoderOutput:
 
     semantic_logits_t1: Optional[torch.Tensor]
     semantic_logits_t2: Optional[torch.Tensor]
-    change_logits_t1: torch.Tensor
-    change_logits_t2: torch.Tensor
+    change_logits: torch.Tensor
 
     # Keep the same semantic-class ordering metadata as UnifiedDecoderOutput.
     # Metrics uses raw_class_ids to verify that prototype/logit channel order
@@ -1075,11 +1070,9 @@ class UnifiedChangeDecoder(nn.Module):
     """
     One shared decoder core for 2D / 3D / 2D3D.
 
-    prediction_type:
-        "binary" -> 2D binary change logits
-        "event"  -> 3D three-class event logits
-
-    This is an internal routing argument, not a user config field.
+    The shared token decoder is used by the 3D semantic/event route.
+    The 2D binary/SCD route uses forward_2d_cg() and a single binary
+    change logit map.
     """
 
     EVENT_CLASSES = (
@@ -1105,11 +1098,19 @@ class UnifiedChangeDecoder(nn.Module):
         unified_num_heads: int = 8,
         unified_mlp_ratio: float = 2.0,
         unified_dropout: float = 0.0,
+        enable_2d: bool = True,
+        enable_3d: bool = True,
+        enable_semantic: bool = True,
     ):
         super().__init__()
         self.decoder_dim = int(decoder_dim)
         self.qwen_dim = int(qwen_dim)
         self.vision_dim = int(vision_dim)
+        self.enable_2d = bool(enable_2d)
+        self.enable_3d = bool(enable_3d)
+        self.enable_semantic = bool(enable_semantic)
+        if not (self.enable_2d or self.enable_3d):
+            raise ValueError("UnifiedChangeDecoder needs at least one active route")
 
         self.token_embedding = UnifiedTokenEmbedding(
             self.decoder_dim,
@@ -1139,10 +1140,18 @@ class UnifiedChangeDecoder(nn.Module):
             dropout=unified_dropout,
         )
 
-        self.temporal_fusion = SparseTemporalFusion(self.decoder_dim)
+        # Shared task conditioning remains active for every route.
         self.task_conditioning = TaskConditioning(
             self.qwen_dim,
             self.decoder_dim,
+        )
+
+        # 3D-only post-Unified processing.  These modules are intentionally not
+        # constructed for a 2D-only run.
+        self.temporal_fusion = (
+            SparseTemporalFusion(self.decoder_dim)
+            if self.enable_3d
+            else None
         )
         self.shared_blocks = nn.ModuleList(
             [
@@ -1153,18 +1162,26 @@ class UnifiedChangeDecoder(nn.Module):
                 )
                 for _ in range(int(num_shared_blocks))
             ]
+            if self.enable_3d
+            else []
         )
-
-        # Shared latent representations.
-        self.semantic_head = nn.Sequential(
-            nn.LayerNorm(self.decoder_dim),
-            nn.Linear(self.decoder_dim, self.decoder_dim),
-            nn.GELU(),
+        self.semantic_head = (
+            nn.Sequential(
+                nn.LayerNorm(self.decoder_dim),
+                nn.Linear(self.decoder_dim, self.decoder_dim),
+                nn.GELU(),
+            )
+            if self.enable_3d and self.enable_semantic
+            else None
         )
-        self.change_head = nn.Sequential(
-            nn.LayerNorm(self.decoder_dim),
-            nn.Linear(self.decoder_dim, self.decoder_dim),
-            nn.GELU(),
+        self.change_head = (
+            nn.Sequential(
+                nn.LayerNorm(self.decoder_dim),
+                nn.Linear(self.decoder_dim, self.decoder_dim),
+                nn.GELU(),
+            )
+            if self.enable_3d
+            else None
         )
 
         # PAIR V2 2D route.
@@ -1173,43 +1190,54 @@ class UnifiedChangeDecoder(nn.Module):
         #  ViT DeepStack @ 1/16, dense<-LLM fused feature @ 1/32].
         # The deepest feature has already been projected into decoder_dim and
         # fused by dense-query / LLM-key-value cross-attention.
-        self.cg_decoder_2d = CascadeGatedDecoder(
-            in_channel_list=(
-                self.vision_dim,
-                self.vision_dim,
-                self.vision_dim,
-                self.decoder_dim,
-            ),
-            out_channels=self.decoder_dim,
-            drop_rate=dropout,
-            use_refinement_block=False,
+        self.cg_decoder_2d = (
+            CascadeGatedDecoder(
+                in_channel_list=(
+                    self.vision_dim,
+                    self.vision_dim,
+                    self.vision_dim,
+                    self.decoder_dim,
+                ),
+                out_channels=self.decoder_dim,
+                drop_rate=dropout,
+                use_refinement_block=False,
+            )
+            if self.enable_2d
+            else None
         )
 
-        # Output heads.
-        # Legacy/unified binary classifier is kept for the original token route.
-        self.binary_change_classifier = nn.Linear(self.decoder_dim, 1)
-
-        # PAIR V2 2D CG change classifier.
-        # One shared xc stream produces two temporal binary logits:
-        #   channel 0 -> change_logits_t1
-        #   channel 1 -> change_logits_t2
-        # These are two independent output channels, not unchanged/change classes.
-        self.classifier_cd = nn.Sequential(
-            nn.Conv2d(self.decoder_dim, self.decoder_dim // 2, kernel_size=1),
-            nn.BatchNorm2d(self.decoder_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(self.decoder_dim // 2, 2, kernel_size=1),
+        # Output heads are route-aware.  Shared semantic language prototypes are
+        # kept whenever any active dataset has semantic supervision.
+        self.classifier_cd = (
+            nn.Sequential(
+                nn.Conv2d(self.decoder_dim, self.decoder_dim // 2, kernel_size=1),
+                nn.BatchNorm2d(self.decoder_dim // 2),
+                nn.ReLU(),
+                nn.Conv2d(self.decoder_dim // 2, 1, kernel_size=1),
+            )
+            if self.enable_2d
+            else None
+        )
+        self.event_head = (
+            nn.Linear(self.decoder_dim, 3)
+            if self.enable_3d
+            else None
         )
 
-        self.event_head = nn.Linear(self.decoder_dim, 3)
-
-        self.class_encoder = QwenClassPrototypeEncoder(
-            qwen_dim=self.qwen_dim,
-            decoder_dim=self.decoder_dim,
+        self.class_encoder = (
+            QwenClassPrototypeEncoder(
+                qwen_dim=self.qwen_dim,
+                decoder_dim=self.decoder_dim,
+            )
+            if self.enable_semantic
+            else None
         )
-        self.logit_scale = nn.Parameter(
-            torch.tensor(float(initial_logit_scale)).log()
-        )
+        if self.enable_semantic:
+            self.logit_scale = nn.Parameter(
+                torch.tensor(float(initial_logit_scale)).log()
+            )
+        else:
+            self.register_parameter("logit_scale", None)
 
     @staticmethod
     def _normalize_2d_prediction_mode(prediction_mode: str) -> str:
@@ -1297,6 +1325,8 @@ class UnifiedChangeDecoder(nn.Module):
         feature: torch.Tensor,
         prototypes: torch.Tensor,
     ) -> torch.Tensor:
+        if self.logit_scale is None:
+            raise RuntimeError("Semantic prototype head is not configured for this run")
         feature = F.normalize(feature.float(), dim=1)
         scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
         return scale * torch.einsum(
@@ -1305,14 +1335,16 @@ class UnifiedChangeDecoder(nn.Module):
             prototypes,
         )
 
-    def _binary_logits_2d(self, feature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _binary_logits_2d(self, feature: torch.Tensor) -> torch.Tensor:
+        if self.classifier_cd is None:
+            raise RuntimeError("2D change head is not configured for this run")
         logits = self.classifier_cd(feature)
-        if logits.ndim != 4 or logits.shape[1] != 2:
+        if logits.ndim != 4 or logits.shape[1] != 1:
             raise RuntimeError(
-                "2D CG change classifier must return [B,2,H,W], "
+                "2D CG change classifier must return [B,1,H,W], "
                 f"got {tuple(logits.shape)}"
             )
-        return logits[:, 0], logits[:, 1]
+        return logits[:, 0]
 
     def forward_2d_cg(
         self,
@@ -1345,6 +1377,8 @@ class UnifiedChangeDecoder(nn.Module):
         SCD and BCD share the exact same CG decoder and explicit xc stream.
         Only the final prediction route differs.
         """
+        if not self.enable_2d or self.cg_decoder_2d is None:
+            raise RuntimeError("2D decoder route is not configured for this run")
         prediction_mode = self._normalize_2d_prediction_mode(
             prediction_mode
         )
@@ -1371,7 +1405,7 @@ class UnifiedChangeDecoder(nn.Module):
             feat_pyramid_t2,
         )
 
-        change_logits_t1, change_logits_t2 = self._binary_logits_2d(xc)
+        change_logits = self._binary_logits_2d(xc)
 
         if prediction_mode == "scd":
             if class_names is None:
@@ -1379,6 +1413,10 @@ class UnifiedChangeDecoder(nn.Module):
             if qwen_backbone is None:
                 raise ValueError("SCD route requires qwen_backbone")
 
+            if self.class_encoder is None:
+                raise RuntimeError(
+                    "Semantic prototype head is not configured for this run"
+                )
             raw_class_ids, ordered_class_names, prototypes = self.class_encoder(
                 class_names=class_names,
                 qwen_backbone=qwen_backbone,
@@ -1395,21 +1433,10 @@ class UnifiedChangeDecoder(nn.Module):
         return Cascade2DDecoderOutput(
             semantic_logits_t1=semantic_logits_t1,
             semantic_logits_t2=semantic_logits_t2,
-            change_logits_t1=change_logits_t1,
-            change_logits_t2=change_logits_t2,
+            change_logits=change_logits,
             raw_class_ids=raw_class_ids,
             class_names=ordered_class_names,
         )
-
-    @staticmethod
-    def _normalize_prediction_type(prediction_type: str) -> str:
-        prediction_type = str(prediction_type).lower().strip()
-        if prediction_type not in ("binary", "event"):
-            raise ValueError(
-                "prediction_type must be 'binary' or 'event', "
-                f"got {prediction_type!r}"
-            )
-        return prediction_type
 
     def _prepare_reasoning(
         self,
@@ -1435,6 +1462,8 @@ class UnifiedChangeDecoder(nn.Module):
         feature: torch.Tensor,
         prototypes: torch.Tensor,
     ) -> torch.Tensor:
+        if self.logit_scale is None:
+            raise RuntimeError("Semantic prototype head is not configured for this run")
         feature = F.normalize(feature.float(), dim=-1)
         scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
         return scale * (feature @ prototypes.T)
@@ -1548,10 +1577,15 @@ class UnifiedChangeDecoder(nn.Module):
         class_names: Dict[int, str],
         qwen_backbone,
         detach_qwen_class_encoder: bool = True,
-        prediction_type: str = "binary",
     ) -> UnifiedDecoderOutput:
-        prediction_type = self._normalize_prediction_type(prediction_type)
-
+        if not self.enable_3d:
+            raise RuntimeError("3D/token decoder route is not configured for this run")
+        if self.temporal_fusion is None or self.change_head is None:
+            raise RuntimeError("3D decoder modules are not configured for this run")
+        if self.semantic_head is None or self.class_encoder is None:
+            raise RuntimeError(
+                "3D semantic prototype path is not configured for this run"
+            )
         dense_t1.validate(
             feature_dim=self.decoder_dim,
             name="dense_t1",
@@ -1644,21 +1678,11 @@ class UnifiedChangeDecoder(nn.Module):
             prototypes,
         )
 
-        # 7) Route only the final change/event classifier.
-        if prediction_type == "binary":
-            change_logits_t1 = self.binary_change_classifier(
-                change_feature_t1
-            )[:, 0]
-            change_logits_t2 = self.binary_change_classifier(
-                change_feature_t2
-            )[:, 0]
-            event_logits_t1 = None
-            event_logits_t2 = None
-        else:
-            change_logits_t1 = None
-            change_logits_t2 = None
-            event_logits_t1 = self.event_head(change_feature_t1)
-            event_logits_t2 = self.event_head(change_feature_t2)
+        # 7) 3D directional event classifier.
+        if self.event_head is None:
+            raise RuntimeError("3D event head is not configured for this run")
+        event_logits_t1 = self.event_head(change_feature_t1)
+        event_logits_t2 = self.event_head(change_feature_t2)
 
         return UnifiedDecoderOutput(
             semantic_feature_t1=semantic_feature_t1,
@@ -1668,8 +1692,6 @@ class UnifiedChangeDecoder(nn.Module):
             semantic_logits_t1=semantic_logits_t1,
             semantic_logits_t2=semantic_logits_t2,
             semantic_prototypes=prototypes,
-            change_logits_t1=change_logits_t1,
-            change_logits_t2=change_logits_t2,
             event_logits_t1=event_logits_t1,
             event_logits_t2=event_logits_t2,
             raw_class_ids=raw_class_ids,

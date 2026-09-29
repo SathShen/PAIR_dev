@@ -390,6 +390,23 @@ def _optimizer_group_name(parameter_name: str) -> str:
     return "main"
 
 
+def active_model_flags(experiment):
+    """Derive route-aware model construction from the selected datasets."""
+    specs = [experiment.datasets[name].spec for name in experiment.selected_names]
+    enable_2d = any(spec.route in {"2d", "2d3d"} for spec in specs)
+    enable_3d = any(spec.route in {"3d", "2d3d"} for spec in specs)
+    # binary-only datasets do not need semantic prototypes/logits; semantic_pair
+    # and post_semantic both do.
+    enable_semantic = any(spec.label_mode != "binary" for spec in specs)
+    if not (enable_2d or enable_3d):
+        raise RuntimeError("Selected datasets do not activate any PAIR route")
+    return {
+        "enable_2d": enable_2d,
+        "enable_3d": enable_3d,
+        "enable_semantic": enable_semantic,
+    }
+
+
 def build_optimizer(model, settings):
     named_groups = {
         "main": [],
@@ -491,9 +508,6 @@ def _architecture_module_bucket(parameter_name: str) -> str:
 
     if name.startswith("decoder.event_head."):
         return "3D Event Head"
-
-    if name.startswith("decoder.binary_change_classifier."):
-        return "Legacy Binary Head"
 
     # Everything else under decoder is the shared/unified token decoder core:
     # token embedding, reasoning projection/injection, temporal fusion,
@@ -616,7 +630,6 @@ def print_trainable_parameter_report(model, optimizer):
         "Semantic Prototype Head",
         "2D Change Head",
         "3D Event Head",
-        "Legacy Binary Head",
         "Image Adapter",
     )
     ordered_names = [name for name in preferred_order if name in modules]
@@ -744,8 +757,10 @@ def save_checkpoint(
         "vision_lora": custom_lora_state_dict(
             base.qwen_backbone.model, kind="vision"
         ),
-        "point_lora": custom_lora_state_dict(
-            base.point_encoder.model, kind="utonia"
+        "point_lora": (
+            custom_lora_state_dict(base.point_encoder.model, kind="utonia")
+            if base.point_encoder is not None
+            else {}
         ),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -773,7 +788,7 @@ def load_checkpoint(path, model, optimizer, scheduler):
     # old decoder checkpoints do not contain the new 3D event_head.
     if "decoder" in ckpt:
         base.decoder.load_state_dict(ckpt["decoder"], strict=False)
-    if "image_adapter" in ckpt:
+    if "image_adapter" in ckpt and base.image_adapter is not None:
         base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
     load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
     load_custom_lora_state_dict(
@@ -781,11 +796,12 @@ def load_checkpoint(path, model, optimizer, scheduler):
         ckpt.get("vision_lora", {}),
         kind="vision",
     )
-    load_custom_lora_state_dict(
-        base.point_encoder.model,
-        ckpt.get("point_lora", {}),
-        kind="utonia",
-    )
+    if base.point_encoder is not None:
+        load_custom_lora_state_dict(
+            base.point_encoder.model,
+            ckpt.get("point_lora", {}),
+            kind="utonia",
+        )
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return (
@@ -1067,8 +1083,15 @@ def main():
         updates_per_epoch = dataset_scheduler.updates_per_epoch
         total_updates = updates_per_epoch * settings.epochs
 
-        # Complete model construction is owned by models/pair.py.
-        model = PAIRModel.from_config(experiment.model, runtime["device"])
+        # Construct only the modality-specific branches required by the
+        # selected datasets.  Cross-Attn + Unified Decoder remain shared and
+        # are always constructed for every active route.
+        model_flags = active_model_flags(experiment)
+        model = PAIRModel.from_config(
+            experiment.model,
+            runtime["device"],
+            **model_flags,
+        )
         if runtime["distributed"]:
             model = DDP(
                 model,
@@ -1132,6 +1155,12 @@ def main():
             print("=" * 96)
             print("Experiment:", experiment.experiment["name"])
             print("Datasets:", ", ".join(experiment.selected_names))
+            print(
+                "Active model routes:",
+                f"2D={model_flags['enable_2d']}",
+                f"3D={model_flags['enable_3d']}",
+                f"semantic={model_flags['enable_semantic']}",
+            )
             print()
             print_trainable_parameter_report(model, optimizer)
             print("GPUs:", runtime["world_size"])
