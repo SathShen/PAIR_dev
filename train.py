@@ -280,12 +280,14 @@ def forward_loss(model, criterion, samples, spec):
     prompts = [sample["prompt"] for sample in samples]
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
+        prediction_mode = "bcd" if spec.label_mode == "binary" else "scd"
         prediction = model(
             images_t1=[sample["images_t1"] for sample in samples],
             images_t2=[sample["images_t2"] for sample in samples],
             prompts=prompts,
             class_names=spec.class_names,
             output_sizes=output_sizes,
+            prediction_mode=prediction_mode,
         )
     elif spec.route == "3d":
         prediction = model(
@@ -499,8 +501,7 @@ def _architecture_module_bucket(parameter_name: str) -> str:
     if name.startswith("decoder."):
         return "Unified Decoder"
 
-    # Current PAIR V2 does not instantiate image_adapter, but keep this
-    # explicit in case an old config brings it back.
+    # 2D final Qwen-ViT dense tokens -> decoder_dim before dense/LLM cross-attention.
     if name.startswith("image_adapter."):
         return "Image Adapter"
 

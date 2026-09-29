@@ -80,6 +80,7 @@
       "root": "/home/sht/Datasets/SECONDpair",
       "per_gpu_batch_size": 4,
       "ignored_id": null,
+      "description": "Bi-temporal 2D semantic change detection on remote-sensing imagery. The task is to identify changed regions and reason about land-cover semantics at both times; binary change is supervised over the image, while semantic discrimination is used for changed regions.",
       "class_names": {
         "0": "unchanged",
         "1": "water",
@@ -94,6 +95,7 @@
       "root": "/home/sht/Datasets/LEVIR-CDpair",
       "per_gpu_batch_size": 4,
       "ignored_id": null,
+      "description": "Bi-temporal 2D building change detection on remote-sensing imagery. The target semantic object is building, and changed regions correspond to building additions or removals. The dataset provides binary changed-versus-unchanged supervision only and does not provide per-time semantic labels.",
       "class_names": {
         "0": "unchanged",
         "255": "changed"
@@ -103,6 +105,7 @@
       "root": "/home/sht/Datasets/LandsatSCDpair",
       "per_gpu_batch_size": 4,
       "ignored_id": null,
+      "description": "Bi-temporal 2D semantic change detection on Landsat imagery. The task is to identify changed regions and reason about land-cover semantics at both times using the declared land-cover classes.",
       "class_names": {
         "0": "unchanged",
         "1": "farmland",
@@ -115,6 +118,7 @@
       "root": "/home/sht/Datasets/NYC-SCDpair",
       "per_gpu_batch_size": 1,
       "ignored_id": -1,
+      "description": "Bi-temporal 3D semantic change detection on urban point clouds. Predict per-point semantic classes at both times and directional change events; the event protocol is unchanged, added, and removed, with removed supported at Time 1 and added supported at Time 2. Vegetation participates in semantic classification but is excluded from change-event labeling.",
       "class_names": {
         "0": "ground",
         "1": "building",

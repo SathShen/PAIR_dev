@@ -7,6 +7,7 @@ The user JSON is intentionally minimal for each dataset:
         "root": "/home/sht/Datasets/SECONDpair",
         "per_gpu_batch_size": 4,
         "ignored_id": null,
+        "description": "Detailed dataset and task description used as Qwen prompt context.",
         "class_names": {
             "0": "unchanged",
             "1": "water",
@@ -109,6 +110,15 @@ def _require_dict(value, name):
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be a JSON object")
     return value
+
+
+def _normalize_description(value, dataset_name) -> str:
+    if value is None:
+        raise KeyError(f"datasets.{dataset_name}.description is required")
+    description = str(value).strip()
+    if not description:
+        raise ValueError(f"datasets.{dataset_name}.description must not be empty")
+    return description
 
 
 def _normalize_class_names(value, dataset_name) -> Dict[int, str]:
@@ -216,6 +226,7 @@ class DatasetConfig:
     root: Path
     per_gpu_batch_size: int
     class_names: Dict[int, str]
+    description: str
     ignored_id: Optional[int]
 
     modalities: Tuple[str, ...]
@@ -234,6 +245,7 @@ class DatasetConfig:
             "name": self.name,
             "root": str(self.root),
             "per_gpu_batch_size": self.per_gpu_batch_size,
+            "description": self.description,
             "class_names": {str(k): v for k, v in self.class_names.items()},
             "ignored_id": self.ignored_id,
             # Inferred PAIR schema/runtime metadata:
@@ -312,7 +324,7 @@ def _resolve_path(value, config_dir: Path) -> Path:
 
 def _dataset_from_json(name: str, data: Mapping[str, Any], config_dir: Path) -> DatasetConfig:
     data = _require_dict(dict(data), f"datasets.{name}")
-    allowed = {"root", "per_gpu_batch_size", "class_names", "ignored_id"}
+    allowed = {"root", "per_gpu_batch_size", "class_names", "description", "ignored_id"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise KeyError(
@@ -326,6 +338,7 @@ def _dataset_from_json(name: str, data: Mapping[str, Any], config_dir: Path) -> 
     root = _resolve_path(data["root"], config_dir)
     schema = infer_dataset_schema(root)
     class_names = _normalize_class_names(data.get("class_names"), name)
+    description = _normalize_description(data.get("description"), name)
     ignored_id = _normalize_ignored_id(data.get("ignored_id"), name)
 
     # Runtime metadata only. It is derived by class name and is not stored in DatasetSpec.
@@ -344,6 +357,7 @@ def _dataset_from_json(name: str, data: Mapping[str, Any], config_dir: Path) -> 
         modalities=schema["modalities"],
         label_mode=schema["label_mode"],
         class_names=class_names,
+        description=description,
         ignored_id=ignored_id,
     )
 
@@ -352,6 +366,7 @@ def _dataset_from_json(name: str, data: Mapping[str, Any], config_dir: Path) -> 
         root=root,
         per_gpu_batch_size=batch,
         class_names=class_names,
+        description=description,
         ignored_id=ignored_id,
         modalities=schema["modalities"],
         route=schema["route"],

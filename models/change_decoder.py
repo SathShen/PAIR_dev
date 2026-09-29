@@ -1046,8 +1046,15 @@ class QwenClassPrototypeEncoder(nn.Module):
             )
 
         if detach_qwen:
-            with torch.no_grad():
-                language_hidden = run_qwen().detach()
+            # Prototype text encoding is a read-only Qwen pass. Disable dropout
+            # for deterministic class features, then restore the caller's mode.
+            qwen_was_training = qwen_model.training
+            qwen_model.eval()
+            try:
+                with torch.no_grad():
+                    language_hidden = run_qwen().detach()
+            finally:
+                qwen_model.train(qwen_was_training)
         else:
             language_hidden = run_qwen()
 

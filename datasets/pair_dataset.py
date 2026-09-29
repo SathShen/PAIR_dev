@@ -168,6 +168,7 @@ class DatasetSpec:
     modalities: Tuple[str, ...]
     label_mode: str
     class_names: Dict[int, str]
+    description: str
     ignored_id: Optional[int] = None
 
     @property
@@ -393,14 +394,23 @@ def build_canonical_target(
 
 
 def build_default_prompt(spec: DatasetSpec) -> str:
+    # Dataset-specific context is explicit in JSON so Qwen receives more than
+    # only a generic route label.  Structural routing is still inferred from
+    # the prepared directory; description is semantic/task context only.
+    text = spec.description.strip()
+    if text and not text.endswith((".", "!", "?")):
+        text += "."
+    if text:
+        text += " "
+
     if spec.has_point:
-        text = (
+        text += (
             "Perform 3D semantic change reasoning between Time 1 and Time 2. "
             "Predict the semantic class at both times and the per-point change event."
         )
     else:
-        text = (
-            "Perform semantic change detection between Time 1 and Time 2. "
+        text += (
+            "Perform change detection between Time 1 and Time 2. "
             "Identify unchanged and changed regions."
         )
         if spec.label_mode == "semantic_pair":
@@ -412,13 +422,18 @@ def build_default_prompt(spec: DatasetSpec) -> str:
             )
         elif spec.label_mode == "binary":
             text += (
-                " The source dataset supervises change only; semantic classes before "
-                "and after change may be unknown."
+                " The source dataset provides binary change supervision only; do not "
+                "assume per-time semantic labels are available."
             )
 
     if spec.class_names:
         classes = ", ".join(f"{raw_id}: {name}" for raw_id, name in spec.class_names.items())
-        text += " Valid semantic classes are: " + classes + "."
+        if spec.label_mode == "binary":
+            text += " Valid change labels are: " + classes + "."
+        elif spec.label_mode == "post_semantic":
+            text += " Valid supervised semantic classes are: " + classes + "."
+        else:
+            text += " Valid semantic classes are: " + classes + "."
     return text
 
 
