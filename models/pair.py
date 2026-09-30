@@ -1762,6 +1762,7 @@ class PAIRModel(nn.Module):
             unified_num_heads=int(unified_cfg.get("num_heads", 8)),
             unified_mlp_ratio=float(unified_cfg.get("mlp_ratio", 2.0)),
             unified_dropout=float(unified_cfg.get("dropout", 0.0)),
+            multiscale_path_dropout=float(cfg.get("multiscale_path_dropout", 0.3)),
             enable_2d=enable_2d,
             enable_3d=enable_3d,
             enable_semantic=enable_semantic,

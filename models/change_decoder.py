@@ -1106,6 +1106,7 @@ class UnifiedChangeDecoder(nn.Module):
         unified_num_heads: int = 8,
         unified_mlp_ratio: float = 2.0,
         unified_dropout: float = 0.0,
+        multiscale_path_dropout: float = 0.3,
         enable_2d: bool = True,
         enable_3d: bool = True,
         enable_semantic: bool = True,
@@ -1117,6 +1118,12 @@ class UnifiedChangeDecoder(nn.Module):
         self.enable_2d = bool(enable_2d)
         self.enable_3d = bool(enable_3d)
         self.enable_semantic = bool(enable_semantic)
+        self.multiscale_path_dropout = float(multiscale_path_dropout)
+        if not 0.0 <= self.multiscale_path_dropout < 1.0:
+            raise ValueError(
+                "multiscale_path_dropout must be in [0, 1), "
+                f"got {self.multiscale_path_dropout}"
+            )
         if not (self.enable_2d or self.enable_3d):
             raise ValueError("UnifiedChangeDecoder needs at least one active route")
 
@@ -1328,6 +1335,45 @@ class UnifiedChangeDecoder(nn.Module):
                     )
             previous_hw = hw
 
+    def _apply_multiscale_path_dropout(
+        self,
+        feat_pyramid_t1: Sequence[torch.Tensor],
+        feat_pyramid_t2: Sequence[torch.Tensor],
+    ) -> Tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]:
+        """
+        Training-only path dropout for the three shallow 2D Vision scales.
+
+        p4 / p8 / p16 are dropped independently per sample with probability p.
+        The SAME mask is applied to T1 and T2 at each scale so dropout cannot
+        create an artificial temporal change.  p32 is never dropped here.
+
+        Inverted-dropout scaling keeps the expected activation magnitude of a
+        retained path unchanged in expectation.  Evaluation is untouched.
+        """
+        p = self.multiscale_path_dropout
+        if (not self.training) or p <= 0.0:
+            return feat_pyramid_t1, feat_pyramid_t2
+
+        keep_prob = 1.0 - p
+        out_t1 = list(feat_pyramid_t1)
+        out_t2 = list(feat_pyramid_t2)
+
+        for i in range(3):  # p4, p8, p16 only; p32 stays intact.
+            feat1 = out_t1[i]
+            feat2 = out_t2[i]
+            mask = (
+                torch.rand(
+                    (feat1.shape[0], 1, 1, 1),
+                    device=feat1.device,
+                )
+                < keep_prob
+            ).to(dtype=feat1.dtype)
+            mask = mask / keep_prob
+            out_t1[i] = feat1 * mask
+            out_t2[i] = feat2 * mask.to(dtype=feat2.dtype, device=feat2.device)
+
+        return out_t1, out_t2
+
     def _semantic_logits_2d(
         self,
         feature: torch.Tensor,
@@ -1407,6 +1453,11 @@ class UnifiedChangeDecoder(nn.Module):
                     f"T1/T2 pyramid shape mismatch at scale {i}: "
                     f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
                 )
+
+        feat_pyramid_t1, feat_pyramid_t2 = self._apply_multiscale_path_dropout(
+            feat_pyramid_t1,
+            feat_pyramid_t2,
+        )
 
         x0, x1, xc = self.cg_decoder_2d(
             feat_pyramid_t1,
