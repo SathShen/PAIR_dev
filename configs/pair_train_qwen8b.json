@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_8B_ver2",
+    "name": "PAIR_SECOND_8B_1e4loralr",
     "seed": 42,
     "epochs": 50
   },
@@ -46,12 +46,12 @@
     }
   },
   "optimizer": {
-    "lr": 0.0001,
+    "lr": 1e-4,
     "scheduler": "cosine",
     "warmup_ratio": 0.03,
     "max_grad_norm": 3.0,
-    "llm_lora_lr": 2e-05,
-    "vision_lora_lr": 2e-05,
+    "llm_lora_lr": 1e-4,
+    "vision_lora_lr": 1e-4,
     "point_lora_lr": 1e-05,
     "main_weight_decay": 0.01,
     "llm_lora_weight_decay": 0.01,
