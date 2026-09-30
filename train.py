@@ -95,15 +95,13 @@ def build_settings(experiment: ExperimentConfig, cli):
 
     return SimpleNamespace(
         lr=float(o.get("lr", 1e-4)),
-        lora_lr=float(o.get("lora_lr", 2e-5)),  # legacy alias for LLM LoRA
-        llm_lora_lr=float(o.get("llm_lora_lr", o.get("lora_lr", 2e-5))),
+        llm_lora_lr=float(o.get("llm_lora_lr", 2e-5)),
         vision_lora_lr=float(o.get("vision_lora_lr", 2e-5)),
         point_lora_lr=float(o.get("point_lora_lr", 1e-5)),
-        weight_decay=float(o.get("weight_decay", 0.01)),
-        main_weight_decay=float(o.get("main_weight_decay", o.get("weight_decay", 0.01))),
-        llm_lora_weight_decay=float(o.get("llm_lora_weight_decay", o.get("weight_decay", 0.01))),
-        vision_lora_weight_decay=float(o.get("vision_lora_weight_decay", o.get("weight_decay", 0.01))),
-        point_lora_weight_decay=float(o.get("point_lora_weight_decay", o.get("weight_decay", 0.01))),
+        main_weight_decay=float(o.get("main_weight_decay", 0.01)),
+        llm_lora_weight_decay=float(o.get("llm_lora_weight_decay", 0.01)),
+        vision_lora_weight_decay=float(o.get("vision_lora_weight_decay", 0.01)),
+        point_lora_weight_decay=float(o.get("point_lora_weight_decay", 0.01)),
         scheduler=str(o.get("scheduler", "cosine")),
         warmup_ratio=float(o.get("warmup_ratio", 0.03)),
         max_grad_norm=float(o.get("max_grad_norm", 1.0)),
@@ -449,9 +447,8 @@ def build_optimizer(model, settings):
     if not groups:
         raise RuntimeError("PAIR has no trainable parameters")
 
-    # WD is explicit per group above; the optimizer-level default is only a
-    # fallback and does not silently override group-specific values.
-    optimizer = torch.optim.AdamW(groups, weight_decay=settings.weight_decay)
+    # Learning rate and weight decay are explicit for every optimizer group.
+    optimizer = torch.optim.AdamW(groups)
     return optimizer, group_params, named_groups
 
 

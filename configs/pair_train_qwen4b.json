@@ -47,8 +47,6 @@
   },
   "optimizer": {
     "lr": 0.0001,
-    "lora_lr": 2e-05,
-    "weight_decay": 0.01,
     "scheduler": "cosine",
     "warmup_ratio": 0.03,
     "max_grad_norm": 3.0,
