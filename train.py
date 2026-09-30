@@ -718,15 +718,94 @@ def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
 # Checkpoints
 # =============================================================================
 
-def non_qwen_trainable_state(model):
+FOUNDATION_STATE_PREFIXES = (
+    "backbone.qwen_backbone.model.",
+    "point_encoder.model.",
+)
+
+
+def _is_foundation_state_name(name):
+    return any(name.startswith(prefix) for prefix in FOUNDATION_STATE_PREFIXES)
+
+
+def pair_checkpoint_state(model):
+    """
+    Return the PAIR state that must be checkpointed outside the separately
+    stored Qwen/Utonia LoRA adapters.
+
+    This includes:
+      - every trainable non-foundation parameter;
+      - every persistent non-foundation buffer (notably BatchNorm running
+        statistics and num_batches_tracked).
+
+    Frozen foundation-model weights/buffers are intentionally excluded because
+    they are restored from their pretrained checkpoints. Qwen/Utonia LoRA
+    parameters are also excluded here because they are saved separately.
+    """
     base = unwrap(model)
     state = base.state_dict()
-    names = {
+
+    trainable_names = {
         name
         for name, parameter in base.named_parameters()
-        if parameter.requires_grad and not name.startswith("backbone.qwen_backbone.model.")
+        if parameter.requires_grad and not _is_foundation_state_name(name)
     }
-    return {key: value.detach().cpu() for key, value in state.items() if key in names}
+    buffer_names = {
+        name
+        for name, _ in base.named_buffers()
+        if not _is_foundation_state_name(name)
+    }
+    names = trainable_names | buffer_names
+
+    return {
+        key: value.detach().cpu()
+        for key, value in state.items()
+        if key in names
+    }
+
+
+def load_model_state_from_checkpoint(ckpt, model):
+    """Restore model weights/buffers without touching optimizer state.
+
+    New checkpoints use ``pair_state`` and include non-foundation buffers.
+    ``pair_trainable`` is accepted only so existing pre-fix checkpoints can be
+    loaded for BN recalibration/recovery. Those old checkpoints cannot restore
+    their original BatchNorm running statistics because the buffers were never
+    saved.
+    """
+    base = unwrap(model)
+
+    pair_state = ckpt.get("pair_state")
+    legacy_missing_buffers = pair_state is None
+    if pair_state is None:
+        pair_state = ckpt.get("pair_trainable", {})
+
+    if pair_state:
+        current = base.state_dict()
+        current.update(pair_state)
+        base.load_state_dict(current, strict=False)
+
+    # Compatibility with pre-PAIRModel checkpoints. strict=False is intentional:
+    # old decoder checkpoints do not contain the newer event head.
+    if "decoder" in ckpt:
+        base.decoder.load_state_dict(ckpt["decoder"], strict=False)
+    if "image_adapter" in ckpt and base.image_adapter is not None:
+        base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
+
+    load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
+    load_custom_lora_state_dict(
+        base.qwen_backbone.model,
+        ckpt.get("vision_lora", {}),
+        kind="vision",
+    )
+    if base.point_encoder is not None:
+        load_custom_lora_state_dict(
+            base.point_encoder.model,
+            ckpt.get("point_lora", {}),
+            kind="utonia",
+        )
+
+    return legacy_missing_buffers
 
 
 def save_checkpoint(
@@ -749,7 +828,8 @@ def save_checkpoint(
         "epoch": int(epoch),
         "update_in_epoch": int(update_in_epoch),
         "optimizer_step": int(optimizer_step),
-        "pair_trainable": non_qwen_trainable_state(model),
+        "checkpoint_format_version": 2,
+        "pair_state": pair_checkpoint_state(model),
         "lora": lora_state_dict(base.qwen_backbone.model),
         "vision_lora": custom_lora_state_dict(
             base.qwen_backbone.model, kind="vision"
@@ -775,29 +855,13 @@ def save_checkpoint(
 
 def load_checkpoint(path, model, optimizer, scheduler):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    base = unwrap(model)
-    trainable_state = ckpt.get("pair_trainable", {})
-    if trainable_state:
-        current = base.state_dict()
-        current.update(trainable_state)
-        base.load_state_dict(current, strict=False)
-    # Compatibility with pre-PAIRModel checkpoints. strict=False is intentional:
-    # old decoder checkpoints do not contain the new 3D event_head.
-    if "decoder" in ckpt:
-        base.decoder.load_state_dict(ckpt["decoder"], strict=False)
-    if "image_adapter" in ckpt and base.image_adapter is not None:
-        base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
-    load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
-    load_custom_lora_state_dict(
-        base.qwen_backbone.model,
-        ckpt.get("vision_lora", {}),
-        kind="vision",
-    )
-    if base.point_encoder is not None:
-        load_custom_lora_state_dict(
-            base.point_encoder.model,
-            ckpt.get("point_lora", {}),
-            kind="utonia",
+    legacy_missing_buffers = load_model_state_from_checkpoint(ckpt, model)
+    if legacy_missing_buffers:
+        print(
+            "Warning: legacy checkpoint uses pair_trainable and does not contain "
+            "non-parameter buffers such as BatchNorm running statistics. "
+            "Resume is allowed for recovery, but exact eval-state restoration is "
+            "not possible without BN recalibration."
         )
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
