@@ -148,7 +148,7 @@ class UnifiedDecoderOutput:
 
 @dataclass
 class Cascade2DDecoderOutput:
-    """Final prediction output of the PAIR V2 2D Cascade Gated Decoder.
+    """Final prediction output of the PAIR V2 2D decoder.
 
     Keep the same branch-discovery protocol as UnifiedDecoderOutput so the
     unified PAIR loss/metrics can inspect optional branches without special
@@ -937,6 +937,143 @@ class CascadeGatedDecoder(nn.Module):
 # =============================================================================
 
 
+class SimpleJointUNetDecoder(nn.Module):
+    """
+    Minimal joint 2D U-Net control decoder.
+
+    Input order for both times is shallow -> deep:
+        [p4, p8, p16, p32]
+
+    The decoder intentionally uses no change-aware gating, CBAM, absolute
+    difference, attention, DropPath, path dropout, or auxiliary branch.
+    T1/T2 features are simply concatenated at every scale, followed by a
+    standard Conv-BN-ReLU block. The deepest joint feature is progressively
+    upsampled and concatenated with the next shallower T1/T2 features.
+
+    One shared z4 feature finally produces x0, x1, and xc through three simple
+    heads so the surrounding PAIR semantic/change heads stay unchanged.
+    """
+
+    def __init__(
+        self,
+        in_channel_list,
+        out_channels,
+    ):
+        super().__init__()
+        if len(in_channel_list) != 4:
+            raise ValueError(
+                "SimpleJointUNetDecoder expects four scales "
+                "[p4,p8,p16,p32]"
+            )
+
+        p4_c, p8_c, p16_c, p32_c = [int(c) for c in in_channel_list]
+        out_channels = int(out_channels)
+
+        def conv_block(in_channels: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+
+        # Deepest reasoning feature: cat(T1, T2) -> z32.
+        self.block32 = conv_block(p32_c * 2)
+
+        # Pure top-down U-Net fusion:
+        # up(z_deep) + cat(T1_skip, T2_skip) -> z_shallow.
+        self.block16 = conv_block(out_channels + p16_c * 2)
+        self.block8 = conv_block(out_channels + p8_c * 2)
+        self.block4 = conv_block(out_channels + p4_c * 2)
+
+        def output_head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+
+        self.head_t1 = output_head()
+        self.head_t2 = output_head()
+        self.head_change = output_head()
+
+    @staticmethod
+    def _upsample_to(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(
+            x,
+            size=ref.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def forward(self, feat_list_a, feat_list_b):
+        if len(feat_list_a) != 4 or len(feat_list_b) != 4:
+            raise ValueError(
+                "SimpleJointUNetDecoder expects four scales for T1 and T2"
+            )
+
+        p4_t1, p8_t1, p16_t1, p32_t1 = feat_list_a
+        p4_t2, p8_t2, p16_t2, p32_t2 = feat_list_b
+
+        z32 = self.block32(torch.cat([p32_t1, p32_t2], dim=1))
+
+        z16 = self.block16(
+            torch.cat(
+                [
+                    self._upsample_to(z32, p16_t1),
+                    p16_t1,
+                    p16_t2,
+                ],
+                dim=1,
+            )
+        )
+        z8 = self.block8(
+            torch.cat(
+                [
+                    self._upsample_to(z16, p8_t1),
+                    p8_t1,
+                    p8_t2,
+                ],
+                dim=1,
+            )
+        )
+        z4 = self.block4(
+            torch.cat(
+                [
+                    self._upsample_to(z8, p4_t1),
+                    p4_t1,
+                    p4_t2,
+                ],
+                dim=1,
+            )
+        )
+
+        x0 = self.head_t1(z4)
+        x1 = self.head_t2(z4)
+        xc = self.head_change(z4)
+        return x0, x1, xc
+
+
 class QwenClassPrototypeEncoder(nn.Module):
     """
     DatasetSpec.class_names -> text prompts -> Qwen -> semantic prototypes.
@@ -1199,14 +1336,15 @@ class UnifiedChangeDecoder(nn.Module):
             else None
         )
 
-        # PAIR V2 2D route.
+        # PAIR V2 2D route. For this control experiment the previous
+        # CascadeGatedDecoder is replaced by a plain joint U-Net.
         # Input order is shallow -> deep:
         # [ViT DeepStack @ 1/4, ViT DeepStack @ 1/8,
         #  ViT DeepStack @ 1/16, dense<-LLM fused feature @ 1/32].
         # The deepest feature has already been projected into decoder_dim and
         # fused by dense-query / LLM-key-value cross-attention.
         self.cg_decoder_2d = (
-            CascadeGatedDecoder(
+            SimpleJointUNetDecoder(
                 in_channel_list=(
                     self.vision_dim,
                     self.vision_dim,
@@ -1214,8 +1352,6 @@ class UnifiedChangeDecoder(nn.Module):
                     self.decoder_dim,
                 ),
                 out_channels=self.decoder_dim,
-                drop_rate=dropout,
-                use_refinement_block=False,
             )
             if self.enable_2d
             else None
@@ -1395,7 +1531,7 @@ class UnifiedChangeDecoder(nn.Module):
         logits = self.classifier_cd(feature)
         if logits.ndim != 4 or logits.shape[1] != 1:
             raise RuntimeError(
-                "2D CG change classifier must return [B,1,H,W], "
+                "2D change classifier must return [B,1,H,W], "
                 f"got {tuple(logits.shape)}"
             )
         return logits[:, 0]
@@ -1428,8 +1564,8 @@ class UnifiedChangeDecoder(nn.Module):
             + position / modality / time embeddings on both sides
             -> shared ReasoningInjection cross-attention
 
-        SCD and BCD share the exact same CG decoder and explicit xc stream.
-        Only the final prediction route differs.
+        SCD and BCD share the exact same simple joint U-Net and explicit xc
+        output feature. Only the final prediction route differs.
         """
         if not self.enable_2d or self.cg_decoder_2d is None:
             raise RuntimeError("2D decoder route is not configured for this run")
@@ -1454,10 +1590,9 @@ class UnifiedChangeDecoder(nn.Module):
                     f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
                 )
 
-        feat_pyramid_t1, feat_pyramid_t2 = self._apply_multiscale_path_dropout(
-            feat_pyramid_t1,
-            feat_pyramid_t2,
-        )
+        # Simple U-Net control experiment: use the untouched full pyramid.
+        # Multiscale path dropout is intentionally disabled here so the only
+        # experimental variable is the 2D decoder architecture.
 
         x0, x1, xc = self.cg_decoder_2d(
             feat_pyramid_t1,
