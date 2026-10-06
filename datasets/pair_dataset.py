@@ -18,11 +18,12 @@ Canonical 3D supervision files:
 
 PAIR 3D event taxonomy:
     0 unchanged
-    1 added
-    2 removed
-    3 class_change
-    4 height_up
-    5 height_down
+    1 removed
+    2 added
+
+Temporal active support:
+    T1: {0, 1} = unchanged / removed
+    T2: {0, 2} = unchanged / added
 
 T1/T2 use independent point topologies. Point and supervision files for one
 epoch must preserve exactly the same point order.
@@ -87,12 +88,12 @@ VALID_MODALITIES = {"image", "point"}
 PAIR_POINT_WINDOW_SIZE_M = 51.2
 PAIR_CHANGE_CENTER_CELL_M = PAIR_POINT_WINDOW_SIZE_M / 20.0
 PAIR_CHANGE_CROP_MAX_TRIES = 32
-PAIR_CHANGE_CENTER_CACHE_VERSION = 4
+PAIR_CHANGE_CENTER_CACHE_VERSION = 5
 
 PAIR_EVENT_NAMES = {
     0: "unchanged",
-    1: "added",
-    2: "removed",
+    1: "removed",
+    2: "added",
 }
 PAIR_EVENT_NUM_CLASSES = len(PAIR_EVENT_NAMES)
 
@@ -1218,9 +1219,9 @@ class UnifiedPAIRDataset(Dataset):
         Build one global change-aware center pool from temporally valid support.
 
         Current PAIR/NYC protocol:
-            T1 removed centers   <- event=2 & event_valid
+            T1 removed centers   <- event=1 & event_valid
             T2 unchanged centers <- event=0 & event_valid
-            T2 added centers     <- event=1 & event_valid
+            T2 added centers     <- event=2 & event_valid
 
         Unchanged is sourced from T2 only to avoid duplicating the overwhelmingly
         large unchanged center pool. Every sampled center still defines one shared
@@ -1270,7 +1271,7 @@ class UnifiedPAIRDataset(Dataset):
             valid2 = self._event_valid_mask(s2)
 
             # T1 contributes only physically supported removed centers.
-            removed_t1 = valid1 & (s1["event"] == 2)
+            removed_t1 = valid1 & (s1["event"] == 1)
             c1, e1 = _center_majority_index(
                 p1["coord"],
                 s1["event"],
@@ -1279,7 +1280,7 @@ class UnifiedPAIRDataset(Dataset):
             )
 
             # T2 contributes unchanged + added centers.
-            t2_supported = valid2 & ((s2["event"] == 0) | (s2["event"] == 1))
+            t2_supported = valid2 & ((s2["event"] == 0) | (s2["event"] == 2))
             c2, e2 = _center_majority_index(
                 p2["coord"],
                 s2["event"],
@@ -2013,12 +2014,12 @@ def _self_test():
     target = build_bitemporal_point_target(
         {
             "semantic": torch.tensor([0, -1, 2]),
-            "event": torch.tensor([0, 2, 0]),
+            "event": torch.tensor([0, 1, 0]),
             "event_valid": torch.tensor([True, True, False]),
         },
         {
             "semantic": torch.tensor([0, 3]),
-            "event": torch.tensor([1, 0]),
+            "event": torch.tensor([2, 0]),
             "event_valid": torch.tensor([True, True]),
         },
         class_names=classes,
@@ -2026,8 +2027,8 @@ def _self_test():
     )
     assert target["semantic_valid_t1"].tolist() == [True, False, True]
     assert target["event_valid_t1"].tolist() == [True, True, False]
-    assert target["event_t1"].tolist() == [0, 2, 0]
-    assert target["event_t2"].tolist() == [1, 0]
+    assert target["event_t1"].tolist() == [0, 1, 0]
+    assert target["event_t2"].tolist() == [2, 0]
     assert "change_t1" not in target and "change_t2" not in target
 
     try:
@@ -2105,7 +2106,7 @@ def _self_test():
     assert DatasetSpec.__dataclass_fields__["ignored_id"].default is None
     assert PAIR_EVENT_NUM_CLASSES == 3
     assert PAIR_POINT_WINDOW_SIZE_M == 51.2
-    assert PAIR_CHANGE_CENTER_CACHE_VERSION == 4
+    assert PAIR_CHANGE_CENTER_CACHE_VERSION == 5
     assert abs(PAIR_CHANGE_CENTER_CELL_M - 2.56) < 1e-9
 
     print("pair_dataset.py self-test: PASS")

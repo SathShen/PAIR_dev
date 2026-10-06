@@ -12,12 +12,12 @@ Design goals
       3D event: active-support CE + derived change Dice
 3) Normalize across ACTIVE task groups so a batch with more annotated heads
    does not automatically contribute a proportionally larger total loss.
-4) Keep the existing 3D event protocol exactly:
+4) Keep the canonical 3D event protocol exactly:
       0 unchanged
-      1 added
-      2 removed
-      T1 support = {0, 2}
-      T2 support = {0, 1}
+      1 removed
+      2 added
+      T1 support = {0, 1}
+      T2 support = {0, 2}
    There is still NO separate 3D binary-change head. The event Dice term is
    derived directly from the shared event head.
 
@@ -50,8 +50,8 @@ import torch.nn.functional as F
 
 PAIR_EVENT_NUM_CLASSES = 3
 PAIR_EVENT_ACTIVE_SUPPORT = {
-    1: (0, 2),  # T1: unchanged / removed
-    2: (0, 1),  # T2: unchanged / added
+    1: (0, 1),  # T1: unchanged / removed
+    2: (0, 2),  # T2: unchanged / added
 }
 
 
@@ -912,8 +912,8 @@ class PAIRSemanticChangeLoss(nn.Module):
             return logits.sum() * 0.0
 
         # Restrict the class space BEFORE CE.
-        # T1 global [0,2] -> local [0,1]
-        # T2 global [0,1] -> local [0,1]
+        # T1 global [0,1] -> local [0,1]
+        # T2 global [0,2] -> local [0,1]
         active_logits = logits[valid_mask].index_select(1, allowed)
         global_target = target[valid_mask]
         local_target = torch.empty_like(global_target)
@@ -1434,8 +1434,8 @@ def _self_test():
     target_3d = {
         "semantic_t1": torch.tensor([0, 1, 2, 3, 1, 2]),
         "semantic_t2": torch.tensor([0, 1, 2, 3, 1, 2]),
-        "event_t1": torch.tensor([0, 2, 0, 2, 0, 2]),
-        "event_t2": torch.tensor([0, 1, 0, 1, 0, 1]),
+        "event_t1": torch.tensor([0, 1, 0, 1, 0, 1]),
+        "event_t2": torch.tensor([0, 2, 0, 2, 0, 2]),
         "event_valid_t1": torch.ones(6, dtype=torch.bool),
         "event_valid_t2": torch.ones(6, dtype=torch.bool),
     }
@@ -1454,16 +1454,16 @@ def _self_test():
 
     out_3d.total.backward()
 
-    # T1 illegal class Added(1); T2 illegal class Removed(2).
+    # T1 illegal class Added(2); T2 illegal class Removed(1).
     assert torch.allclose(
-        pred_3d.event_logits_t1.grad[:, 1],
-        torch.zeros_like(pred_3d.event_logits_t1.grad[:, 1]),
+        pred_3d.event_logits_t1.grad[:, 2],
+        torch.zeros_like(pred_3d.event_logits_t1.grad[:, 2]),
         atol=0.0,
         rtol=0.0,
     )
     assert torch.allclose(
-        pred_3d.event_logits_t2.grad[:, 2],
-        torch.zeros_like(pred_3d.event_logits_t2.grad[:, 2]),
+        pred_3d.event_logits_t2.grad[:, 1],
+        torch.zeros_like(pred_3d.event_logits_t2.grad[:, 1]),
         atol=0.0,
         rtol=0.0,
     )

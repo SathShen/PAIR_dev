@@ -116,7 +116,7 @@
       "root": "/home/sht/Datasets/NYC-SCDpair",
       "per_gpu_batch_size": 1,
       "ignored_id": -1,
-      "description": "Bi-temporal 3D semantic change detection on urban point clouds. Predict per-point semantic classes at both times and directional change events; the event protocol is unchanged, added, and removed, with removed supported at Time 1 and added supported at Time 2. Vegetation participates in semantic classification but is excluded from change-event labeling.",
+      "description": "Bi-temporal 3D semantic change detection on urban point clouds. Predict per-point semantic classes at both times and directional change events; the event protocol is 0 unchanged, 1 removed, and 2 added, with Time 1 supporting {0,1} (unchanged/removed) and Time 2 supporting {0,2} (unchanged/added). Vegetation participates in semantic classification but is excluded from change-event labeling.",
       "class_names": {
         "0": "ground",
         "1": "building",

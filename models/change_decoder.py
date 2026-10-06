@@ -12,8 +12,8 @@ Design:
 - 2D keeps the binary change head
 - 3D uses one shared 3-class event head:
     0 unchanged
-    1 added
-    2 removed
+    1 removed
+    2 added
 
 The decoder core is modality-agnostic. Dataset-specific active event support
 belongs to the loss/metrics layer, not here.
@@ -1241,8 +1241,8 @@ class UnifiedChangeDecoder(nn.Module):
 
     EVENT_CLASSES = (
         "unchanged",
-        "added",
         "removed",
+        "added",
     )
 
     def __init__(

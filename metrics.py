@@ -6,7 +6,7 @@ Unified streaming metrics for PAIR semantic change detection.
 
 3D:
     semantic_logits_t1/t2 + 3-class event_logits_t1/t2
-    event protocol: 0 unchanged, 1 added, 2 removed
+    event protocol: 0 unchanged, 1 removed, 2 added
     binary change metrics are derived from event != 0 when no binary head exists.
 """
 
@@ -22,13 +22,13 @@ from datasets.pair_dataset import infer_unchanged_raw_id
 EPS = 1e-12
 PAIR_EVENT_NAMES = {
     0: "unchanged",
-    1: "added",
-    2: "removed",
+    1: "removed",
+    2: "added",
 }
 PAIR_EVENT_NUM_CLASSES = len(PAIR_EVENT_NAMES)
 PAIR_EVENT_ACTIVE_SUPPORT = {
-    1: (0, 2),  # T1: unchanged / removed
-    2: (0, 1),  # T2: unchanged / added
+    1: (0, 1),  # T1: unchanged / removed
+    2: (0, 2),  # T2: unchanged / added
 }
 
 def _safe_div(a, b):
@@ -340,8 +340,8 @@ class PAIRMetrics:
         Predict event classes only within the active support
         of the corresponding time point.
 
-        T1: {0 unchanged, 2 removed}
-        T2: {0 unchanged, 1 added}
+        T1: {0 unchanged, 1 removed}
+        T2: {0 unchanged, 2 added}
         """
         if time_id not in PAIR_EVENT_ACTIVE_SUPPORT:
             raise ValueError(
@@ -970,23 +970,23 @@ def _self_test():
         semantic_logits_t2=torch.eye(4),
         event_logits_t1=torch.tensor([
             [5.0, 0.0, 0.0],  # unchanged
-            [0.0, 0.0, 5.0],  # removed
+            [0.0, 5.0, 0.0],  # removed
             [5.0, 0.0, 0.0],  # unchanged
-            [0.0, 0.0, 5.0],  # removed
+            [0.0, 5.0, 0.0],  # removed
         ]),
         event_logits_t2=torch.tensor([
             [5.0, 0.0, 0.0],  # unchanged
-            [0.0, 5.0, 0.0],  # added
+            [0.0, 0.0, 5.0],  # added
             [5.0, 0.0, 0.0],  # unchanged
-            [0.0, 5.0, 0.0],  # added
+            [0.0, 0.0, 5.0],  # added
         ]),
     )
 
     t3d = {
         "semantic_t1": torch.tensor([0, 1, 2, 3]),
         "semantic_t2": torch.tensor([0, 1, 2, 3]),
-        "event_t1": torch.tensor([0, 2, 0, 2]),
-        "event_t2": torch.tensor([0, 1, 0, 1]),
+        "event_t1": torch.tensor([0, 1, 0, 1]),
+        "event_t2": torch.tensor([0, 2, 0, 2]),
         "event_valid_t1": torch.ones(4, dtype=torch.bool),
         "event_valid_t2": torch.ones(4, dtype=torch.bool),
     }
