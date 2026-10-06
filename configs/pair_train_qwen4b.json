@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "PAIR_SECOND_4B_Unet",
+    "name": "PAIR_SECOND_4B_primidToken",
     "seed": 42,
     "epochs": 50
   },

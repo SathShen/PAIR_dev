@@ -37,6 +37,7 @@ class Qwen3VLBackbone(nn.Module):
                  device_map: Optional[Union[str, Dict[str, Any]]] = "cuda",
                  local_files_only: bool = True,
                  point_token: str = "<POINT>", task_token: str = "<TASK>",
+                 pyramid_token: str = "<PYRAMID>",
                  vision_intermediate_layers: Optional[Sequence[int]] = None):
         super().__init__()
         self.model_dir = model_dir
@@ -46,16 +47,24 @@ class Qwen3VLBackbone(nn.Module):
         self.local_files_only = local_files_only
         self.point_token = point_token
         self.task_token = task_token
+        self.pyramid_token = pyramid_token
 
         self.processor = AutoProcessor.from_pretrained(
             model_dir, local_files_only=local_files_only
         )
         self.tokenizer = self.processor.tokenizer
         self.tokenizer.add_special_tokens({
-            "additional_special_tokens": [self.point_token, self.task_token]
+            "additional_special_tokens": [
+                self.point_token,
+                self.task_token,
+                self.pyramid_token,
+            ]
         })
         self.point_token_id = self.tokenizer.convert_tokens_to_ids(self.point_token)
         self.task_token_id = self.tokenizer.convert_tokens_to_ids(self.task_token)
+        self.pyramid_token_id = self.tokenizer.convert_tokens_to_ids(
+            self.pyramid_token
+        )
 
         load_kwargs = {"dtype": dtype, "local_files_only": local_files_only}
         if device_map is not None:
@@ -464,40 +473,92 @@ class Qwen3VLBackbone(nn.Module):
             raise ValueError(
                 f"Do not manually include {self.task_token}; PAIR appends it as the final readout token"
             )
+        if self.pyramid_token in prompt:
+            raise ValueError(
+                f"Do not manually include {self.pyramid_token}; "
+                "PAIR inserts image-pyramid reasoning tokens automatically"
+            )
 
-    def _build_messages(self, prompt, image_t1, image_t2, n_point_t1, n_point_t2):
+    def _build_messages(
+        self,
+        prompt,
+        image_t1,
+        image_t2,
+        n_point_t1,
+        n_point_t2,
+        pyramid_plan=None,
+    ):
         self._validate_prompt(prompt)
 
         # Causal Qwen order:
         #   task instruction -> Time 1 modalities -> Time 2 modalities -> <TASK>.
-        # Therefore all modality-token hidden states can see the task/class
-        # instruction, while the final <TASK> readout can see the complete
-        # bi-temporal multimodal context.
+        #
+        # For 2D PAIR, each temporal image is explicitly described to Qwen as
+        # a four-level visual pyramid.  P4/P8/P16 are custom compressed
+        # DeepStack token blocks and P32 is the native merged Qwen image-token
+        # block.  The textual labels are intentionally part of the LLM prompt:
+        # the model is told which pyramid level, decoder scale, source Vision
+        # layer and compressed token grid each custom block represents.
         content = [{"type": "text", "text": prompt.rstrip()}]
 
-        if image_t1 is not None:
-            content += [
-                {"type": "text", "text": "Time 1 image:"},
-                {"type": "image", "image": image_t1},
-            ]
+        def append_image_pyramid(time_label, image):
+            if image is None:
+                return
+
+            if pyramid_plan:
+                content.append({
+                    "type": "text",
+                    "text": (
+                        f"{time_label} visual pyramid. "
+                        "The next token blocks are multi-scale Qwen Vision features "
+                        "for the same image. Use their level/scale labels when "
+                        "reasoning about semantic content and temporal change."
+                    ),
+                })
+                # Shallow -> deep so the later/deeper causal states can see the
+                # earlier high-resolution semantic context.
+                for item in pyramid_plan:
+                    count = int(item["count"])
+                    content.append({
+                        "type": "text",
+                        "text": (
+                            f"{time_label} pyramid {item['level']} "
+                            f"(decoder scale {item['scale']}; derived from Qwen "
+                            f"Vision DeepStack layer {item['layer_idx']}; "
+                            f"compressed to {item['grid']}x{item['grid']} "
+                            "reasoning tokens):\n"
+                            + self.pyramid_token * count
+                        ),
+                    })
+
+            content.extend([
+                {
+                    "type": "text",
+                    "text": (
+                        f"{time_label} pyramid P32 "
+                        "(decoder scale 1/32; native merged Qwen image tokens):"
+                    ),
+                },
+                {"type": "image", "image": image},
+            ])
+
+        append_image_pyramid("Time 1", image_t1)
         if n_point_t1:
             content.append({
                 "type": "text",
                 "text": "Time 1 point cloud:\n" + self.point_token * n_point_t1,
             })
 
-        if image_t2 is not None:
-            content += [
-                {"type": "text", "text": "Time 2 image:"},
-                {"type": "image", "image": image_t2},
-            ]
+        append_image_pyramid("Time 2", image_t2)
         if n_point_t2:
             content.append({
                 "type": "text",
                 "text": "Time 2 point cloud:\n" + self.point_token * n_point_t2,
             })
 
-        # Keep exactly one readout marker after all temporal inputs.
+        # Keep exactly one PAIR readout marker after the complete bi-temporal
+        # context.  Its hidden state can therefore summarize every pyramid
+        # level from both times.
         content.append({"type": "text", "text": self.task_token})
         return [{"role": "user", "content": content}]
 
@@ -528,8 +589,17 @@ class Qwen3VLBackbone(nn.Module):
     # Native batched processor input
     # ------------------------------------------------------------------
 
-    def prepare_inputs(self, *, prompt, images_t1=None, images_t2=None,
-                       point_tokens_t1=None, point_tokens_t2=None):
+    def prepare_inputs(
+        self,
+        *,
+        prompt,
+        images_t1=None,
+        images_t2=None,
+        point_tokens_t1=None,
+        point_tokens_t2=None,
+        pyramid_tokens_per_level: int = 0,
+        pyramid_grid_size: int = 8,
+    ):
         # Prevent stale 2D features from a previous Qwen forward from being
         # consumed accidentally (especially when alternating 2D and 3D batches).
         self.clear_vision_intermediate_cache()
@@ -540,6 +610,49 @@ class Qwen3VLBackbone(nn.Module):
         images2 = self._value_batch(images_t2, bsz, "images_t2")
         points1 = self._point_token_batch(point_tokens_t1, bsz, "point_tokens_t1")
         points2 = self._point_token_batch(point_tokens_t2, bsz, "point_tokens_t2")
+
+        pyramid_tokens_per_level = int(pyramid_tokens_per_level)
+        pyramid_grid_size = int(pyramid_grid_size)
+        if pyramid_tokens_per_level < 0:
+            raise ValueError("pyramid_tokens_per_level must be >= 0")
+        if pyramid_grid_size <= 0:
+            raise ValueError("pyramid_grid_size must be > 0")
+        if pyramid_tokens_per_level not in (0, pyramid_grid_size * pyramid_grid_size):
+            raise ValueError(
+                "PAIR currently expects one square compressed token grid per "
+                "pyramid level: pyramid_tokens_per_level must equal "
+                "pyramid_grid_size**2"
+            )
+
+        shallow_idx, middle_idx, deep_idx = self.vision_intermediate_layers
+        pyramid_plan = []
+        if pyramid_tokens_per_level > 0:
+            pyramid_plan = [
+                {
+                    "level": "P4",
+                    "key": "p4",
+                    "scale": "1/4",
+                    "layer_idx": int(shallow_idx),
+                    "count": pyramid_tokens_per_level,
+                    "grid": pyramid_grid_size,
+                },
+                {
+                    "level": "P8",
+                    "key": "p8",
+                    "scale": "1/8",
+                    "layer_idx": int(middle_idx),
+                    "count": pyramid_tokens_per_level,
+                    "grid": pyramid_grid_size,
+                },
+                {
+                    "level": "P16",
+                    "key": "p16",
+                    "scale": "1/16",
+                    "layer_idx": int(deep_idx),
+                    "count": pyramid_tokens_per_level,
+                    "grid": pyramid_grid_size,
+                },
+            ]
 
         messages_batch = []
         image_list = []
@@ -553,7 +666,12 @@ class Qwen3VLBackbone(nn.Module):
             point_counts_t2.append(n2)
 
             messages = self._build_messages(
-                prompts[b], images1[b], images2[b], n1, n2
+                prompts[b],
+                images1[b],
+                images2[b],
+                n1,
+                n2,
+                pyramid_plan=pyramid_plan,
             )
             messages_batch.append(messages)
 
@@ -585,10 +703,20 @@ class Qwen3VLBackbone(nn.Module):
         image_mask = input_ids == self.image_token_id
         point_mask = input_ids == self.point_token_id
         task_mask = input_ids == self.task_token_id
+        pyramid_mask = input_ids == self.pyramid_token_id
         point_mask_t1 = torch.zeros_like(point_mask)
         point_mask_t2 = torch.zeros_like(point_mask)
         image_mask_t1 = torch.zeros_like(image_mask)
         image_mask_t2 = torch.zeros_like(image_mask)
+
+        pyramid_masks_t1 = {
+            item["key"]: torch.zeros_like(pyramid_mask)
+            for item in pyramid_plan
+        }
+        pyramid_masks_t2 = {
+            item["key"]: torch.zeros_like(pyramid_mask)
+            for item in pyramid_plan
+        }
 
         # Every sample owns exactly one task token.
         task_counts = task_mask.sum(1)
@@ -611,6 +739,51 @@ class Qwen3VLBackbone(nn.Module):
             )
             self._assign_positions(
                 point_mask_t2, b, positions, point_counts_t1[b], point_counts_t2[b]
+            )
+
+        # Assign the custom pyramid placeholders in exactly the same causal
+        # order used by _build_messages: T1 P4/P8/P16, then T2 P4/P8/P16.
+        if pyramid_plan:
+            for b in range(bsz):
+                positions = torch.nonzero(
+                    pyramid_mask[b], as_tuple=False
+                ).flatten()
+                has_t1 = images1[b] is not None
+                has_t2 = images2[b] is not None
+                expected = (int(has_t1) + int(has_t2)) * sum(
+                    int(item["count"]) for item in pyramid_plan
+                )
+                if positions.numel() != expected:
+                    raise RuntimeError(
+                        f"Batch {b}: expected {expected} pyramid placeholders, "
+                        f"tokenizer produced {positions.numel()}"
+                    )
+                cursor = 0
+                for label, enabled, target_masks in (
+                    ("t1", has_t1, pyramid_masks_t1),
+                    ("t2", has_t2, pyramid_masks_t2),
+                ):
+                    if not enabled:
+                        continue
+                    for item in pyramid_plan:
+                        count = int(item["count"])
+                        self._assign_positions(
+                            target_masks[item["key"]],
+                            b,
+                            positions,
+                            cursor,
+                            count,
+                        )
+                        cursor += count
+                if cursor != positions.numel():
+                    raise RuntimeError(
+                        f"Batch {b}: pyramid placeholder accounting mismatch "
+                        f"{cursor} != {positions.numel()}"
+                    )
+        elif bool(pyramid_mask.any()):
+            raise RuntimeError(
+                "Prompt unexpectedly contains pyramid placeholders while "
+                "pyramid_tokens_per_level=0"
             )
 
         # Qwen stores one image_grid_thw row per flattened supplied image.
@@ -670,6 +843,12 @@ class Qwen3VLBackbone(nn.Module):
             "point_mask_t1": point_mask_t1,
             "point_mask_t2": point_mask_t2,
             "task_mask": task_mask,
+            "pyramid_mask": pyramid_mask,
+            "pyramid_masks_t1": pyramid_masks_t1,
+            "pyramid_masks_t2": pyramid_masks_t2,
+            "pyramid_plan": tuple(dict(item) for item in pyramid_plan),
+            "pyramid_tokens_per_level": pyramid_tokens_per_level,
+            "pyramid_grid_size": pyramid_grid_size,
 
             "image_records": image_records,
             "image_counts_in_order": image_counts_in_order,

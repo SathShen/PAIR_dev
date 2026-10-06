@@ -220,7 +220,17 @@ class UnifiedTokenEmbedding(nn.Module):
 
 
 class ReasoningInjection(nn.Module):
-    """Dense queries attend to a much smaller reasoning-token set."""
+    """Dense queries read reasoning tokens without a raw-feature residual.
+
+    The dense feature is used only as the attention query.  Decoder-visible
+    content comes from the Qwen reasoning K/V stream.  In particular, there is
+    deliberately NO ``dense + attended`` residual here: keeping that residual
+    gives the decoder a direct Vision-feature shortcut around the LLM.
+
+    This still preserves dense spatial localization because every dense token
+    has its own query and therefore its own attention weights over the
+    reasoning tokens.  What is removed is only the identity/content bypass.
+    """
 
     def __init__(
         self,
@@ -248,8 +258,13 @@ class ReasoningInjection(nn.Module):
         dense: torch.Tensor,
         reasoning: torch.Tensor,
     ) -> torch.Tensor:
-        if dense.shape[0] == 0 or reasoning.shape[0] == 0:
+        if dense.shape[0] == 0:
             return dense
+        if reasoning.shape[0] == 0:
+            raise RuntimeError(
+                "ReasoningInjection received dense tokens but no reasoning tokens; "
+                "refusing to fall back to a raw dense-feature bypass"
+            )
 
         kv = self.norm_kv(reasoning).unsqueeze(0)
         outputs = []
@@ -259,8 +274,12 @@ class ReasoningInjection(nn.Module):
             attended, _ = self.attention(q, kv, kv, need_weights=False)
             outputs.append(attended[0])
 
-        injected = torch.cat(outputs, dim=0)
-        return self.out_norm(dense + injected)
+        attended = torch.cat(outputs, dim=0)
+
+        # IMPORTANT: no residual from ``dense`` here.  The dense stream affects
+        # the output only through Q -> attention weights; all value/content
+        # delivered to the decoder comes from the reasoning stream.
+        return self.out_norm(attended)
 
     def forward(
         self,
@@ -1243,7 +1262,6 @@ class UnifiedChangeDecoder(nn.Module):
         unified_num_heads: int = 8,
         unified_mlp_ratio: float = 2.0,
         unified_dropout: float = 0.0,
-        multiscale_path_dropout: float = 0.3,
         enable_2d: bool = True,
         enable_3d: bool = True,
         enable_semantic: bool = True,
@@ -1255,18 +1273,20 @@ class UnifiedChangeDecoder(nn.Module):
         self.enable_2d = bool(enable_2d)
         self.enable_3d = bool(enable_3d)
         self.enable_semantic = bool(enable_semantic)
-        self.multiscale_path_dropout = float(multiscale_path_dropout)
-        if not 0.0 <= self.multiscale_path_dropout < 1.0:
-            raise ValueError(
-                "multiscale_path_dropout must be in [0, 1), "
-                f"got {self.multiscale_path_dropout}"
-            )
         if not (self.enable_2d or self.enable_3d):
             raise ValueError("UnifiedChangeDecoder needs at least one active route")
 
         self.token_embedding = UnifiedTokenEmbedding(
             self.decoder_dim,
             num_modalities=num_modalities,
+        )
+        # 2D pyramid identity: P4/P8/P16/P32. This is the dense-token-side
+        # counterpart to the explicit natural-language pyramid labels inserted
+        # into Qwen's prompt. It is shared across both times.
+        self.scale_embedding_2d = (
+            nn.Embedding(4, self.decoder_dim)
+            if self.enable_2d
+            else None
         )
         self.reasoning_projection = nn.Sequential(
             nn.Linear(self.qwen_dim, self.decoder_dim),
@@ -1336,19 +1356,16 @@ class UnifiedChangeDecoder(nn.Module):
             else None
         )
 
-        # PAIR V2 2D route. For this control experiment the previous
-        # CascadeGatedDecoder is replaced by a plain joint U-Net.
-        # Input order is shallow -> deep:
-        # [ViT DeepStack @ 1/4, ViT DeepStack @ 1/8,
-        #  ViT DeepStack @ 1/16, dense<-LLM fused feature @ 1/32].
-        # The deepest feature has already been projected into decoder_dim and
-        # fused by dense-query / LLM-key-value cross-attention.
+        # 2D route: every pyramid level has already passed through the same
+        # dense<-LLM Cross-Attn + shared Unified Decoder, so all four U-Net
+        # inputs live in decoder_dim. The U-Net itself remains deliberately
+        # plain: cat -> Conv-BN-ReLU -> upsample, with no change-aware gating.
         self.cg_decoder_2d = (
             SimpleJointUNetDecoder(
                 in_channel_list=(
-                    self.vision_dim,
-                    self.vision_dim,
-                    self.vision_dim,
+                    self.decoder_dim,
+                    self.decoder_dim,
+                    self.decoder_dim,
                     self.decoder_dim,
                 ),
                 out_channels=self.decoder_dim,
@@ -1423,9 +1440,9 @@ class UnifiedChangeDecoder(nn.Module):
             )
 
         expected_channels = (
-            self.vision_dim,
-            self.vision_dim,
-            self.vision_dim,
+            self.decoder_dim,
+            self.decoder_dim,
+            self.decoder_dim,
             self.decoder_dim,
         )
         batch_size = None
@@ -1471,45 +1488,6 @@ class UnifiedChangeDecoder(nn.Module):
                     )
             previous_hw = hw
 
-    def _apply_multiscale_path_dropout(
-        self,
-        feat_pyramid_t1: Sequence[torch.Tensor],
-        feat_pyramid_t2: Sequence[torch.Tensor],
-    ) -> Tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]:
-        """
-        Training-only path dropout for the three shallow 2D Vision scales.
-
-        p4 / p8 / p16 are dropped independently per sample with probability p.
-        The SAME mask is applied to T1 and T2 at each scale so dropout cannot
-        create an artificial temporal change.  p32 is never dropped here.
-
-        Inverted-dropout scaling keeps the expected activation magnitude of a
-        retained path unchanged in expectation.  Evaluation is untouched.
-        """
-        p = self.multiscale_path_dropout
-        if (not self.training) or p <= 0.0:
-            return feat_pyramid_t1, feat_pyramid_t2
-
-        keep_prob = 1.0 - p
-        out_t1 = list(feat_pyramid_t1)
-        out_t2 = list(feat_pyramid_t2)
-
-        for i in range(3):  # p4, p8, p16 only; p32 stays intact.
-            feat1 = out_t1[i]
-            feat2 = out_t2[i]
-            mask = (
-                torch.rand(
-                    (feat1.shape[0], 1, 1, 1),
-                    device=feat1.device,
-                )
-                < keep_prob
-            ).to(dtype=feat1.dtype)
-            mask = mask / keep_prob
-            out_t1[i] = feat1 * mask
-            out_t2[i] = feat2 * mask.to(dtype=feat2.dtype, device=feat2.device)
-
-        return out_t1, out_t2
-
     def _semantic_logits_2d(
         self,
         feature: torch.Tensor,
@@ -1553,16 +1531,16 @@ class UnifiedChangeDecoder(nn.Module):
             [1/4, 1/8, 1/16, 1/32]
 
         For Qwen3-VL-4B at 512x512 this is conceptually:
-            DeepStack shallow @ 128x128, vision_dim channels
-            DeepStack middle  @  64x64, vision_dim channels
-            DeepStack deep    @  32x32, vision_dim channels
-            dense<-LLM fused  @  16x16, decoder_dim channels
+            P4  reasoned feature @ 128x128, decoder_dim channels
+            P8  reasoned feature @  64x64, decoder_dim channels
+            P16 reasoned feature @  32x32, decoder_dim channels
+            P32 reasoned feature @  16x16, decoder_dim channels
 
-        The 1/32 feature is produced before this function by:
-            Q = final merged Qwen-ViT dense feature
-            K,V = Qwen LLM image hidden states
-            + position / modality / time embeddings on both sides
-            -> shared ReasoningInjection cross-attention
+        Every level is produced before this function by:
+            dense Vision Q + its Qwen LLM pyramid K/V
+            -> shared Cross-Attn
+            -> joint T1/T2 multi-scale Unified Decoder
+            -> <TASK> conditioning
 
         SCD and BCD share the exact same simple joint U-Net and explicit xc
         output feature. Only the final prediction route differs.
@@ -1590,9 +1568,7 @@ class UnifiedChangeDecoder(nn.Module):
                     f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
                 )
 
-        # Simple U-Net control experiment: use the untouched full pyramid.
-        # Multiscale path dropout is intentionally disabled here so the only
-        # experimental variable is the 2D decoder architecture.
+        # No path dropout or auxiliary supervision is used here.
 
         x0, x1, xc = self.cg_decoder_2d(
             feat_pyramid_t1,
@@ -1669,14 +1645,13 @@ class UnifiedChangeDecoder(nn.Module):
         dense_time_id: int,
         reasoning_tokens: UnifiedTokenSet,
         reasoning_time_id: int,
+        scale_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Fuse one temporal dense stream with Qwen reasoning.
 
-        Both Q and K/V receive the shared PAIR token embedding:
-            feature + position + modality + time.
-
-        This is used by both the 3D unified route and the restored 2D
-        dense<-LLM cross-attention route.
+        Q and K/V receive feature + position + modality + time embeddings.
+        For the 2D route, both sides additionally receive the same P4/P8/P16/
+        P32 scale embedding. The 3D route leaves scale_id=None.
         """
         dense_tokens.validate(
             feature_dim=self.decoder_dim,
@@ -1690,11 +1665,111 @@ class UnifiedChangeDecoder(nn.Module):
             reasoning_tokens,
             time_id=reasoning_time_id,
         )
+
+        if scale_id is not None:
+            if self.scale_embedding_2d is None:
+                raise RuntimeError("2D scale embedding is not configured")
+            scale_id = int(scale_id)
+            if scale_id < 0 or scale_id >= 4:
+                raise ValueError(f"2D scale_id must be 0..3, got {scale_id}")
+            scale = self.scale_embedding_2d.weight[scale_id]
+            x = x + scale.to(device=x.device, dtype=x.dtype)
+            reasoning = reasoning + scale.to(
+                device=reasoning.device, dtype=reasoning.dtype
+            )
+
         return self.reasoning_injection(
             dense=x,
             dense_batch_ids=dense_tokens.batch_ids,
             reasoning=reasoning,
             reasoning_batch_ids=reasoning_batch_ids,
+        )
+
+    def fuse_2d_multiscale_reasoning(
+        self,
+        *,
+        dense_t1: Sequence[UnifiedTokenSet],
+        dense_t2: Sequence[UnifiedTokenSet],
+        reasoning_t1: Sequence[UnifiedTokenSet],
+        reasoning_t2: Sequence[UnifiedTokenSet],
+        task_hidden: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """Reason over all four 2D pyramid levels before the U-Net.
+
+        Level order is [P4,P8,P16,P32]. Each dense level is used as Q and
+        cross-attends to the matching Qwen LLM hidden block as K/V.  The
+        Cross-Attn output has no raw dense residual, so every decoder-visible
+        pyramid feature is reasoning-derived.  The resulting features from
+        every level and both times are then concatenated into one shared latent
+        Unified Decoder call. Finally <TASK> conditions the complete token set
+        and the original per-level topology is restored.
+        """
+        groups = (dense_t1, dense_t2, reasoning_t1, reasoning_t2)
+        if any(not isinstance(x, (list, tuple)) or len(x) != 4 for x in groups):
+            raise ValueError(
+                "fuse_2d_multiscale_reasoning expects four levels "
+                "[P4,P8,P16,P32] for every T1/T2 dense/reasoning stream"
+            )
+
+        x1_parts = []
+        x2_parts = []
+        lengths1 = []
+        lengths2 = []
+        for scale_id in range(4):
+            d1 = dense_t1[scale_id]
+            d2 = dense_t2[scale_id]
+            r1 = reasoning_t1[scale_id]
+            r2 = reasoning_t2[scale_id]
+            d1.validate(feature_dim=self.decoder_dim, name=f"dense_t1_p{4 * (2 ** scale_id)}")
+            d2.validate(feature_dim=self.decoder_dim, name=f"dense_t2_p{4 * (2 ** scale_id)}")
+            r1.validate(feature_dim=self.qwen_dim, name=f"reasoning_t1_scale{scale_id}")
+            r2.validate(feature_dim=self.qwen_dim, name=f"reasoning_t2_scale{scale_id}")
+
+            x1 = self._inject_reasoning_one_time(
+                dense_tokens=d1,
+                dense_time_id=0,
+                reasoning_tokens=r1,
+                reasoning_time_id=0,
+                scale_id=scale_id,
+            )
+            x2 = self._inject_reasoning_one_time(
+                dense_tokens=d2,
+                dense_time_id=1,
+                reasoning_tokens=r2,
+                reasoning_time_id=1,
+                scale_id=scale_id,
+            )
+            x1_parts.append(x1)
+            x2_parts.append(x2)
+            lengths1.append(int(x1.shape[0]))
+            lengths2.append(int(x2.shape[0]))
+
+        x1_all = torch.cat(x1_parts, dim=0)
+        x2_all = torch.cat(x2_parts, dim=0)
+        batch_ids1 = torch.cat([x.batch_ids for x in dense_t1], dim=0)
+        batch_ids2 = torch.cat([x.batch_ids for x in dense_t2], dim=0)
+
+        # One shared global reasoning bottleneck across every scale and time.
+        x1_all, x2_all = self.unified_attention.forward_pair(
+            x1=x1_all,
+            batch_ids1=batch_ids1,
+            x2=x2_all,
+            batch_ids2=batch_ids2,
+        )
+        x1_all = self.task_conditioning(
+            x=x1_all,
+            batch_ids=batch_ids1,
+            task_hidden=task_hidden,
+        )
+        x2_all = self.task_conditioning(
+            x=x2_all,
+            batch_ids=batch_ids2,
+            task_hidden=task_hidden,
+        )
+
+        return (
+            tuple(torch.split(x1_all, lengths1, dim=0)),
+            tuple(torch.split(x2_all, lengths2, dim=0)),
         )
 
     def fuse_2d_dense_reasoning(
@@ -1726,12 +1801,14 @@ class UnifiedChangeDecoder(nn.Module):
             dense_time_id=0,
             reasoning_tokens=reasoning_t1,
             reasoning_time_id=0,
+            scale_id=3,
         )
         x2 = self._inject_reasoning_one_time(
             dense_tokens=dense_t2,
             dense_time_id=1,
             reasoning_tokens=reasoning_t2,
             reasoning_time_id=1,
+            scale_id=3,
         )
 
         # Shared Unified Decoder: T1/T2 are mixed jointly inside each sample.

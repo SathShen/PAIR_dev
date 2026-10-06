@@ -8,18 +8,17 @@ Unified temporal model for:
 
 PAIR V2 2D route
 ----------------
-Qwen3-VL provides three checkpoint-specific pre-merge DeepStack ViT feature
-maps plus its final merged visual dense tokens and LLM image hidden states.
-For a 512x512 input, the three pre-merge maps share the native 32x32 ViT grid
-and are converted to 1/4, 1/8 and 1/16 pseudo-pyramid scales.
+All four decoder pyramid levels are now routed through Qwen reasoning before
+the final 2D decoder.  The three pre-merge DeepStack features (P4/P8/P16) are
+compressed to small token grids, explicitly labelled in the text prompt with
+their pyramid level / decoder scale / Vision layer, injected into the Qwen LLM
+sequence, and read back from the LLM hidden states.  Native merged image tokens
+serve as P32.
 
-At the true merged 16x16 grid, PAIR restores the original dense<-LLM fusion:
-    Q   = projected final merged Qwen-ViT dense tokens
-    K,V = projected Qwen LLM image hidden states
-Both streams receive position + modality + time embeddings before shared
-cross-attention.  The fused result is the 1/32 deepest feature sent to the
-existing CascadeGatedDecoder.  SCD and BCD use the same x0/x1/xc decoder; only
-the final prediction route differs.
+For every level, the dense visual map is the Cross-Attention query and the
+corresponding Qwen LLM hidden block is K/V.  All T1/T2 levels then pass jointly
+through the shared latent Unified Decoder and <TASK> conditioning before a
+plain joint U-Net restores the 1/4 output grid.
 The public 2D prediction contains only:
 
     semantic_logits_t1
@@ -97,11 +96,13 @@ class PAIRBackbone(nn.Module):
         qwen_backbone: nn.Module,
         point_encoder: Optional[nn.Module] = None,
         point_adapter: Optional[nn.Module] = None,
+        image_pyramid_reasoning_adapter: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.qwen_backbone = qwen_backbone
         self.point_encoder = point_encoder
         self.point_adapter = point_adapter
+        self.image_pyramid_reasoning_adapter = image_pyramid_reasoning_adapter
 
     # -------------------------------------------------------------------------
     # Route inference
@@ -359,6 +360,95 @@ class PAIRBackbone(nn.Module):
         return hook
 
     # -------------------------------------------------------------------------
+    # Multi-scale image-pyramid token injection into Qwen LLM
+    # -------------------------------------------------------------------------
+
+    def _make_pyramid_injection_hook(
+        self,
+        *,
+        prepared,
+        stats,
+    ):
+        adapter = self.image_pyramid_reasoning_adapter
+        if adapter is None:
+            raise RuntimeError(
+                "Pyramid placeholders were requested but no image pyramid "
+                "reasoning adapter is configured"
+            )
+
+        plan = tuple(prepared.get("pyramid_plan", ()))
+        masks_t1 = prepared.get("pyramid_masks_t1", {})
+        masks_t2 = prepared.get("pyramid_masks_t2", {})
+        batch_size = int(prepared["batch_size"])
+        hidden_size = int(self.qwen_backbone.hidden_size)
+
+        def hook(module, args, kwargs):
+            stats["calls"] += 1
+            inputs_embeds = kwargs.get("inputs_embeds")
+            if not (torch.is_tensor(inputs_embeds) and inputs_embeds.ndim == 3):
+                raise RuntimeError(
+                    "PAIR pyramid injection expected Qwen language_model to "
+                    "receive inputs_embeds=[B,L,D]"
+                )
+            if inputs_embeds.shape[0] != batch_size:
+                raise RuntimeError(
+                    "Pyramid injection batch mismatch: "
+                    f"{inputs_embeds.shape[0]} != {batch_size}"
+                )
+            if inputs_embeds.shape[-1] != hidden_size:
+                raise RuntimeError(
+                    "Pyramid injection hidden mismatch: "
+                    f"{inputs_embeds.shape[-1]} != {hidden_size}"
+                )
+
+            # The Qwen visual tower has already run before language_model is
+            # called. Its permanent DeepStack hooks therefore contain the
+            # current batch's native pre-merge features at this point.
+            vision = self.qwen_backbone.get_temporal_vision_feature_maps(
+                prepared
+            )
+            out = inputs_embeds.clone()
+            replaced = 0
+
+            for temporal_key, mask_dict in (
+                ("t1", masks_t1),
+                ("t2", masks_t2),
+            ):
+                for item in plan:
+                    level_key = str(item["key"])
+                    layer_idx = int(item["layer_idx"])
+                    mask = mask_dict[level_key].to(out.device)
+                    feature_map = vision[temporal_key][layer_idx]
+                    pyramid_tokens = adapter(feature_map)
+                    expected = int(item["count"])
+                    if pyramid_tokens.shape != (batch_size, expected, hidden_size):
+                        raise RuntimeError(
+                            f"{temporal_key}/{level_key}: pyramid adapter returned "
+                            f"{tuple(pyramid_tokens.shape)}, expected "
+                            f"{(batch_size, expected, hidden_size)}"
+                        )
+
+                    for batch_id in range(batch_size):
+                        sample_mask = mask[batch_id]
+                        actual = int(sample_mask.sum().item())
+                        if actual != expected:
+                            raise RuntimeError(
+                                f"Batch {batch_id} {temporal_key}/{level_key}: "
+                                f"prompt contains {actual} placeholders, expected {expected}"
+                            )
+                        out[batch_id, sample_mask] = pyramid_tokens[batch_id].to(
+                            device=out.device, dtype=out.dtype
+                        )
+                        replaced += actual
+
+            kwargs = dict(kwargs)
+            kwargs["inputs_embeds"] = out
+            stats["replaced"] = replaced
+            return args, kwargs
+
+        return hook
+
+    # -------------------------------------------------------------------------
     # Capture hooks
     # -------------------------------------------------------------------------
 
@@ -524,6 +614,37 @@ class PAIRBackbone(nn.Module):
             inputs, prepared["image_grid_indices_t2"]
         )
 
+        # Custom P4/P8/P16 token blocks are ordinary causal LLM positions,
+        # not Qwen native visual positions. Read their final LLM hidden states
+        # back in the same level/time topology used by the prompt.
+        grid = int(prepared.get("pyramid_grid_size", 0))
+        plan = tuple(prepared.get("pyramid_plan", ()))
+        pyramid_hidden = {"t1": {}, "t2": {}}
+        if plan:
+            if grid <= 0:
+                raise RuntimeError("Invalid pyramid_grid_size in prepared Qwen inputs")
+            for temporal_key, mask_dict in (
+                ("t1", prepared["pyramid_masks_t1"]),
+                ("t2", prepared["pyramid_masks_t2"]),
+            ):
+                for item in plan:
+                    level_key = str(item["key"])
+                    mask = mask_dict[level_key].to(device)
+                    per_sample = []
+                    expected = grid * grid
+                    for batch_id in range(batch_size):
+                        selected = last_hidden[batch_id][mask[batch_id]]
+                        if selected.shape[0] != expected:
+                            raise RuntimeError(
+                                f"Batch {batch_id} {temporal_key}/{level_key}: "
+                                f"LLM hidden has {selected.shape[0]} pyramid tokens, "
+                                f"expected {expected}"
+                            )
+                        per_sample.append(
+                            selected.reshape(1, grid, grid, selected.shape[-1])
+                        )
+                    pyramid_hidden[temporal_key][level_key] = per_sample
+
         return {
             "image_hidden_t1": image_hidden_t1,
             "image_hidden_t2": image_hidden_t2,
@@ -540,6 +661,8 @@ class PAIRBackbone(nn.Module):
             "image_hidden_2d_t2_list": self._split_by_batch(
                 image_hidden_t2, image_batch_t2, shapes_t2
             ),
+            "image_pyramid_hidden_2d_t1": pyramid_hidden["t1"],
+            "image_pyramid_hidden_2d_t2": pyramid_hidden["t2"],
         }
 
     # -------------------------------------------------------------------------
@@ -554,13 +677,27 @@ class PAIRBackbone(nn.Module):
         images_t2,
         point_tokens_t1,
         point_tokens_t2,
+        enable_image_pyramid_tokens: bool = False,
     ):
+        pyramid_adapter = self.image_pyramid_reasoning_adapter
+        use_pyramid = bool(enable_image_pyramid_tokens)
+        if use_pyramid and pyramid_adapter is None:
+            raise RuntimeError(
+                "enable_image_pyramid_tokens=True but no pyramid adapter is configured"
+            )
+
         prepared = self.qwen_backbone.prepare_inputs(
             prompt=prompt,
             images_t1=images_t1,
             images_t2=images_t2,
             point_tokens_t1=point_tokens_t1,
             point_tokens_t2=point_tokens_t2,
+            pyramid_tokens_per_level=(
+                int(pyramid_adapter.num_tokens) if use_pyramid else 0
+            ),
+            pyramid_grid_size=(
+                int(pyramid_adapter.grid_size) if use_pyramid else 8
+            ),
         )
         device = self.qwen_backbone.model_device
         inputs = {
@@ -572,7 +709,12 @@ class PAIRBackbone(nn.Module):
             point_tokens_t2,
             prepared["batch_size"],
         )
-        return {**prepared, "inputs": inputs, "point_tokens": point_tokens}
+        return {
+            **prepared,
+            "inputs": inputs,
+            "point_tokens": point_tokens,
+            "image_pyramid_tokens_enabled": use_pyramid,
+        }
 
     # -------------------------------------------------------------------------
     # Forward
@@ -610,12 +752,17 @@ class PAIRBackbone(nn.Module):
             point_tokens_t1 = point_out_t1["point_tokens"]
             point_tokens_t2 = point_out_t2["point_tokens"]
 
+        use_image_pyramid_tokens = (
+            task_mode in ("2d", "2d3d")
+            and self.image_pyramid_reasoning_adapter is not None
+        )
         prepared = self._prepare_qwen(
             prompt=prompt,
             images_t1=images_t1 if task_mode in ("2d", "2d3d") else None,
             images_t2=images_t2 if task_mode in ("2d", "2d3d") else None,
             point_tokens_t1=point_tokens_t1 if task_mode in ("3d", "2d3d") else None,
             point_tokens_t2=point_tokens_t2 if task_mode in ("3d", "2d3d") else None,
+            enable_image_pyramid_tokens=use_image_pyramid_tokens,
         )
         inputs = prepared["inputs"]
         point_tokens = prepared["point_tokens"]
@@ -630,6 +777,7 @@ class PAIRBackbone(nn.Module):
             self.qwen_backbone.clear_vision_intermediate_cache()
 
         stats = {"calls": 0, "replaced": False}
+        pyramid_stats = {"calls": 0, "replaced": 0}
         visual_capture, language_capture, handles = {}, {}, []
 
         if any(item is not None for item in point_tokens):
@@ -641,6 +789,17 @@ class PAIRBackbone(nn.Module):
                         full_seq_len=inputs["input_ids"].shape[1],
                         stats=stats,
                     )
+                )
+            )
+
+        if use_image_pyramid_tokens:
+            handles.append(
+                self.language_model_module().register_forward_pre_hook(
+                    self._make_pyramid_injection_hook(
+                        prepared=prepared,
+                        stats=pyramid_stats,
+                    ),
+                    with_kwargs=True,
                 )
             )
 
@@ -675,6 +834,20 @@ class PAIRBackbone(nn.Module):
             raise RuntimeError(
                 "Temporal point tokens were prepared but not injected into Qwen"
             )
+        if use_image_pyramid_tokens:
+            expected_pyramid = (
+                prepared["batch_size"]
+                * 2
+                * len(prepared["pyramid_plan"])
+                * prepared["pyramid_tokens_per_level"]
+            )
+            if pyramid_stats["calls"] <= 0 or pyramid_stats["replaced"] != expected_pyramid:
+                raise RuntimeError(
+                    "Image pyramid tokens were prepared but not fully injected "
+                    f"into Qwen: calls={pyramid_stats['calls']} "
+                    f"replaced={pyramid_stats['replaced']} "
+                    f"expected={expected_pyramid}"
+                )
 
         vision_intermediate = None
         if capture_vision_intermediate:
@@ -804,6 +977,12 @@ class PAIRBackbone(nn.Module):
             "image_dense_2d_t2_list": dense_2d_t2,
             "image_hidden_2d_t1_list": hidden.get("image_hidden_2d_t1_list"),
             "image_hidden_2d_t2_list": hidden.get("image_hidden_2d_t2_list"),
+            "image_pyramid_hidden_2d_t1": hidden.get(
+                "image_pyramid_hidden_2d_t1"
+            ),
+            "image_pyramid_hidden_2d_t2": hidden.get(
+                "image_pyramid_hidden_2d_t2"
+            ),
             "image_premerge_t1": (
                 None if vision_intermediate is None else vision_intermediate["t1"]
             ),
@@ -843,6 +1022,9 @@ class PAIRBackbone(nn.Module):
             "task_count": prepared["task_count"],
             "point_injection_calls": stats["calls"],
             "point_injection_replaced": stats["replaced"],
+            "pyramid_injection_calls": pyramid_stats["calls"],
+            "pyramid_injection_replaced": pyramid_stats["replaced"],
+            "pyramid_plan": prepared.get("pyramid_plan", ()),
         }
 
         if single:
@@ -991,6 +1173,115 @@ class ImageDenseAdapter(nn.Module):
                 f"ImageDenseAdapter expects [N,{self.in_dim}], got {tuple(x.shape)}"
             )
         return self.proj(x)
+
+
+class ImagePyramidReasoningAdapter(nn.Module):
+    """Compress one native DeepStack map into a small Qwen-token block.
+
+    Every P4/P8/P16 source map is still on Qwen's native pre-merge spatial
+    grid (typically 32x32 for a 512x512 image).  We adaptive-average-pool it
+    to a fixed reasoning grid and project each pooled Vision vector directly
+    into the Qwen text hidden dimension.  The same adapter is shared by all
+    three pyramid levels and both times; scale identity is supplied explicitly
+    by the surrounding prompt text.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        grid_size: int = 8,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.grid_size = int(grid_size)
+        if self.grid_size <= 0:
+            raise ValueError("grid_size must be > 0")
+        self.num_tokens = self.grid_size * self.grid_size
+        self.proj = nn.Sequential(
+            nn.Linear(self.in_dim, self.out_dim),
+            nn.LayerNorm(self.out_dim),
+        )
+
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(feature_map) or feature_map.ndim != 4:
+            raise ValueError(
+                "ImagePyramidReasoningAdapter expects [B,C,H,W], got "
+                f"{getattr(feature_map, 'shape', None)}"
+            )
+        if feature_map.shape[1] != self.in_dim:
+            raise ValueError(
+                f"Pyramid feature channels {feature_map.shape[1]} != {self.in_dim}"
+            )
+        pooled = F.adaptive_avg_pool2d(
+            feature_map,
+            output_size=(self.grid_size, self.grid_size),
+        )
+        flat = pooled.permute(0, 2, 3, 1).contiguous().reshape(
+            feature_map.shape[0],
+            self.num_tokens,
+            self.in_dim,
+        )
+        projection_dtype = self.proj[0].weight.dtype
+        return self.proj(flat.to(dtype=projection_dtype))
+
+
+def _bchw_to_image_feature_list(feature_map: torch.Tensor, *, name: str):
+    """Convert [B,C,H,W] into per-sample [1,H,W,C] lists."""
+    if not torch.is_tensor(feature_map) or feature_map.ndim != 4:
+        raise ValueError(
+            f"{name} must be [B,C,H,W], got {getattr(feature_map, 'shape', None)}"
+        )
+    return [
+        feature_map[b].permute(1, 2, 0).unsqueeze(0).contiguous()
+        for b in range(feature_map.shape[0])
+    ]
+
+
+def build_reasoned_2d_pyramid(
+    fused_native_maps,
+    *,
+    name: str,
+):
+    """Restore [P4,P8,P16,P32] decoder grids from reasoned native maps.
+
+    P4/P8/P16 all originate from the native pre-merge Vision grid, while P32
+    is the merged grid at half the height/width.  Every map has already passed
+    through LLM-conditioned Cross-Attn + Unified before this resampling.
+    """
+    if not isinstance(fused_native_maps, (list, tuple)) or len(fused_native_maps) != 4:
+        raise ValueError(f"{name} needs four fused native maps")
+    p4_native, p8_native, p16, p32 = fused_native_maps
+    for i, feat in enumerate(fused_native_maps):
+        if not torch.is_tensor(feat) or feat.ndim != 4:
+            raise ValueError(
+                f"{name}[{i}] must be [B,C,H,W], got {getattr(feat, 'shape', None)}"
+            )
+    if p4_native.shape != p8_native.shape or p4_native.shape != p16.shape:
+        raise RuntimeError(
+            f"{name}: P4/P8/P16 native maps must share one grid, got "
+            f"{tuple(p4_native.shape)}, {tuple(p8_native.shape)}, {tuple(p16.shape)}"
+        )
+    native_h, native_w = p16.shape[-2:]
+    if tuple(p32.shape[-2:]) != (native_h // 2, native_w // 2):
+        raise RuntimeError(
+            f"{name}: P32 must be half the native grid, got "
+            f"native={(native_h, native_w)} p32={tuple(p32.shape[-2:])}"
+        )
+    p4 = F.interpolate(
+        p4_native,
+        size=(native_h * 4, native_w * 4),
+        mode="bilinear",
+        align_corners=False,
+    )
+    p8 = F.interpolate(
+        p8_native,
+        size=(native_h * 2, native_w * 2),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return [p4, p8, p16, p32]
 
 
 def _normalized_2d_positions(
@@ -1592,6 +1883,7 @@ class PAIRModel(nn.Module):
         backbone,
         decoder,
         image_adapter,
+        image_pyramid_dense_adapter,
         qwen_tuning,
         vision_lora_enabled=False,
         point_lora_enabled=False,
@@ -1602,8 +1894,10 @@ class PAIRModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
-        # 2D dense-query adapter: final merged Qwen-ViT tokens -> decoder_dim.
+        # 2D dense-query adapters. P32 uses Qwen's merged hidden dimension;
+        # P4/P8/P16 use the native Vision hidden dimension.
         self.image_adapter = image_adapter
+        self.image_pyramid_dense_adapter = image_pyramid_dense_adapter
         self.qwen_tuning = str(qwen_tuning).lower()
         self.vision_lora_enabled = bool(vision_lora_enabled)
         self.point_lora_enabled = bool(point_lora_enabled)
@@ -1736,16 +2030,35 @@ class PAIRModel(nn.Module):
         elif point_lora_requested:
             print("Utonia / PointAdapter / Point LoRA skipped: no active 3D route")
 
+        pyramid_grid_size = int(cfg.get("pyramid_reasoning_grid_size", 8))
+        image_pyramid_reasoning_adapter = (
+            ImagePyramidReasoningAdapter(
+                in_dim=qwen.vision_hidden_size,
+                out_dim=qwen.hidden_size,
+                grid_size=pyramid_grid_size,
+            ).to(device)
+            if enable_2d
+            else None
+        )
         backbone = PAIRBackbone(
             qwen_backbone=qwen,
             point_encoder=point_encoder,
             point_adapter=point_adapter,
+            image_pyramid_reasoning_adapter=image_pyramid_reasoning_adapter,
         )
-        # Qwen's final merged visual output is projected to decoder space and
-        # used as the dense query stream for the restored 2D cross-attention.
+
+        # Dense query adapters for all four pyramid levels.
         image_adapter = (
             ImageDenseAdapter(
                 in_dim=qwen.hidden_size,
+                out_dim=decoder_dim,
+            ).to(device)
+            if enable_2d
+            else None
+        )
+        image_pyramid_dense_adapter = (
+            ImageDenseAdapter(
+                in_dim=qwen.vision_hidden_size,
                 out_dim=decoder_dim,
             ).to(device)
             if enable_2d
@@ -1762,7 +2075,6 @@ class PAIRModel(nn.Module):
             unified_num_heads=int(unified_cfg.get("num_heads", 8)),
             unified_mlp_ratio=float(unified_cfg.get("mlp_ratio", 2.0)),
             unified_dropout=float(unified_cfg.get("dropout", 0.0)),
-            multiscale_path_dropout=float(cfg.get("multiscale_path_dropout", 0.3)),
             enable_2d=enable_2d,
             enable_3d=enable_3d,
             enable_semantic=enable_semantic,
@@ -1771,6 +2083,7 @@ class PAIRModel(nn.Module):
             backbone,
             decoder,
             image_adapter,
+            image_pyramid_dense_adapter,
             qwen_tuning,
             vision_lora_enabled=vision_lora_enabled,
             point_lora_enabled=point_lora_enabled,
@@ -1838,107 +2151,178 @@ class PAIRModel(nn.Module):
             images_t2=images_t2,
             return_logits=False,
             return_hidden_states=True,
-            # This flag requests both the existing merged visual features
-            # and the three configured pre-merge DeepStack maps captured by hooks.
             return_dense_features=True,
             use_cache=False,
         )
 
-        # Frozen Qwen is safe under no_grad for 2D because the complete V2
-        # decoder sits downstream from the frozen Qwen representations.
-        if self.qwen_tuning == "frozen":
-            with torch.no_grad():
-                out = self.backbone(**kwargs)
-        else:
-            out = self.backbone(**kwargs)
+        # Frozen Qwen is safe under no_grad only when no trainable input token
+        # adapters feed through it.  The multi-scale pyramid adapter is
+        # trainable and its gradients must traverse the fixed LLM, so the 2D
+        # route must keep autograd even for qwen_tuning='frozen'.
+        out = self.backbone(**kwargs)
 
         premerge_t1 = out.aux.get("image_premerge_t1")
         premerge_t2 = out.aux.get("image_premerge_t2")
         dense_t1_list = out.aux.get("image_dense_2d_t1_list")
         dense_t2_list = out.aux.get("image_dense_2d_t2_list")
-        llm_t1 = out.aux.get("image_hidden_2d_t1_list")
-        llm_t2 = out.aux.get("image_hidden_2d_t2_list")
+        native_llm_t1 = out.aux.get("image_hidden_2d_t1_list")
+        native_llm_t2 = out.aux.get("image_hidden_2d_t2_list")
+        pyramid_llm_t1 = out.aux.get("image_pyramid_hidden_2d_t1")
+        pyramid_llm_t2 = out.aux.get("image_pyramid_hidden_2d_t2")
+
         if premerge_t1 is None or premerge_t2 is None:
-            raise RuntimeError("PAIR did not expose the configured Qwen pre-merge features")
+            raise RuntimeError("PAIR did not expose Qwen pre-merge pyramid features")
         if dense_t1_list is None or dense_t2_list is None:
             raise RuntimeError("PAIR did not expose final merged Qwen-ViT dense features")
-        if llm_t1 is None or llm_t2 is None:
-            raise RuntimeError("PAIR did not expose Qwen LLM image reasoning maps")
+        if native_llm_t1 is None or native_llm_t2 is None:
+            raise RuntimeError("PAIR did not expose native Qwen LLM image hidden states")
+        if not pyramid_llm_t1 or not pyramid_llm_t2:
+            raise RuntimeError("PAIR did not expose Qwen LLM pyramid hidden states")
         if out.task_hidden is None:
             raise RuntimeError("PAIR did not expose the Qwen <TASK> readout")
-        if self.image_adapter is None:
-            raise RuntimeError("PAIR 2D dense<-LLM fusion requires image_adapter")
+        if self.image_adapter is None or self.image_pyramid_dense_adapter is None:
+            raise RuntimeError("PAIR 2D multi-scale dense adapters are not configured")
 
-        # Restore the original PAIR 2D fusion protocol:
-        #   Q   = final merged Qwen-ViT dense tokens -> ImageDenseAdapter
-        #   K,V = Qwen LLM image hidden states -> reasoning_projection
-        # Both sides then receive shared position + modality + time embeddings
-        # before ReasoningInjection cross-attention.  The fused output becomes
-        # the 1/32 deepest CGDecoder feature.
-        dense_tokens_t1, dense_shapes_t1 = make_image_token_set_2d(
+        layer_indices = tuple(self.qwen_backbone.vision_intermediate_layers)
+        if len(layer_indices) != 3:
+            raise RuntimeError(
+                f"Expected three DeepStack layers, got {layer_indices}"
+            )
+        shallow_idx, middle_idx, deep_idx = layer_indices
+        scale_spec = (
+            ("p4", shallow_idx),
+            ("p8", middle_idx),
+            ("p16", deep_idx),
+        )
+
+        dense_sets_t1 = []
+        dense_sets_t2 = []
+        reasoning_sets_t1 = []
+        reasoning_sets_t2 = []
+        dense_shapes_t1 = []
+        dense_shapes_t2 = []
+
+        # P4/P8/P16: raw dense queries come from their own native DeepStack
+        # maps, while K/V come from the matching custom token blocks AFTER the
+        # Qwen LLM has read the explicit pyramid labels in the prompt.
+        for level_key, layer_idx in scale_spec:
+            if layer_idx not in premerge_t1 or layer_idx not in premerge_t2:
+                raise RuntimeError(
+                    f"Missing DeepStack layer {layer_idx} for {level_key}"
+                )
+            if level_key not in pyramid_llm_t1 or level_key not in pyramid_llm_t2:
+                raise RuntimeError(
+                    f"Missing LLM pyramid hidden block {level_key}"
+                )
+
+            dense1, shapes1 = make_image_token_set_2d(
+                _bchw_to_image_feature_list(
+                    premerge_t1[layer_idx], name=f"T1_{level_key}_dense"
+                ),
+                feature_dim=self.qwen_backbone.vision_hidden_size,
+                name=f"T1_{level_key}_dense",
+                adapter=self.image_pyramid_dense_adapter,
+            )
+            dense2, shapes2 = make_image_token_set_2d(
+                _bchw_to_image_feature_list(
+                    premerge_t2[layer_idx], name=f"T2_{level_key}_dense"
+                ),
+                feature_dim=self.qwen_backbone.vision_hidden_size,
+                name=f"T2_{level_key}_dense",
+                adapter=self.image_pyramid_dense_adapter,
+            )
+            reason1, _ = make_image_token_set_2d(
+                pyramid_llm_t1[level_key],
+                feature_dim=self.qwen_backbone.hidden_size,
+                name=f"T1_{level_key}_llm",
+            )
+            reason2, _ = make_image_token_set_2d(
+                pyramid_llm_t2[level_key],
+                feature_dim=self.qwen_backbone.hidden_size,
+                name=f"T2_{level_key}_llm",
+            )
+
+            if shapes1 != shapes2:
+                raise RuntimeError(
+                    f"T1/T2 dense topology mismatch at {level_key}: "
+                    f"{shapes1} vs {shapes2}"
+                )
+            dense_sets_t1.append(dense1)
+            dense_sets_t2.append(dense2)
+            reasoning_sets_t1.append(reason1)
+            reasoning_sets_t2.append(reason2)
+            dense_shapes_t1.append(shapes1)
+            dense_shapes_t2.append(shapes2)
+
+        # P32: Qwen's native merged image tokens already pass through the LLM.
+        dense32_t1, shape32_t1 = make_image_token_set_2d(
             dense_t1_list,
             feature_dim=self.qwen_backbone.hidden_size,
-            name="T1_dense",
+            name="T1_p32_dense",
             adapter=self.image_adapter,
         )
-        dense_tokens_t2, dense_shapes_t2 = make_image_token_set_2d(
+        dense32_t2, shape32_t2 = make_image_token_set_2d(
             dense_t2_list,
             feature_dim=self.qwen_backbone.hidden_size,
-            name="T2_dense",
+            name="T2_p32_dense",
             adapter=self.image_adapter,
         )
-        reasoning_tokens_t1, reasoning_shapes_t1 = make_image_token_set_2d(
-            llm_t1,
+        reason32_t1, _ = make_image_token_set_2d(
+            native_llm_t1,
             feature_dim=self.qwen_backbone.hidden_size,
-            name="T1_llm",
+            name="T1_p32_llm",
         )
-        reasoning_tokens_t2, reasoning_shapes_t2 = make_image_token_set_2d(
-            llm_t2,
+        reason32_t2, _ = make_image_token_set_2d(
+            native_llm_t2,
             feature_dim=self.qwen_backbone.hidden_size,
-            name="T2_llm",
+            name="T2_p32_llm",
         )
-
-        if dense_shapes_t1 != reasoning_shapes_t1:
+        if shape32_t1 != shape32_t2:
             raise RuntimeError(
-                f"T1 dense/LLM topology mismatch: {dense_shapes_t1} vs {reasoning_shapes_t1}"
+                f"T1/T2 P32 topology mismatch: {shape32_t1} vs {shape32_t2}"
             )
-        if dense_shapes_t2 != reasoning_shapes_t2:
-            raise RuntimeError(
-                f"T2 dense/LLM topology mismatch: {dense_shapes_t2} vs {reasoning_shapes_t2}"
-            )
+        dense_sets_t1.append(dense32_t1)
+        dense_sets_t2.append(dense32_t2)
+        reasoning_sets_t1.append(reason32_t1)
+        reasoning_sets_t2.append(reason32_t2)
+        dense_shapes_t1.append(shape32_t1)
+        dense_shapes_t2.append(shape32_t2)
 
-        fused_t1, fused_t2 = self.decoder.fuse_2d_dense_reasoning(
-            dense_t1=dense_tokens_t1,
-            dense_t2=dense_tokens_t2,
-            reasoning_t1=reasoning_tokens_t1,
-            reasoning_t2=reasoning_tokens_t2,
+        fused_t1, fused_t2 = self.decoder.fuse_2d_multiscale_reasoning(
+            dense_t1=tuple(dense_sets_t1),
+            dense_t2=tuple(dense_sets_t2),
+            reasoning_t1=tuple(reasoning_sets_t1),
+            reasoning_t2=tuple(reasoning_sets_t2),
             task_hidden=out.task_hidden,
         )
-        fused_map_t1 = restore_image_token_map_2d(
-            fused_t1,
-            dense_tokens_t1.batch_ids,
-            dense_shapes_t1,
-            name="T1_fused",
-        )
-        fused_map_t2 = restore_image_token_map_2d(
-            fused_t2,
-            dense_tokens_t2.batch_ids,
-            dense_shapes_t2,
-            name="T2_fused",
-        )
 
-        layer_indices = self.qwen_backbone.vision_intermediate_layers
-        feat_pyramid_t1 = build_qwen_2d_pyramid(
-            premerge_by_layer=premerge_t1,
-            fused_deepest_feature=fused_map_t1,
-            layer_indices=layer_indices,
-            name="T1",
+        fused_native_t1 = []
+        fused_native_t2 = []
+        for scale_id, (flat1, flat2) in enumerate(zip(fused_t1, fused_t2)):
+            fused_native_t1.append(
+                restore_image_token_map_2d(
+                    flat1,
+                    dense_sets_t1[scale_id].batch_ids,
+                    dense_shapes_t1[scale_id],
+                    name=f"T1_fused_scale{scale_id}",
+                )
+            )
+            fused_native_t2.append(
+                restore_image_token_map_2d(
+                    flat2,
+                    dense_sets_t2[scale_id].batch_ids,
+                    dense_shapes_t2[scale_id],
+                    name=f"T2_fused_scale{scale_id}",
+                )
+            )
+
+        feat_pyramid_t1 = build_reasoned_2d_pyramid(
+            fused_native_t1,
+            name="T1_reasoned_pyramid",
         )
-        feat_pyramid_t2 = build_qwen_2d_pyramid(
-            premerge_by_layer=premerge_t2,
-            fused_deepest_feature=fused_map_t2,
-            layer_indices=layer_indices,
-            name="T2",
+        feat_pyramid_t2 = build_reasoned_2d_pyramid(
+            fused_native_t2,
+            name="T2_reasoned_pyramid",
         )
 
         for scale_id, (feat1, feat2) in enumerate(
@@ -1946,7 +2330,7 @@ class PAIRModel(nn.Module):
         ):
             if feat1.shape != feat2.shape:
                 raise RuntimeError(
-                    f"T1/T2 V2 pyramid mismatch at scale {scale_id}: "
+                    f"T1/T2 reasoned pyramid mismatch at scale {scale_id}: "
                     f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
                 )
 
