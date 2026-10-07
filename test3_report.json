@@ -1,0 +1,571 @@
+{
+  "config": "configs/pair_train_qwen4b.json",
+  "dataset": "SECOND",
+  "checkpoint": "/data2/sht/Codes/PAIR/outputs/202610070114_PAIR_SECOND_4B_primidToken2/ValBest_SECOND_Ep027_SECONDFscd0.6395.pt",
+  "checkpoint_epoch": 27,
+  "pyramid_reasoning_grid_size": 8,
+  "configured_max_grad_norm": 3.0,
+  "grad_accum": 1,
+  "feature_attention": {
+    "p16/T1": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.0073582157492638,
+          "spatial_std": 0.7668709009885788,
+          "neighbor_delta_rms": 0.6949825547635555,
+          "neighbor_cosine": 0.7593682333827019
+        },
+        "query_input": {
+          "feature_rms": 1.3331502676010132,
+          "spatial_std": 0.5254649054259062,
+          "neighbor_delta_rms": 0.43981217592954636,
+          "neighbor_cosine": 0.9448909275233746
+        },
+        "cross_output": {
+          "feature_rms": 0.9866132289171219,
+          "spatial_std": 0.7421890869736671,
+          "neighbor_delta_rms": 0.6705568358302116,
+          "neighbor_cosine": 0.7656230814754963
+        },
+        "unified_output": {
+          "feature_rms": 1.0867758691310883,
+          "spatial_std": 0.9064969792962074,
+          "neighbor_delta_rms": 0.8304035440087318,
+          "neighbor_cosine": 0.704071119427681
+        },
+        "task_output": {
+          "feature_rms": 0.9612335227429867,
+          "spatial_std": 0.07765570748597383,
+          "neighbor_delta_rms": 0.06933950330130756,
+          "neighbor_cosine": 0.9973704405128956
+        },
+        "decoder_input": {
+          "feature_rms": 0.9612335227429867,
+          "spatial_std": 0.07765570748597383,
+          "neighbor_delta_rms": 0.06933950330130756,
+          "neighbor_cosine": 0.9973704405128956
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7450860779307055,
+        "mean_max_prob": 0.14814376831054688,
+        "mean_effective_keys_per_query": 27.93058955669403,
+        "mass_effective_key_fraction": 0.7014270601446819,
+        "top1_key_coverage": 0.615234375
+      }
+    },
+    "p16/T2": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.0077418833971024,
+          "spatial_std": 0.7546053975820541,
+          "neighbor_delta_rms": 0.7022769935429096,
+          "neighbor_cosine": 0.7544731684029102
+        },
+        "query_input": {
+          "feature_rms": 1.3227636516094208,
+          "spatial_std": 0.5387887991964817,
+          "neighbor_delta_rms": 0.46316225454211235,
+          "neighbor_cosine": 0.9378439746797085
+        },
+        "cross_output": {
+          "feature_rms": 0.9857660010457039,
+          "spatial_std": 0.7257915064692497,
+          "neighbor_delta_rms": 0.6818621959537268,
+          "neighbor_cosine": 0.7571612261235714
+        },
+        "unified_output": {
+          "feature_rms": 1.0811984986066818,
+          "spatial_std": 0.8895988762378693,
+          "neighbor_delta_rms": 0.8454030379652977,
+          "neighbor_cosine": 0.6908076591789722
+        },
+        "task_output": {
+          "feature_rms": 0.9618685767054558,
+          "spatial_std": 0.07529469020664692,
+          "neighbor_delta_rms": 0.06997167482040823,
+          "neighbor_cosine": 0.9973235912621021
+        },
+        "decoder_input": {
+          "feature_rms": 0.9618685767054558,
+          "spatial_std": 0.07529469020664692,
+          "neighbor_delta_rms": 0.06997167482040823,
+          "neighbor_cosine": 0.9973235912621021
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7430089825457131,
+        "mean_max_prob": 0.14633161295205355,
+        "mean_effective_keys_per_query": 27.715639233589172,
+        "mass_effective_key_fraction": 0.7008115074610267,
+        "top1_key_coverage": 0.5771484375
+      }
+    },
+    "p32/T1": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 0.9987038038671017,
+          "spatial_std": 0.6121351178735495,
+          "neighbor_delta_rms": 0.5241806209087372,
+          "neighbor_cosine": 0.8593545332551003
+        },
+        "query_input": {
+          "feature_rms": 1.2320187017321587,
+          "spatial_std": 0.4660594779998064,
+          "neighbor_delta_rms": 0.3529612571001053,
+          "neighbor_cosine": 0.9580231718719006
+        },
+        "cross_output": {
+          "feature_rms": 0.9948272779583931,
+          "spatial_std": 0.6874677035957575,
+          "neighbor_delta_rms": 0.6000835169106722,
+          "neighbor_cosine": 0.8140264004468918
+        },
+        "unified_output": {
+          "feature_rms": 1.1262258887290955,
+          "spatial_std": 0.7629653103649616,
+          "neighbor_delta_rms": 0.6620117072016001,
+          "neighbor_cosine": 0.8226325549185276
+        },
+        "task_output": {
+          "feature_rms": 0.960518017411232,
+          "spatial_std": 0.0688282500486821,
+          "neighbor_delta_rms": 0.059280135203152895,
+          "neighbor_cosine": 0.9980531893670559
+        },
+        "decoder_input": {
+          "feature_rms": 0.960518017411232,
+          "spatial_std": 0.0688282500486821,
+          "neighbor_delta_rms": 0.059280135203152895,
+          "neighbor_cosine": 0.9980531893670559
+        }
+      },
+      "attention": {
+        "keys": 256,
+        "norm_entropy": 0.7997326014229237,
+        "mean_max_prob": 0.04683443112298846,
+        "mean_effective_keys_per_query": 108.41163349151611,
+        "mass_effective_key_fraction": 0.6771479209201242,
+        "top1_key_coverage": 0.169189453125
+      }
+    },
+    "p32/T2": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 0.9988046921789646,
+          "spatial_std": 0.5319232400506735,
+          "neighbor_delta_rms": 0.5007096193730831,
+          "neighbor_cosine": 0.8722692914307117
+        },
+        "query_input": {
+          "feature_rms": 1.2760723382234573,
+          "spatial_std": 0.42602575197815895,
+          "neighbor_delta_rms": 0.3433560524135828,
+          "neighbor_cosine": 0.963040042668581
+        },
+        "cross_output": {
+          "feature_rms": 0.9941445700824261,
+          "spatial_std": 0.6071874238550663,
+          "neighbor_delta_rms": 0.5822732616215944,
+          "neighbor_cosine": 0.8259434625506401
+        },
+        "unified_output": {
+          "feature_rms": 1.1244406253099442,
+          "spatial_std": 0.6772387064993382,
+          "neighbor_delta_rms": 0.6467979401350021,
+          "neighbor_cosine": 0.8315669521689415
+        },
+        "task_output": {
+          "feature_rms": 0.9611937366425991,
+          "spatial_std": 0.06049373000860214,
+          "neighbor_delta_rms": 0.05761500634253025,
+          "neighbor_cosine": 0.9981767497956753
+        },
+        "decoder_input": {
+          "feature_rms": 0.9611937366425991,
+          "spatial_std": 0.06049373000860214,
+          "neighbor_delta_rms": 0.05761500634253025,
+          "neighbor_cosine": 0.9981767497956753
+        }
+      },
+      "attention": {
+        "keys": 256,
+        "norm_entropy": 0.824291213392638,
+        "mean_max_prob": 0.039085454074665904,
+        "mean_effective_keys_per_query": 118.81216812133789,
+        "mass_effective_key_fraction": 0.7314924458643337,
+        "top1_key_coverage": 0.178466796875
+      }
+    },
+    "p4/T1": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.0075467452406883,
+          "spatial_std": 0.745260663330555,
+          "neighbor_delta_rms": 0.7724708430469036,
+          "neighbor_cosine": 0.7037259489297867
+        },
+        "query_input": {
+          "feature_rms": 1.3319734036922455,
+          "spatial_std": 0.5211353320628405,
+          "neighbor_delta_rms": 0.5007917806506157,
+          "neighbor_cosine": 0.9287459589540958
+        },
+        "cross_output": {
+          "feature_rms": 0.9851004034280777,
+          "spatial_std": 0.6077190805226564,
+          "neighbor_delta_rms": 0.6051014810800552,
+          "neighbor_cosine": 0.8082630597054958
+        },
+        "unified_output": {
+          "feature_rms": 1.0887626186013222,
+          "spatial_std": 0.747953150421381,
+          "neighbor_delta_rms": 0.7499750442802906,
+          "neighbor_cosine": 0.7579597160220146
+        },
+        "task_output": {
+          "feature_rms": 0.9623980037868023,
+          "spatial_std": 0.0638691287022084,
+          "neighbor_delta_rms": 0.06298660184256732,
+          "neighbor_cosine": 0.9978230409324169
+        },
+        "decoder_input": {
+          "feature_rms": 0.9617798291146755,
+          "spatial_std": 0.05385408480651677,
+          "neighbor_delta_rms": 0.012544348428491503,
+          "neighbor_cosine": 0.9999135844409466
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7746403469939275,
+        "mean_max_prob": 0.12274531507864594,
+        "mean_effective_keys_per_query": 31.236289739608765,
+        "mass_effective_key_fraction": 0.7348971162792984,
+        "top1_key_coverage": 0.5419921875
+      }
+    },
+    "p4/T2": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.007392704486847,
+          "spatial_std": 0.7505074962973595,
+          "neighbor_delta_rms": 0.7832007631659508,
+          "neighbor_cosine": 0.6956331841647625
+        },
+        "query_input": {
+          "feature_rms": 1.3057982623577118,
+          "spatial_std": 0.5292627848684788,
+          "neighbor_delta_rms": 0.5118577107787132,
+          "neighbor_cosine": 0.9225464202463627
+        },
+        "cross_output": {
+          "feature_rms": 0.9847245961427689,
+          "spatial_std": 0.5894910786300898,
+          "neighbor_delta_rms": 0.5887113809585571,
+          "neighbor_cosine": 0.8182153962552547
+        },
+        "unified_output": {
+          "feature_rms": 1.0817412063479424,
+          "spatial_std": 0.7324537299573421,
+          "neighbor_delta_rms": 0.7365597784519196,
+          "neighbor_cosine": 0.7625675462186337
+        },
+        "task_output": {
+          "feature_rms": 0.9628645293414593,
+          "spatial_std": 0.06237667240202427,
+          "neighbor_delta_rms": 0.06141317752189934,
+          "neighbor_cosine": 0.9979246743023396
+        },
+        "decoder_input": {
+          "feature_rms": 0.9622745551168919,
+          "spatial_std": 0.05248225852847099,
+          "neighbor_delta_rms": 0.012237904244102538,
+          "neighbor_cosine": 0.9999175406992435
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7581283715099709,
+        "mean_max_prob": 0.12871018005535007,
+        "mean_effective_keys_per_query": 29.319475173950195,
+        "mass_effective_key_fraction": 0.7081619206635721,
+        "top1_key_coverage": 0.5126953125
+      }
+    },
+    "p8/T1": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.0067724138498306,
+          "spatial_std": 0.7745672129094601,
+          "neighbor_delta_rms": 0.7402738984674215,
+          "neighbor_cosine": 0.7248388379812241
+        },
+        "query_input": {
+          "feature_rms": 1.3557822406291962,
+          "spatial_std": 0.559174582362175,
+          "neighbor_delta_rms": 0.49626322090625763,
+          "neighbor_cosine": 0.9319701455533504
+        },
+        "cross_output": {
+          "feature_rms": 0.9883857145905495,
+          "spatial_std": 0.736340094357729,
+          "neighbor_delta_rms": 0.688199894502759,
+          "neighbor_cosine": 0.7540940791368484
+        },
+        "unified_output": {
+          "feature_rms": 1.0905363261699677,
+          "spatial_std": 0.8723316490650177,
+          "neighbor_delta_rms": 0.8200353048741817,
+          "neighbor_cosine": 0.714401800185442
+        },
+        "task_output": {
+          "feature_rms": 0.9605086408555508,
+          "spatial_std": 0.07334479782730341,
+          "neighbor_delta_rms": 0.06846671947278082,
+          "neighbor_cosine": 0.9974310174584389
+        },
+        "decoder_input": {
+          "feature_rms": 0.9597142413258553,
+          "spatial_std": 0.06211069109849632,
+          "neighbor_delta_rms": 0.024725932045839727,
+          "neighbor_cosine": 0.9996640495955944
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7623215414311791,
+        "mean_max_prob": 0.13496658205986023,
+        "mean_effective_keys_per_query": 29.68224596977234,
+        "mass_effective_key_fraction": 0.7542845220202256,
+        "top1_key_coverage": 0.576171875
+      }
+    },
+    "p8/T2": {
+      "stages": {
+        "raw_dense": {
+          "feature_rms": 1.0067786574363708,
+          "spatial_std": 0.783849373459816,
+          "neighbor_delta_rms": 0.7511975355446339,
+          "neighbor_cosine": 0.7169032692909241
+        },
+        "query_input": {
+          "feature_rms": 1.3173642456531525,
+          "spatial_std": 0.5652384106069803,
+          "neighbor_delta_rms": 0.5057806298136711,
+          "neighbor_cosine": 0.9252230823040009
+        },
+        "cross_output": {
+          "feature_rms": 0.9880585893988609,
+          "spatial_std": 0.7222271114587784,
+          "neighbor_delta_rms": 0.6776025239378214,
+          "neighbor_cosine": 0.7616177275776863
+        },
+        "unified_output": {
+          "feature_rms": 1.0860631167888641,
+          "spatial_std": 0.8556295931339264,
+          "neighbor_delta_rms": 0.8070164620876312,
+          "neighbor_cosine": 0.7220266573131084
+        },
+        "task_output": {
+          "feature_rms": 0.9612519592046738,
+          "spatial_std": 0.07148019201122224,
+          "neighbor_delta_rms": 0.06720662582665682,
+          "neighbor_cosine": 0.9975267611443996
+        },
+        "decoder_input": {
+          "feature_rms": 0.9604864381253719,
+          "spatial_std": 0.0603516164701432,
+          "neighbor_delta_rms": 0.02430589171126485,
+          "neighbor_cosine": 0.999676164239645
+        }
+      },
+      "attention": {
+        "keys": 64,
+        "norm_entropy": 0.7487560264663826,
+        "mean_max_prob": 0.13805959653109312,
+        "mean_effective_keys_per_query": 28.284099817276,
+        "mass_effective_key_fraction": 0.7305905636039904,
+        "top1_key_coverage": 0.59765625
+      }
+    }
+  },
+  "normal_val": {
+    "samples": 1694,
+    "seconds": 382.35003423690796,
+    "scalars": {
+      "change/OA": 0.8987809578671506,
+      "change/Precision": 0.7423068925587185,
+      "change/Recall": 0.7243627994648232,
+      "change/F1": 0.7332250767574141,
+      "change/IoU": 0.5788124340830532,
+      "change/Kappa": 0.6707781868017568,
+      "semantic_t1/OA": 0.16218044907030557,
+      "semantic_t1/mIoU": 0.12061022029994453,
+      "semantic_t1/mF1": 0.2100468832041585,
+      "semantic_t1/Kappa": 0.09915099359478921,
+      "semantic_t2/OA": 0.1713415458886373,
+      "semantic_t2/mIoU": 0.16788539661511126,
+      "semantic_t2/mF1": 0.2645595866562102,
+      "semantic_t2/Kappa": 0.12244939829391145,
+      "semantic/OA": 0.16676099747947143,
+      "semantic/mIoU": 0.14900289534808803,
+      "semantic/mF1": 0.2482519266775263,
+      "semantic/Kappa": 0.11294984708283977,
+      "scd/OA": 0.8765479181282917,
+      "scd/IoU_nc": 0.875485473812566,
+      "scd/IoU_c": 0.5676745383012212,
+      "scd/mIoU": 0.7215800060568935,
+      "scd/P_scd": 0.6621949983639095,
+      "scd/R_scd": 0.6183541638724739,
+      "scd/F_scd": 0.6395241145115256,
+      "scd/SeK": 0.22827614510611133,
+      "scd/Score": 0.37626730339134595
+    }
+  },
+  "shuffle_llm_val": {
+    "samples": 1694,
+    "seconds": 392.35476565361023,
+    "scalars": {
+      "change/OA": 0.8994574969042853,
+      "change/Precision": 0.7475998862769632,
+      "change/Recall": 0.7192513716710803,
+      "change/F1": 0.7331516958550346,
+      "change/IoU": 0.5787209829750382,
+      "change/Kappa": 0.671240125841596,
+      "semantic_t1/OA": 0.16213178353157628,
+      "semantic_t1/mIoU": 0.12329993407997586,
+      "semantic_t1/mF1": 0.2140306660833941,
+      "semantic_t1/Kappa": 0.09886784496568726,
+      "semantic_t2/OA": 0.17139738819252923,
+      "semantic_t2/mIoU": 0.1776731794398775,
+      "semantic_t2/mF1": 0.2743508051167236,
+      "semantic_t2/Kappa": 0.12230756720956806,
+      "semantic/OA": 0.16676458586205276,
+      "semantic/mIoU": 0.15468804106144807,
+      "semantic/mF1": 0.25503598419656065,
+      "semantic/Kappa": 0.11269544469487591,
+      "scd/OA": 0.8773290111717396,
+      "scd/IoU_nc": 0.8763799143208822,
+      "scd/IoU_c": 0.5674117159020345,
+      "scd/mIoU": 0.7218958151114584,
+      "scd/P_scd": 0.6669933207522907,
+      "scd/R_scd": 0.6140612681425032,
+      "scd/F_scd": 0.6394337414412355,
+      "scd/SeK": 0.2279632117027031,
+      "scd/Score": 0.3761429927253297
+    },
+    "shuffled_batches": 424,
+    "singleton_noop_batches": 0
+  },
+  "grad_audit": {
+    "updates": 742,
+    "loss_mean": 0.5576316996244086,
+    "raw_grad_norm": {
+      "mean": 6.628582820260801,
+      "p50": 6.536026044347377,
+      "p75": 7.471594311268525,
+      "p90": 8.267441588331872,
+      "p95": 8.650892574670337,
+      "p99": 10.415007719577346,
+      "max": 28.839487013215752
+    },
+    "global_grad_rms_mean": 0.0011552837100589476,
+    "logit_scale": {
+      "scale_mean": 23.699684143066406,
+      "grad_abs_mean": 0.1661510002897234,
+      "grad_abs_p50": 0.169422946870327,
+      "grad_abs_p90": 0.2104316085577011,
+      "grad_abs_p95": 0.22128047272562976,
+      "grad_abs_p99": 0.2474840740859509,
+      "grad_abs_max": 0.8838199973106384,
+      "grad_over_global_mean": 0.024790218577862472
+    },
+    "class_encoder_grad_norm": {
+      "mean": 6.382375240762642,
+      "p95": 8.414020324465987,
+      "max": 28.65341581502714
+    },
+    "clip_candidates": [
+      {
+        "clip": 1.0,
+        "clip_fraction": 1.0,
+        "mean_coef_all": 0.16183148554272797,
+        "mean_coef_clipped": 0.16183148554272797,
+        "mean_postclip_norm": 1.0
+      },
+      {
+        "clip": 2.0,
+        "clip_fraction": 0.9986522911051213,
+        "mean_coef_all": 0.3236205197926962,
+        "mean_coef_clipped": 0.3227077269719036,
+        "mean_postclip_norm": 1.99991769008297
+      },
+      {
+        "clip": 3.0,
+        "clip_fraction": 0.9892183288409704,
+        "mean_coef_all": 0.4833242408575313,
+        "mean_coef_clipped": 0.4776928974336352,
+        "mean_postclip_norm": 2.9951358804790216
+      },
+      {
+        "clip": 4.0,
+        "clip_fraction": 0.9609164420485176,
+        "mean_coef_all": 0.6371216430741535,
+        "mean_coef_clipped": 0.6223622148120924,
+        "mean_postclip_norm": 3.971977436593659
+      },
+      {
+        "clip": 5.0,
+        "clip_fraction": 0.8638814016172507,
+        "mean_coef_all": 0.7763874546605855,
+        "mean_coef_clipped": 0.7411536526648275,
+        "mean_postclip_norm": 4.888304103884444
+      },
+      {
+        "clip": 6.0,
+        "clip_fraction": 0.6711590296495957,
+        "mean_coef_all": 0.8869930614482765,
+        "mean_coef_clipped": 0.8316241999891989,
+        "mean_postclip_norm": 5.659545401106333
+      },
+      {
+        "clip": 8.0,
+        "clip_fraction": 0.14150943396226415,
+        "mean_coef_all": 0.9859998984970159,
+        "mean_coef_clipped": 0.901065949378912,
+        "mean_postclip_norm": 6.427702471349608
+      },
+      {
+        "clip": 8.267441588331872,
+        "clip_fraction": 0.10107816711590296,
+        "mean_coef_all": 0.989584667071505,
+        "mean_coef_clipped": 0.8969576395607565,
+        "mean_postclip_norm": 6.460074852795203
+      },
+      {
+        "clip": 8.650892574670337,
+        "clip_fraction": 0.05121293800539083,
+        "mean_coef_all": 0.9924627141113729,
+        "mean_coef_clipped": 0.8528245755431229,
+        "mean_postclip_norm": 6.487723672610772
+      },
+      {
+        "clip": 10.0,
+        "clip_fraction": 0.013477088948787063,
+        "mean_coef_all": 0.9956948875782446,
+        "mean_coef_clipped": 0.6805606583057573,
+        "mean_postclip_norm": 6.524451037350048
+      },
+      {
+        "clip": 10.415007719577346,
+        "clip_fraction": 0.01078167115902965,
+        "mean_coef_all": 0.9960055709621709,
+        "mean_coef_clipped": 0.6295167067413607,
+        "mean_postclip_norm": 6.529334284098595
+      }
+    ]
+  }
+}
