@@ -13,6 +13,14 @@ original-point features. They DO NOT hold classification heads.
                       event_t1/t2 [N1,3], [N2,3].
 
 3D event protocol: 0 unchanged, 1 removed (T1 only), 2 added (T2 only).
+
+Optional multi-box spatial guidance:
+  2D boxes [B,K,4] normalized xyxy coordinates, valid mask [B,K].
+  3D boxes [B,K,6] in the same XYZ reference frame as input points;
+      optional box_scene_bounds [B,2,3] normalizes 3D box query positions.
+  K may be zero. Region queries read the same time-compatible memory, and
+  soft gates yield residual FEATURE correction only (never crop or hard mask).
+  Box proposal generation/supervision is upstream, NOT implemented here.
 """
 
 from __future__ import annotations
@@ -411,6 +419,7 @@ class PredictionLogits:
     raw_class_ids: Tuple[int, ...] = ()
     class_names: Tuple[str, ...] = ()
     updated_queries: Optional[torch.Tensor] = None
+    box_guidance_applied: bool = False
 
 
 class QueryConditionedClassHead(nn.Module):
@@ -538,6 +547,206 @@ class QueryConditionedBinaryHead(nn.Module):
         return logits.reshape(b, h, w)
 
 
+class MultiBoxGuidance(nn.Module):
+    """Optional 2D/3D multi-region guidance with NO hard restriction.
+
+    An instance represents both modalities but encodes 2D/3D positions with
+    separate small MLPs. It does not predict boxes. Coordinates must share
+    the SAME spatial reference frame as the dense pixels / point coordinates.
+
+    A box proposes where to refine, not where predictions are allowed.
+    The base image/point features always survive via the residual skip.
+    """
+
+    def __init__(
+        self,
+        decoder_dim: int = 256,
+        *,
+        fourier_bands: int = 4,
+        max_boxes: int = 64,
+        edge_softness: float = 0.08,
+        box_chunk_size: int = 8,
+        init_residual_strength: float = 0.10,
+    ) -> None:
+        super().__init__()
+        if fourier_bands < 1 or max_boxes < 1 or box_chunk_size < 1:
+            raise ValueError('fourier_bands, max_boxes, and chunk size must be positive')
+        if edge_softness <= 0 or not 0 < init_residual_strength < 1:
+            raise ValueError('edge_softness must be positive and residual strength in (0,1)')
+        self.decoder_dim = int(decoder_dim)
+        self.fourier_bands = int(fourier_bands)
+        self.max_boxes = int(max_boxes)
+        self.edge_softness = float(edge_softness)
+        self.box_chunk_size = int(box_chunk_size)
+        frequencies = (2.0 ** torch.arange(fourier_bands, dtype=torch.float32)) * math.pi
+        self.register_buffer('frequencies', frequencies, persistent=False)
+        self.pos_2d = nn.Sequential(
+            nn.Linear(4 * 2 * fourier_bands, decoder_dim),
+            nn.GELU(), nn.Linear(decoder_dim, decoder_dim),
+        )
+        self.pos_3d = nn.Sequential(
+            nn.Linear(6 * 2 * fourier_bands, decoder_dim),
+            nn.GELU(), nn.Linear(decoder_dim, decoder_dim),
+        )
+        # Separate 2D/3D adapters; unchanged 2D/3D heads remain independent.
+        self.feature_2d = nn.Linear(decoder_dim, decoder_dim, bias=False)
+        self.feature_3d = nn.Linear(decoder_dim, decoder_dim, bias=False)
+        start = math.log(init_residual_strength / (1.0 - init_residual_strength))
+        self.strength_2d = nn.Parameter(torch.tensor(start, dtype=torch.float32))
+        self.strength_3d = nn.Parameter(torch.tensor(start, dtype=torch.float32))
+
+    def check_boxes(
+        self,
+        boxes: Optional[torch.Tensor],
+        valid: Optional[torch.Tensor],
+        scores: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        dimension: int,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if boxes is None:
+            if valid is not None or scores is not None:
+                raise ValueError('box_valid and box_scores require boxes')
+            return None, None, None
+        expected = (4 if dimension == 2 else 6)
+        if boxes.ndim != 3 or boxes.shape[0] != batch_size or boxes.shape[2] != expected:
+            raise ValueError(f'boxes must be [B,K,{expected}]')
+        if boxes.device != device or not torch.is_floating_point(boxes):
+            raise ValueError('boxes must be floating-point on memory.device')
+        if boxes.shape[1] > self.max_boxes:
+            raise ValueError(f'K={boxes.shape[1]} exceeds max_boxes={self.max_boxes}; '
+                             'select proposals upstream; do not silently truncate')
+        if not torch.isfinite(boxes).all():
+            raise ValueError('boxes must be finite')
+        b, k, _ = boxes.shape
+        if valid is None:
+            valid = torch.ones((b,k), device=device, dtype=torch.bool)
+        if valid.dtype != torch.bool or valid.shape != (b,k) or valid.device != device:
+            raise ValueError('box_valid must be bool [B,K] on memory.device')
+        if scores is None:
+            scores = torch.ones((b,k),device=device,dtype=torch.float32)
+        if scores.shape != (b,k) or scores.device != device or not torch.is_floating_point(scores):
+            raise ValueError('box_scores must be floating-point [B,K] on memory.device')
+        if not torch.isfinite(scores).all() or (scores < 0).any() or (scores > 1).any():
+            raise ValueError('box_scores must be finite probabilities in [0,1]')
+        # Validate only marked-valid boxes. Padded invalid slots may be zero.
+        half = expected // 2
+        if valid.any():
+            kept = boxes[valid]
+            if not (kept[:,half:] > kept[:,:half]).all():
+                raise ValueError('valid boxes must have min < max in every axis')
+            if dimension == 2 and ((kept < 0).any() or (kept > 1).any()):
+                raise ValueError('2D boxes must use normalized xyxy coordinates in [0,1]')
+        return boxes, valid, scores.float() * valid.float()
+
+    def encode(self, boxes: torch.Tensor, *, dimension: int) -> torch.Tensor:
+        freqs = self.frequencies.to(device=boxes.device)
+        scaled = boxes.float().unsqueeze(-1) * freqs
+        embedding = torch.cat((scaled.sin(), scaled.cos()), dim=-1).flatten(-2)
+        linear = self.pos_2d if dimension == 2 else self.pos_3d
+        return linear(embedding.to(dtype=linear[0].weight.dtype))
+
+    def _soft_gate(self, xyz: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+        """xyz [...,1,D], boxes [...,K,D] endpoints (min,max) -> [...,K].
+
+        Gates use box-relative edge width rather than absolute pixels/meters.
+        The 3D scene-coordinate units can therefore be metres or normalized.
+        """
+        dimensions = xyz.shape[-1]
+        lo, hi = boxes[..., :dimensions], boxes[..., dimensions:]
+        width = (hi - lo).clamp_min(1e-6)
+        epsilon = width * self.edge_softness
+        left = torch.sigmoid((xyz - lo) / epsilon)
+        right = torch.sigmoid((hi - xyz) / epsilon)
+        return (left * right).prod(dim=-1)
+
+    def refine_image(
+        self,
+        features: torch.Tensor,
+        boxes: torch.Tensor,
+        valid: torch.Tensor,
+        scores: torch.Tensor,
+        region_queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """[B,D,H,W] + [B,K,4] + [B,K,D] -> [B,D,H,W]."""
+        b, d, h, w = features.shape
+        if boxes.shape[:2] != region_queries.shape[:2] or region_queries.shape[-1] != d:
+            raise ValueError('region query count/width does not match boxes/features')
+        if not (valid & (scores > 0)).any():
+            return features
+        # Only small [B,chunk,H,W] gate tensors are constructed. Avoid [B,K,D,H,W].
+        yy = (torch.arange(h, device=features.device, dtype=torch.float32) + .5) / h
+        xx = (torch.arange(w, device=features.device, dtype=torch.float32) + .5) / w
+        y, x = torch.meshgrid(yy,xx,indexing='ij')
+        xy = torch.stack((x,y),dim=-1).view(1,1,h,w,2)
+        total = torch.zeros((b,1,h,w),device=features.device,dtype=torch.float32)
+        union = torch.zeros_like(total)
+        pooled = torch.zeros((b,d,h,w),device=features.device,dtype=torch.float32)
+        transforms = self.feature_2d(region_queries.to(dtype=self.feature_2d.weight.dtype)).float()
+        for j in range(0,boxes.shape[1],self.box_chunk_size):
+            sl = slice(j,min(j+self.box_chunk_size,boxes.shape[1]))
+            box = boxes[:,sl].float().view(b,-1,1,1,4)
+            gate = self._soft_gate(xy,box).mul(scores[:,sl,None,None])
+            union = torch.maximum(union,gate.amax(dim=1,keepdim=True))
+            total = total + gate.sum(dim=1,keepdim=True)
+            pooled = pooled + torch.einsum('bkhw,bkd->bdhw',gate,transforms[:,sl])
+        context = pooled / total.clamp_min(1e-6)
+        delta = union * torch.tanh(context) * torch.sigmoid(self.strength_2d)
+        return features + delta.to(dtype=features.dtype)
+
+    def refine_points(
+        self,
+        features: torch.Tensor,
+        xyz: torch.Tensor,
+        batch_ids: torch.Tensor,
+        boxes: torch.Tensor,
+        valid: torch.Tensor,
+        scores: torch.Tensor,
+        region_queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """[N,D] + XYZ [N,3] + boxes [B,K,6] -> [N,D].
+
+        Split by sample to avoid giant [N,K,D] tensors; only [point_chunk,K]
+        pairwise gates are materialized. No matching of T1/T2 point indices.
+        """
+        if xyz.shape != (features.shape[0],3) or xyz.device != features.device:
+            raise ValueError('point XYZ must be [N,3] on the feature device')
+        if not torch.isfinite(xyz).all():
+            raise ValueError('point XYZ must be finite')
+        if not (valid & (scores > 0)).any():
+            return features
+        weights = self.feature_3d(region_queries.to(dtype=self.feature_3d.weight.dtype)).float()
+        output = features.clone()
+        for ib in range(boxes.shape[0]):
+            sample_index = torch.nonzero(batch_ids == ib,as_tuple=False).flatten()
+            if sample_index.numel() == 0 or not (valid[ib] & (scores[ib] > 0)).any():
+                continue
+            kept = valid[ib] & (scores[ib] > 0)
+            local_boxes=boxes[ib,kept].float()
+            local_scores=scores[ib,kept]
+            local_weights=weights[ib,kept]
+            # Bounded number of points per iteration; preserves ordering.
+            for start in range(0,len(sample_index),65536):
+                select=sample_index[start:start+65536]
+                coordinates=xyz[select].float()
+                total=torch.zeros((len(select),1),device=xyz.device)
+                union=torch.zeros_like(total)
+                pooled=torch.zeros((len(select),features.shape[1]),device=xyz.device)
+                for j in range(0,local_boxes.shape[0],self.box_chunk_size):
+                    sl=slice(j,min(j+self.box_chunk_size,local_boxes.shape[0]))
+                    gate=self._soft_gate(
+                        coordinates[:,None,:],local_boxes[sl][None,:,:]
+                    ) * local_scores[None,sl]
+                    union=torch.maximum(union,gate.max(dim=1,keepdim=True).values)
+                    total=total+gate.sum(dim=1,keepdim=True)
+                    pooled=pooled+gate @ local_weights[sl]
+                context=pooled / total.clamp_min(1e-6)
+                correction=union * torch.tanh(context) * torch.sigmoid(self.strength_3d)
+                output=output.index_add(0,select,correction.to(dtype=output.dtype))
+        return output
+
+
 class PAIRChangeDecoder(nn.Module):
     """Shared Q decoder and complete modality-specific prediction heads.
 
@@ -576,6 +785,10 @@ class PAIRChangeDecoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        max_box_proposals: int = 64,
+        box_edge_softness: float = 0.08,
+        box_chunk_size: int = 8,
+        box_residual_init: float = 0.10,
     ) -> None:
         super().__init__()
         self.decoder_dim = int(decoder_dim)
@@ -593,6 +806,13 @@ class PAIRChangeDecoder(nn.Module):
         self.point_semantic_head = QueryConditionedClassHead(decoder_dim)
         self.point_event_head = QueryConditionedClassHead(decoder_dim)
         self.event_prototypes = nn.Parameter(torch.randn(3, decoder_dim) * 0.02)
+        self.box_guidance = MultiBoxGuidance(
+            decoder_dim=decoder_dim,
+            max_boxes=max_box_proposals,
+            edge_softness=box_edge_softness,
+            box_chunk_size=box_chunk_size,
+            init_residual_strength=box_residual_init,
+        )
 
     @staticmethod
     def _make_temporal_mask(
@@ -668,6 +888,53 @@ class PAIRChangeDecoder(nn.Module):
         )
         return encoding, queries
 
+    def _regional_queries(
+        self,
+        *,
+        global_query: torch.Tensor,
+        boxes_for_encoding: torch.Tensor,
+        dimension: int,
+        memory: torch.Tensor,
+        memory_mask: Optional[torch.Tensor],
+        memory_time_ids: Optional[torch.Tensor],
+        query_memory_mask: Optional[torch.Tensor],
+        task_index: int,
+        allowed_time: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Box+task Q -> same SHARED decoder; masks mirror corresponding task Q."""
+        b, k, _ = boxes_for_encoding.shape
+        initial = global_query.unsqueeze(1) + self.box_guidance.encode(
+            boxes_for_encoding, dimension=dimension
+        )
+        scoped = None
+        if query_memory_mask is not None:
+            scoped = query_memory_mask[:,task_index:task_index+1].expand(-1,k,-1)
+        elif memory_time_ids is not None:
+            allowed = (memory_time_ids == allowed_time) if allowed_time in (1,2) else (memory_time_ids != 0)
+            scoped = allowed.unsqueeze(1).expand(-1,k,-1)
+        return self.query_decoder(
+            query=initial,
+            memory=memory,
+            memory_mask=memory_mask if memory_time_ids is None else (memory_time_ids != 0),
+            query_memory_mask=scoped,
+        )
+
+    @staticmethod
+    def _normalize_box3d(
+        boxes: torch.Tensor,
+        bounds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize world XYZ box boundaries for stable Fourier encoding."""
+        if bounds.shape != (boxes.shape[0],2,3):
+            raise ValueError('box_scene_bounds must be [B,2,3]')
+        if bounds.device != boxes.device or not torch.isfinite(bounds).all():
+            raise ValueError('box_scene_bounds must be finite and on memory.device')
+        extent = bounds[:,1]-bounds[:,0]
+        if (extent <= 0).any():
+            raise ValueError('box_scene_bounds max must exceed min in all axes')
+        return torch.cat(((boxes[:,:,:3]-bounds[:,None,0,:]) / extent[:,None,:],
+                          (boxes[:,:,3:]-bounds[:,None,0,:]) / extent[:,None,:]),dim=-1)
+
     def forward_2d(
         self,
         *,
@@ -685,6 +952,9 @@ class PAIRChangeDecoder(nn.Module):
         query_memory_mask: Optional[torch.Tensor] = None,
         memory_time_ids: Optional[torch.Tensor] = None,
         detach_qwen_class_encoder: bool = True,
+        boxes_2d: Optional[torch.Tensor] = None,
+        box_valid: Optional[torch.Tensor] = None,
+        box_scores: Optional[torch.Tensor] = None,
     ) -> PredictionLogits:
         """Return flat logits for loss.py, or dense logits if return_maps=True.
 
@@ -729,6 +999,45 @@ class PAIRChangeDecoder(nn.Module):
             is_3d=False,
             detach_qwen_class_encoder=detach_qwen_class_encoder,
         )
+        boxes_2d, box_valid, box_scores = self.box_guidance.check_boxes(
+            boxes_2d, box_valid, box_scores, batch_size=b,
+            dimension=2, device=memory.device,
+        )
+        use_boxes = (boxes_2d is not None and boxes_2d.shape[1] > 0
+                     and bool((box_valid & (box_scores > 0)).any()))
+        if use_boxes:
+            idx = 2 if mode == 'scd' else 0
+            change_regions = self._regional_queries(
+                global_query=queries[:,idx],
+                boxes_for_encoding=boxes_2d,
+                dimension=2, memory=memory,
+                memory_mask=memory_mask,
+                memory_time_ids=memory_time_ids,
+                query_memory_mask=query_memory_mask,
+                task_index=idx,
+            )
+            change_features = self.box_guidance.refine_image(
+                change_features, boxes_2d, box_valid, box_scores, change_regions
+            )
+            if mode == 'scd':
+                sem1_regions = self._regional_queries(
+                    global_query=queries[:,0], boxes_for_encoding=boxes_2d,
+                    dimension=2, memory=memory, memory_mask=memory_mask,
+                    memory_time_ids=memory_time_ids,
+                    query_memory_mask=query_memory_mask, task_index=0,allowed_time=1,
+                )
+                sem2_regions = self._regional_queries(
+                    global_query=queries[:,1], boxes_for_encoding=boxes_2d,
+                    dimension=2, memory=memory, memory_mask=memory_mask,
+                    memory_time_ids=memory_time_ids,
+                    query_memory_mask=query_memory_mask, task_index=1,allowed_time=2,
+                )
+                pixel_features_t1 = self.box_guidance.refine_image(
+                    pixel_features_t1,boxes_2d,box_valid,box_scores,sem1_regions,
+                )
+                pixel_features_t2 = self.box_guidance.refine_image(
+                    pixel_features_t2,boxes_2d,box_valid,box_scores,sem2_regions,
+                )
         semantic_t1 = semantic_t2 = None
         if mode == 'scd':
             proto = encoded.semantic_prototypes
@@ -751,6 +1060,7 @@ class PAIRChangeDecoder(nn.Module):
             raw_class_ids=encoded.raw_class_ids,
             class_names=encoded.class_names,
             updated_queries=queries,
+            box_guidance_applied=use_boxes,
         )
 
     @staticmethod
@@ -834,6 +1144,12 @@ class PAIRChangeDecoder(nn.Module):
         query_memory_mask: Optional[torch.Tensor] = None,
         memory_time_ids: Optional[torch.Tensor] = None,
         detach_qwen_class_encoder: bool = True,
+        boxes_3d: Optional[torch.Tensor] = None,
+        box_valid: Optional[torch.Tensor] = None,
+        box_scores: Optional[torch.Tensor] = None,
+        box_scene_bounds: Optional[torch.Tensor] = None,
+        point_xyz_t1: Optional[torch.Tensor] = None,
+        point_xyz_t2: Optional[torch.Tensor] = None,
     ) -> PredictionLogits:
         """3D per-point semantic and active-support event logits, ready for loss."""
         if not class_names:
@@ -854,6 +1170,58 @@ class PAIRChangeDecoder(nn.Module):
             memory_time_ids=memory_time_ids, is_3d=True,
             detach_qwen_class_encoder=detach_qwen_class_encoder,
         )
+        boxes_3d, box_valid, box_scores = self.box_guidance.check_boxes(
+            boxes_3d, box_valid, box_scores, batch_size=b,
+            dimension=3, device=memory.device,
+        )
+        use_boxes = (boxes_3d is not None and boxes_3d.shape[1] > 0
+                     and bool((box_valid & (box_scores > 0)).any()))
+        if use_boxes:
+            if point_xyz_t1 is None or point_xyz_t2 is None or box_scene_bounds is None:
+                raise ValueError('3D box guidance requires point XYZ (T1/T2) and '
+                                 'box_scene_bounds in the same spatial reference frame')
+            normalized = self._normalize_box3d(boxes_3d,box_scene_bounds)
+            e1_regions = self._regional_queries(
+                global_query=queries[:,2], boxes_for_encoding=normalized,
+                dimension=3, memory=memory, memory_mask=memory_mask,
+                memory_time_ids=memory_time_ids,
+                query_memory_mask=query_memory_mask,task_index=2,
+            )
+            e2_regions = self._regional_queries(
+                global_query=queries[:,3], boxes_for_encoding=normalized,
+                dimension=3, memory=memory, memory_mask=memory_mask,
+                memory_time_ids=memory_time_ids,
+                query_memory_mask=query_memory_mask,task_index=3,
+            )
+            event_features_t1 = self.box_guidance.refine_points(
+                event_features_t1,point_xyz_t1,point_batch_t1,
+                boxes_3d,box_valid,box_scores,e1_regions,
+            )
+            event_features_t2 = self.box_guidance.refine_points(
+                event_features_t2,point_xyz_t2,point_batch_t2,
+                boxes_3d,box_valid,box_scores,e2_regions,
+            )
+            s1_regions = self._regional_queries(
+                global_query=queries[:,0], boxes_for_encoding=normalized,
+                dimension=3, memory=memory, memory_mask=memory_mask,
+                memory_time_ids=memory_time_ids,
+                query_memory_mask=query_memory_mask,task_index=0,allowed_time=1,
+            )
+            s2_regions = self._regional_queries(
+                global_query=queries[:,1], boxes_for_encoding=normalized,
+                dimension=3, memory=memory, memory_mask=memory_mask,
+                memory_time_ids=memory_time_ids,
+                query_memory_mask=query_memory_mask,task_index=1,allowed_time=2,
+            )
+            point_features_t1 = self.box_guidance.refine_points(
+                point_features_t1,point_xyz_t1,point_batch_t1,
+                boxes_3d,box_valid,box_scores,s1_regions,
+            )
+            point_features_t2 = self.box_guidance.refine_points(
+                point_features_t2,point_xyz_t2,point_batch_t2,
+                boxes_3d,box_valid,box_scores,s2_regions,
+            )
+            # Semantic logits are recomputed below after the refinement.
         sem1 = self.point_semantic_head.forward_points(
             point_features_t1, point_batch_t1, queries[:,0], encoded.semantic_prototypes
         )
@@ -875,4 +1243,5 @@ class PAIRChangeDecoder(nn.Module):
             raw_class_ids=encoded.raw_class_ids,
             class_names=encoded.class_names,
             updated_queries=queries,
+            box_guidance_applied=use_boxes,
         )
