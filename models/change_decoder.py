@@ -1,27 +1,24 @@
-"""
-PAIR Unified Dense Change Decoder
-=================================
+"""PAIR shared decoder, task queries and final prediction logits.
 
-Shared dense decoder for 2D / 3D / future 2D+3D PAIR paths.
+- QwenClassPrototypeEncoder: class descriptions + task descriptions + sample TASK hidden.
+- TransformerQueryDecoder: shared 2D/3D task query cross-attention over spatial memory.
+- Image/Point heads: modality-specific, within-modality T1/T2 weights shared.
+- PAIRChangeDecoder: complete predictions BEFORE the existing loss.py.
 
-Design:
-- dense token = adapted dense feature + xyz + modality id + time id
-- reasoning token = Qwen hidden + xyz + modality id + time id
-- sparse TemporalLinks provide cross-time correspondence
-- semantic prediction uses Qwen language class prototypes
-- 2D keeps the binary change head
-- 3D uses one shared 3-class event head:
-    0 unchanged
-    1 removed
-    2 added
+ImageAdapter and PointAdapter only build spatial memories and high-resolution /
+original-point features. They DO NOT hold classification heads.
 
-The decoder core is modality-agnostic. Dataset-specific active event support
-belongs to the loss/metrics layer, not here.
+2D loss-ready logits: semantic_t1/t2 [N,C] (optional for BCD), change [N].
+3D loss-ready logits: semantic_t1/t2 [N1,C], [N2,C],
+                      event_t1/t2 [N1,3], [N2,3].
+
+3D event protocol: 0 unchanged, 1 removed (T1 only), 2 added (T2 only).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -29,528 +26,290 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# =============================================================================
-# Unified structures
-# =============================================================================
-
-
 @dataclass
-class UnifiedTokenSet:
-    """Flat ragged token representation shared by 2D / 3D / 2D3D."""
+class QueryEncodingOutput:
+    """Outputs from a single Qwen text-encoding pass.
 
-    features: torch.Tensor
-    positions: torch.Tensor
-    modality_ids: torch.Tensor
-    batch_ids: torch.Tensor
-
-    def validate(
-        self,
-        *,
-        feature_dim: Optional[int] = None,
-        name: str = "tokens",
-    ) -> None:
-        if self.features.ndim != 2:
-            raise ValueError(
-                f"{name}.features must be [N,D], got {tuple(self.features.shape)}"
-            )
-        n = self.features.shape[0]
-        if self.positions.shape != (n, 3):
-            raise ValueError(
-                f"{name}.positions must be [N,3], got {tuple(self.positions.shape)}"
-            )
-        if self.modality_ids.shape != (n,):
-            raise ValueError(
-                f"{name}.modality_ids must be [N], got {tuple(self.modality_ids.shape)}"
-            )
-        if self.batch_ids.shape != (n,):
-            raise ValueError(
-                f"{name}.batch_ids must be [N], got {tuple(self.batch_ids.shape)}"
-            )
-        if feature_dim is not None and self.features.shape[1] != int(feature_dim):
-            raise ValueError(
-                f"{name}.features dim must be {feature_dim}, got {self.features.shape[1]}"
-            )
-        if self.modality_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError(f"{name}.modality_ids must be integer tensor")
-        if self.batch_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError(f"{name}.batch_ids must be integer tensor")
-        if not torch.isfinite(self.features).all():
-            raise ValueError(f"{name}.features contains NaN/Inf")
-        if not torch.isfinite(self.positions).all():
-            raise ValueError(f"{name}.positions contains NaN/Inf")
-
-
-@dataclass
-class TemporalLinks:
-    """
-    Sparse cross-time neighborhood links.
-
-    source_indices: [N_target,K], invalid source entries use -1
-    weights: [N_target,K] or None
+    task_queries: [B,Q,D], sample-conditioned queries in decoder space.
+    semantic_prototypes: [C,D] or None, L2-normalized text prototypes.
+    raw_class_ids / class_names: semantic channel order; empty for BCD.
     """
 
-    source_indices: torch.Tensor
-    weights: Optional[torch.Tensor] = None
-
-    def validate(
-        self,
-        *,
-        num_target: int,
-        num_source: int,
-        name: str = "links",
-    ) -> None:
-        if self.source_indices.ndim != 2:
-            raise ValueError(f"{name}.source_indices must be [N,K]")
-        if self.source_indices.shape[0] != int(num_target):
-            raise ValueError(
-                f"{name}: expected {num_target} rows, got {self.source_indices.shape[0]}"
-            )
-        if self.source_indices.dtype not in (torch.int32, torch.int64):
-            raise TypeError(f"{name}.source_indices must be integer tensor")
-
-        valid = self.source_indices >= 0
-        if valid.any():
-            max_index = int(self.source_indices[valid].max().item())
-            if max_index >= int(num_source):
-                raise IndexError(
-                    f"{name}: source index {max_index} exceeds source token count {num_source}"
-                )
-
-        if self.weights is not None:
-            if self.weights.shape != self.source_indices.shape:
-                raise ValueError(f"{name}.weights must match source_indices shape")
-            if not torch.isfinite(self.weights).all():
-                raise ValueError(f"{name}.weights contains NaN/Inf")
-
-
-@dataclass
-class UnifiedDecoderOutput:
-    semantic_feature_t1: torch.Tensor
-    semantic_feature_t2: torch.Tensor
-    change_feature_t1: torch.Tensor
-    change_feature_t2: torch.Tensor
-
-    semantic_logits_t1: torch.Tensor
-    semantic_logits_t2: torch.Tensor
-
-    # The already-computed normalized dataset language prototypes [K,D].
-    # 2D uses these again AFTER spatial feature upsampling, avoiding a second
-    # Qwen text pass while leaving the shared decoder representation unchanged.
-    semantic_prototypes: torch.Tensor
-
-    # 3D event path.
-    event_logits_t1: Optional[torch.Tensor]
-    event_logits_t2: Optional[torch.Tensor]
-
+    task_queries: torch.Tensor
+    semantic_prototypes: Optional[torch.Tensor]
     raw_class_ids: Tuple[int, ...]
     class_names: Tuple[str, ...]
 
 
-@dataclass
-class Cascade2DDecoderOutput:
-    """Final prediction output of the PAIR V2 2D decoder.
+class QwenClassPrototypeEncoder(nn.Module):
+    """Use one Qwen text pass to encode class and task descriptions.
 
-    Keep the same branch-discovery protocol as UnifiedDecoderOutput so the
-    unified PAIR loss/metrics can inspect optional branches without special
-    casing the 2D CG route. 2D never produces 3D event logits.
-    """
+    Class prototypes and task prompts share a projection but differ in use:
+      - class vectors [C,D] are L2-normalized for semantic classification;
+      - task vectors [Q,D] combine with the current sample's Qwen <TASK>
+        hidden [B,qwen_dim], yielding sample-conditioned queries [B,Q,D].
 
-    semantic_logits_t1: Optional[torch.Tensor]
-    semantic_logits_t2: Optional[torch.Tensor]
-    change_logits: torch.Tensor
-
-    # Keep the same semantic-class ordering metadata as UnifiedDecoderOutput.
-    # Metrics uses raw_class_ids to verify that prototype/logit channel order
-    # matches DatasetSpec.class_names.
-    raw_class_ids: Tuple[int, ...]
-    class_names: Tuple[str, ...]
-
-    event_logits_t1: Optional[torch.Tensor] = None
-    event_logits_t2: Optional[torch.Tensor] = None
-
-
-# =============================================================================
-# Unified token embedding
-# =============================================================================
-
-
-class CoordinateEncoder(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-        )
-
-    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        return self.net(xyz.float())
-
-
-class UnifiedTokenEmbedding(nn.Module):
-    """feature + position + modality + time"""
-
-    def __init__(self, dim: int, num_modalities: int = 2):
-        super().__init__()
-        self.position_encoder = CoordinateEncoder(dim)
-        self.modality_embedding = nn.Embedding(num_modalities, dim)
-        self.time_embedding = nn.Embedding(2, dim)
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, tokens: UnifiedTokenSet, *, time_id: int) -> torch.Tensor:
-        x = tokens.features
-        pos = self.position_encoder(tokens.positions).to(
-            dtype=x.dtype,
-            device=x.device,
-        )
-        mod = self.modality_embedding(tokens.modality_ids.long()).to(dtype=x.dtype)
-        time_ids = torch.full(
-            (x.shape[0],),
-            int(time_id),
-            dtype=torch.long,
-            device=x.device,
-        )
-        time = self.time_embedding(time_ids).to(dtype=x.dtype)
-        return self.norm(x + pos + mod + time)
-
-
-# =============================================================================
-# Dense <- Qwen reasoning injection
-# =============================================================================
-
-
-class ReasoningInjection(nn.Module):
-    """Dense queries read reasoning tokens without a raw-feature residual.
-
-    The dense feature is used only as the attention query.  Decoder-visible
-    content comes from the Qwen reasoning K/V stream.  In particular, there is
-    deliberately NO ``dense + attended`` residual here: keeping that residual
-    gives the decoder a direct Vision-feature shortcut around the LLM.
-
-    This still preserves dense spatial localization because every dense token
-    has its own query and therefore its own attention weights over the
-    reasoning tokens.  What is removed is only the identity/content bypass.
+    The Qwen text forward can be detached without detaching gradients from
+    the learnable projections or the sample's multimodal <TASK> hidden.
     """
 
     def __init__(
         self,
-        dim: int,
-        num_heads: int = 8,
-        dropout: float = 0.0,
-        query_chunk_size: int = 4096,
-    ):
+        *,
+        qwen_dim: int,
+        decoder_dim: int = 256,
+        prompt_template: str = "A remote sensing semantic class: {name}.",
+        task_prompt_template: str = "A remote sensing change detection task: {name}.",
+    ) -> None:
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.query_chunk_size = int(query_chunk_size)
-        self.attention = nn.MultiheadAttention(
-            dim,
-            num_heads,
+        if qwen_dim <= 0 or decoder_dim <= 0:
+            raise ValueError("qwen_dim and decoder_dim must be positive")
+        if "{name}" not in prompt_template or "{name}" not in task_prompt_template:
+            raise ValueError("Both prompt templates must contain '{name}'")
+
+        self.qwen_dim = int(qwen_dim)
+        self.decoder_dim = int(decoder_dim)
+        self.prompt_template = str(prompt_template)
+        self.task_prompt_template = str(task_prompt_template)
+
+        self.projection = nn.Sequential(
+            nn.Linear(self.qwen_dim, self.decoder_dim),
+            nn.LayerNorm(self.decoder_dim),
+        )
+        self.sample_projection = nn.Linear(self.qwen_dim, self.decoder_dim)
+        self.query_norm = nn.LayerNorm(self.decoder_dim)
+
+    @staticmethod
+    def normalize_class_dict(
+        class_names: Dict[int, str],
+    ) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
+        if not isinstance(class_names, dict) or not class_names:
+            raise ValueError("class_names must be a nonempty Dict[int, str]")
+        normalized = {}
+        for raw_id, name in class_names.items():
+            if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+                raise TypeError(f"class ID must be int, got {raw_id!r}")
+            if not isinstance(name, str) or not name.strip():
+                raise TypeError(f"class name for ID {raw_id} must be nonempty str")
+            normalized[raw_id] = name.strip()
+        raw_ids = tuple(sorted(normalized))
+        return raw_ids, tuple(normalized[raw_id] for raw_id in raw_ids)
+
+    @staticmethod
+    def _last_valid_hidden(
+        hidden: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if hidden.ndim != 3 or attention_mask.shape != hidden.shape[:2]:
+            raise ValueError("Expected hidden [P,S,D] and attention_mask [P,S]")
+        valid = attention_mask.bool()
+        if not valid.any(dim=1).all():
+            raise ValueError("Every text prompt must contain at least one valid token")
+        positions = torch.arange(valid.shape[1], device=valid.device)
+        last = positions.masked_fill(~valid, -1).amax(dim=1)
+        rows = torch.arange(hidden.shape[0], device=hidden.device)
+        return hidden[rows, last]
+
+    @staticmethod
+    def _run_text_qwen(
+        qwen_backbone, prompts: Sequence[str], *, detach_qwen: bool
+    ) -> torch.Tensor:
+        tokenizer = qwen_backbone.tokenizer
+        qwen_model = qwen_backbone.model
+        if tokenizer.eos_token is None:
+            raise RuntimeError("Qwen tokenizer must define an EOS token")
+        encoded = tokenizer(
+            [text + tokenizer.eos_token for text in prompts],
+            padding=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        device = next(qwen_model.parameters()).device
+        ids = encoded["input_ids"].to(device=device)
+        mask = encoded["attention_mask"].to(device=device)
+
+        def execute() -> torch.Tensor:
+            output = qwen_model(
+                input_ids=ids,
+                attention_mask=mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+            return QwenClassPrototypeEncoder._last_valid_hidden(
+                output.hidden_states[-1], mask
+            )
+
+        if not detach_qwen:
+            return execute()
+
+        # A text-only, read-only pass must not alter the configured train/eval
+        # behavior of the multimodal model (including LoRA dropout modules).
+        training_states = [(m, m.training) for m in qwen_model.modules()]
+        qwen_model.eval()
+        try:
+            with torch.no_grad():
+                result = execute().detach()
+        finally:
+            for module, was_training in training_states:
+                module.training = was_training
+        return result
+
+    def forward(
+        self,
+        *,
+        qwen_backbone,
+        task_hidden: torch.Tensor,
+        task_descriptions: Sequence[str],
+        class_names: Optional[Dict[int, str]] = None,
+        detach_qwen: bool = True,
+    ) -> QueryEncodingOutput:
+        if task_hidden.ndim == 3 and task_hidden.shape[1] == 1:
+            task_hidden = task_hidden[:, 0, :]
+        if task_hidden.ndim != 2 or task_hidden.shape[1] != self.qwen_dim:
+            raise ValueError(
+                f"task_hidden must be [B,{self.qwen_dim}], got "
+                f"{tuple(task_hidden.shape)}"
+            )
+        if task_hidden.shape[0] == 0:
+            raise ValueError("task_hidden must have a nonempty batch")
+        if isinstance(task_descriptions, str) or not task_descriptions:
+            raise ValueError("task_descriptions must be a nonempty sequence of strings")
+        tasks = tuple(task_descriptions)
+        if any(not isinstance(t, str) or not t.strip() for t in tasks):
+            raise ValueError("Every task description must be nonempty text")
+
+        if class_names is None:
+            raw_ids, ordered_names = (), ()
+        else:
+            raw_ids, ordered_names = self.normalize_class_dict(class_names)
+
+        prompts = [self.prompt_template.format(name=n) for n in ordered_names]
+        prompts.extend(self.task_prompt_template.format(name=t.strip()) for t in tasks)
+        hidden = self._run_text_qwen(
+            qwen_backbone, prompts, detach_qwen=detach_qwen
+        )
+        if hidden.shape != (len(prompts), self.qwen_dim):
+            raise RuntimeError(
+                f"Qwen text hidden shape {tuple(hidden.shape)} does not match "
+                f"({len(prompts)},{self.qwen_dim})"
+            )
+
+        # Projected text features and sample features remain trainable even
+        # when the text-only Qwen pass is detached.
+        projection_dtype = self.projection[0].weight.dtype
+        text_features = self.projection(hidden.to(dtype=projection_dtype))
+        num_classes = len(raw_ids)
+        semantic_prototypes = (
+            F.normalize(text_features[:num_classes].float(), dim=-1)
+            if num_classes > 0
+            else None
+        )
+        task_vectors = text_features[num_classes:]
+        sample_vectors = self.sample_projection(
+            task_hidden.to(device=task_vectors.device, dtype=projection_dtype)
+        )
+        task_queries = self.query_norm(
+            task_vectors.unsqueeze(0) + sample_vectors.unsqueeze(1)
+        )
+        return QueryEncodingOutput(
+            task_queries=task_queries,
+            semantic_prototypes=semantic_prototypes,
+            raw_class_ids=raw_ids,
+            class_names=ordered_names,
+        )
+
+
+class TransformerDecoderLayer(nn.Module):
+    """Pre-norm cross-attention + FFN. Query is never a dense point/pixel map.
+
+    MHA is batch_first; query [B,Q,D], memory [B,L,D]. Boolean masks follow
+    the PAIR convention True=ALLOWED (inverted internally for PyTorch MHA).
+    """
+
+    def __init__(
+        self,
+        *,
+        decoder_dim: int = 256,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if decoder_dim <= 0 or num_heads <= 0 or decoder_dim % num_heads != 0:
+            raise ValueError("decoder_dim must be positive and divisible by num_heads")
+        if mlp_ratio <= 0 or not (0.0 <= dropout < 1.0):
+            raise ValueError("mlp_ratio must be positive and dropout in [0,1)")
+        self.num_heads = int(num_heads)
+        self.query_norm = nn.LayerNorm(decoder_dim)
+        self.memory_norm = nn.LayerNorm(decoder_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=decoder_dim,
+            num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-        self.out_norm = nn.LayerNorm(dim)
-
-    def _one_batch(
-        self,
-        dense: torch.Tensor,
-        reasoning: torch.Tensor,
-    ) -> torch.Tensor:
-        if dense.shape[0] == 0:
-            return dense
-        if reasoning.shape[0] == 0:
-            raise RuntimeError(
-                "ReasoningInjection received dense tokens but no reasoning tokens; "
-                "refusing to fall back to a raw dense-feature bypass"
-            )
-
-        kv = self.norm_kv(reasoning).unsqueeze(0)
-        outputs = []
-        for start in range(0, dense.shape[0], self.query_chunk_size):
-            end = min(start + self.query_chunk_size, dense.shape[0])
-            q = self.norm_q(dense[start:end]).unsqueeze(0)
-            attended, _ = self.attention(q, kv, kv, need_weights=False)
-            outputs.append(attended[0])
-
-        attended = torch.cat(outputs, dim=0)
-
-        # IMPORTANT: no residual from ``dense`` here.  The dense stream affects
-        # the output only through Q -> attention weights; all value/content
-        # delivered to the decoder comes from the reasoning stream.
-        return self.out_norm(attended)
-
-    def forward(
-        self,
-        *,
-        dense: torch.Tensor,
-        dense_batch_ids: torch.Tensor,
-        reasoning: torch.Tensor,
-        reasoning_batch_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        output = torch.empty_like(dense)
-        for batch_id in torch.unique(dense_batch_ids).tolist():
-            dense_mask = dense_batch_ids == int(batch_id)
-            reasoning_mask = reasoning_batch_ids == int(batch_id)
-            output[dense_mask] = self._one_batch(
-                dense[dense_mask],
-                reasoning[reasoning_mask],
-            )
-        return output
-
-
-# =============================================================================
-# Sparse T1 <-> T2 fusion
-# =============================================================================
-
-
-class SparseTemporalFusion(nn.Module):
-    """O(N*K) local temporal interaction using externally supplied links."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Linear(dim * 4, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim),
-        )
-        self.norm = nn.LayerNorm(dim)
-
-    @staticmethod
-    def gather_cross_context(
-        *,
-        source: torch.Tensor,
-        links: TemporalLinks,
-    ) -> torch.Tensor:
-        index = links.source_indices.long()
-        valid = index >= 0
-
-        if source.shape[0] == 0:
-            if valid.any():
-                raise IndexError(
-                    "Temporal links reference a source tensor with zero tokens"
-                )
-            return source.new_zeros((index.shape[0], source.shape[-1]))
-
-        safe_index = index.clamp(min=0)
-        gathered = source[safe_index]
-
-        if links.weights is None:
-            weights = valid.to(dtype=source.dtype)
-        else:
-            weights = links.weights.to(
-                dtype=source.dtype,
-                device=source.device,
-            )
-            weights = weights * valid.to(dtype=weights.dtype)
-
-        denominator = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        normalized_weights = weights / denominator
-        cross = (gathered * normalized_weights.unsqueeze(-1)).sum(dim=1)
-        has_neighbor = valid.any(dim=1, keepdim=True)
-        return torch.where(has_neighbor, cross, torch.zeros_like(cross))
-
-    def forward(
-        self,
-        *,
-        target: torch.Tensor,
-        source: torch.Tensor,
-        links: TemporalLinks,
-    ) -> torch.Tensor:
-        links.validate(
-            num_target=target.shape[0],
-            num_source=source.shape[0],
-            name="temporal_links",
-        )
-        cross = self.gather_cross_context(source=source, links=links)
-        fused = self.fuse(
-            torch.cat(
-                [
-                    target,
-                    cross,
-                    torch.abs(target - cross),
-                    target * cross,
-                ],
-                dim=-1,
-            )
-        )
-        return self.norm(target + fused)
-
-
-# =============================================================================
-# Task conditioning
-# =============================================================================
-
-
-class TaskConditioning(nn.Module):
-    """<TASK> hidden -> FiLM conditioning over every dense token."""
-
-    def __init__(self, qwen_dim: int, decoder_dim: int):
-        super().__init__()
-        self.to_film = nn.Linear(qwen_dim, decoder_dim * 2)
-        self.norm = nn.LayerNorm(decoder_dim)
-
-    def forward(
-        self,
-        *,
-        x: torch.Tensor,
-        batch_ids: torch.Tensor,
-        task_hidden: torch.Tensor,
-    ) -> torch.Tensor:
-        if task_hidden.ndim != 2:
-            raise ValueError(
-                f"task_hidden must be [B,D], got {tuple(task_hidden.shape)}"
-            )
-
-        gamma, beta = self.to_film(task_hidden).chunk(2, dim=-1)
-        gamma = torch.tanh(gamma)
-        token_gamma = gamma[batch_ids.long()]
-        token_beta = beta[batch_ids.long()]
-        return self.norm(x * (1.0 + token_gamma) + token_beta)
-
-
-# =============================================================================
-# Shared decoder block
-# =============================================================================
-
-
-class SharedDenseBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        hidden_dim = int(dim * float(mlp_ratio))
-        self.norm = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+        self.ffn_norm = nn.LayerNorm(decoder_dim)
+        hidden_dim = max(1, int(round(decoder_dim * mlp_ratio)))
+        self.ffn = nn.Sequential(
+            nn.Linear(decoder_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, decoder_dim),
         )
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.mlp(self.norm(x))
-
-
-class SelfAttentionBlock(nn.Module):
-    """Standard pre-norm self-attention + MLP block for a short token set."""
-
-    def __init__(
+    def forward(
         self,
-        dim: int,
+        query: torch.Tensor,
+        memory: torch.Tensor,
         *,
-        num_heads: int = 8,
-        mlp_ratio: float = 2.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if dim % int(num_heads) != 0:
-            raise ValueError(
-                f"dim={dim} must be divisible by num_heads={num_heads}"
-            )
-        hidden_dim = int(dim * float(mlp_ratio))
-        self.norm_attn = nn.LayerNorm(dim)
-        self.attention = nn.MultiheadAttention(
-            dim,
-            int(num_heads),
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.norm_mlp = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(float(dropout)),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(
-                f"SelfAttentionBlock expects [B,N,D], got {tuple(x.shape)}"
-            )
-        qkv = self.norm_attn(x)
-        attended, _ = self.attention(
-            qkv,
-            qkv,
-            qkv,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        normed = self.query_norm(query)
+        normalized_memory = self.memory_norm(memory)
+        context, _ = self.cross_attention(
+            normed,
+            normalized_memory,
+            normalized_memory,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
             need_weights=False,
         )
-        x = x + attended
-        x = x + self.mlp(self.norm_mlp(x))
-        return x
+        query = query + self.dropout(context)
+        query = query + self.dropout(self.ffn(self.ffn_norm(query)))
+        return query
 
 
-class FixedTokenAttention(nn.Module):
-    """Efficient shared global attention for variable-length dense tokens.
+class TransformerQueryDecoder(nn.Module):
+    """One weight-shared query decoder for both 2D and 3D PAIR adapters.
 
-    The module keeps M learned tokens [M,D]. For each sample:
+    memory_mask: [B,L], True for a real/unpadded memory token.
+    query_memory_mask: [B,Q,L], True where a particular Query may attend.
+    This allows T1-only / T2-only / both-time temporal attention without
+    introducing separate modality-specific decoders.
 
-        dense [N,D]
-          -> learned tokens read dense with cross-attention
-          -> self-attention runs only on M learned tokens
-          -> dense tokens read the updated learned tokens
-          -> dense [N,D]
-
-    This makes the expensive global interaction O(N*M + M^2) instead of O(N^2).
-    The same parameters are used by 2D and 3D.
+    Returns [B,Q,D] updated queries. Final prediction heads are in this file.
     """
 
     def __init__(
         self,
-        dim: int,
         *,
-        num_tokens: int = 64,
+        decoder_dim: int = 256,
         num_layers: int = 2,
         num_heads: int = 8,
-        mlp_ratio: float = 2.0,
+        mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-    ):
+    ) -> None:
         super().__init__()
-        dim = int(dim)
-        num_tokens = int(num_tokens)
-        num_layers = int(num_layers)
-        num_heads = int(num_heads)
-        if dim <= 0 or num_tokens <= 0 or num_layers <= 0:
-            raise ValueError(
-                "dim, num_tokens and num_layers must all be positive"
-            )
-        if dim % num_heads != 0:
-            raise ValueError(
-                f"dim={dim} must be divisible by num_heads={num_heads}"
-            )
-
-        self.dim = dim
-        self.num_tokens = num_tokens
-        self.num_layers = num_layers
-
-        self.learned_tokens = nn.Parameter(
-            torch.empty(num_tokens, dim)
-        )
-        nn.init.trunc_normal_(self.learned_tokens, std=0.02)
-
-        # Learned tokens read the full dense set.
-        self.read_query_norm = nn.LayerNorm(dim)
-        self.read_dense_norm = nn.LayerNorm(dim)
-        self.read_attention = nn.MultiheadAttention(
-            dim,
-            num_heads,
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.read_out_norm = nn.LayerNorm(dim)
-
-        # Global reasoning happens only on the short learned-token set.
-        self.self_blocks = nn.ModuleList(
+        if decoder_dim <= 0 or num_layers <= 0:
+            raise ValueError("decoder_dim and num_layers must be positive")
+        self.decoder_dim = int(decoder_dim)
+        self.num_heads = int(num_heads)
+        self.layers = nn.ModuleList(
             [
-                SelfAttentionBlock(
-                    dim,
+                TransformerDecoderLayer(
+                    decoder_dim=decoder_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
@@ -558,1440 +317,562 @@ class FixedTokenAttention(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.final_norm = nn.LayerNorm(decoder_dim)
 
-        # Dense tokens read the globally mixed learned tokens back.
-        self.write_dense_norm = nn.LayerNorm(dim)
-        self.write_token_norm = nn.LayerNorm(dim)
-        self.write_attention = nn.MultiheadAttention(
-            dim,
-            num_heads,
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.write_out_norm = nn.LayerNorm(dim)
-
-    def _one_sample(self, dense: torch.Tensor) -> torch.Tensor:
-        if dense.ndim != 2 or dense.shape[-1] != self.dim:
-            raise ValueError(
-                f"dense must be [N,{self.dim}], got {tuple(dense.shape)}"
-            )
-        if dense.shape[0] == 0:
-            return dense
-
-        dense_b = dense.unsqueeze(0)
-        learned = self.learned_tokens.to(
-            device=dense.device,
-            dtype=dense.dtype,
-        ).unsqueeze(0)
-
-        q = self.read_query_norm(learned)
-        kv = self.read_dense_norm(dense_b)
-        read, _ = self.read_attention(q, kv, kv, need_weights=False)
-        learned = self.read_out_norm(learned + read)
-
-        for block in self.self_blocks:
-            learned = block(learned)
-
-        q = self.write_dense_norm(dense_b)
-        kv = self.write_token_norm(learned)
-        write, _ = self.write_attention(q, kv, kv, need_weights=False)
-        return self.write_out_norm(dense_b + write)[0]
-
-    def forward_pair(
+    def forward(
         self,
         *,
-        x1: torch.Tensor,
-        batch_ids1: torch.Tensor,
-        x2: torch.Tensor,
-        batch_ids2: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Jointly mix T1/T2 tokens within each sample, then split them back."""
-        if x1.ndim != 2 or x2.ndim != 2:
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        memory_mask: Optional[torch.Tensor] = None,
+        query_memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if query.ndim != 3 or memory.ndim != 3:
+            raise ValueError("query and memory must be [B,Q,D] and [B,L,D]")
+        b, q, d = query.shape
+        bm, l, dm = memory.shape
+        if b != bm or d != self.decoder_dim or dm != self.decoder_dim:
             raise ValueError(
-                f"x1/x2 must be [N,D], got {tuple(x1.shape)} / {tuple(x2.shape)}"
+                f"Expected query [B,Q,{self.decoder_dim}] and "
+                f"memory [B,L,{self.decoder_dim}] with matching B, got "
+                f"{tuple(query.shape)} and {tuple(memory.shape)}"
             )
-        if x1.shape[-1] != self.dim or x2.shape[-1] != self.dim:
-            raise ValueError(
-                f"x1/x2 feature dim must be {self.dim}"
-            )
-        if batch_ids1.shape != (x1.shape[0],):
-            raise ValueError(
-                f"batch_ids1 must be [{x1.shape[0]}], got {tuple(batch_ids1.shape)}"
-            )
-        if batch_ids2.shape != (x2.shape[0],):
-            raise ValueError(
-                f"batch_ids2 must be [{x2.shape[0]}], got {tuple(batch_ids2.shape)}"
-            )
+        if b == 0 or q == 0 or l == 0:
+            raise ValueError("Batch, query, and memory lengths must all be nonzero")
+        if query.device != memory.device:
+            raise ValueError("query and memory must be on the same device")
+        if memory.dtype != query.dtype:
+            # Vision / point memories can arrive in BF16 while the learnable
+            # text-query projection runs in FP32. MHA requires matching dtypes.
+            memory = memory.to(dtype=query.dtype)
 
-        ids1 = set(int(x) for x in torch.unique(batch_ids1).tolist())
-        ids2 = set(int(x) for x in torch.unique(batch_ids2).tolist())
-        if ids1 != ids2:
-            raise ValueError(
-                f"T1/T2 batch id sets differ: {sorted(ids1)} vs {sorted(ids2)}"
-            )
+        if memory_mask is not None:
+            if memory_mask.shape != (b, l) or memory_mask.dtype != torch.bool:
+                raise ValueError("memory_mask must be bool [B,L], True=valid")
+            if memory_mask.device != memory.device:
+                raise ValueError("memory_mask must be on memory.device")
+        if query_memory_mask is not None:
+            if (
+                query_memory_mask.shape != (b, q, l)
+                or query_memory_mask.dtype != torch.bool
+            ):
+                raise ValueError("query_memory_mask must be bool [B,Q,L], True=allowed")
+            if query_memory_mask.device != memory.device:
+                raise ValueError("query_memory_mask must be on memory.device")
 
-        out1 = torch.empty_like(x1)
-        out2 = torch.empty_like(x2)
-        for batch_id in sorted(ids1):
-            mask1 = batch_ids1 == int(batch_id)
-            mask2 = batch_ids2 == int(batch_id)
-            n1 = int(mask1.sum().item())
-            n2 = int(mask2.sum().item())
-            if n1 == 0 or n2 == 0:
-                raise ValueError(
-                    f"batch {batch_id} must contain both T1 and T2 tokens"
-                )
-
-            joined = torch.cat([x1[mask1], x2[mask2]], dim=0)
-            joined = self._one_sample(joined)
-            out1[mask1] = joined[:n1]
-            out2[mask2] = joined[n1:n1 + n2]
-
-        return out1, out2
-
-
-# =============================================================================
-# PAIR V2 2D Cascade Gated Decoder
-# Ported from PerASCD models/common.py.
-# The module always keeps three streams:
-#   x0 = T1 semantic
-#   x1 = T2 semantic
-#   xc = explicit change
-# =============================================================================
-
-
-class CBAMconv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, reduction=16):
-        super().__init__()
-        self.conv2d = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            padding=kernel_size // 2,
-        )
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.mlp1 = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False),
-        )
-        self.sigmoid = nn.Sigmoid()
-        self.conv1x1 = nn.Conv2d(
-            2,
-            1,
-            kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
-            bias=False,
-        )
-
-    def forward(self, x):
-        avg_out = self.mlp1(self.avg_pool(x))
-        max_out = self.mlp1(self.max_pool(x))
-        channel_w = self.sigmoid(avg_out + max_out)
-        x = x * channel_w
-
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        spatial_w = self.sigmoid(
-            self.conv1x1(torch.cat([avg_out, max_out], dim=1))
-        )
-        x = x * spatial_w
-        return self.conv2d(x)
-
-
-class ChangeAwareGatingModule(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            in_channels // 4,
-            kernel_size=3,
-            padding=1,
-        )
-        self.relu = nn.ReLU()
-        self.conv_local = nn.Conv2d(in_channels // 4, 2, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_global = nn.Conv2d(in_channels // 4, 2, kernel_size=1)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.relu(x)
-
-        avg = self.avg_pool(x)
-        avg = self.conv_global(avg)
-        global_weight = self.sigmoid(avg)
-
-        logit = self.conv_local(x)
-        local_weight = self.sigmoid(logit)
-        return local_weight * (1 + global_weight)
-
-
-class CascadeGatedBlock(nn.Module):
-    def __init__(
-        self,
-        feat_channels,
-        out_channels,
-        drop_rate=0.0,
-        use_lateral=True,
-    ):
-        super().__init__()
-        self.use_lateral = use_lateral
-
-        self.feat_conv0 = nn.Sequential(
-            CBAMconv2d(feat_channels, out_channels, kernel_size=3),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.feat_convc = nn.Sequential(
-            CBAMconv2d(out_channels, out_channels, kernel_size=3),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.highconv0 = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.highconv1 = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.highconvc = nn.Sequential(
-            nn.Conv2d(
-                out_channels * 3,
-                out_channels,
-                kernel_size=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.lowconv0 = nn.Sequential(
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.lowconv1 = nn.Sequential(
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.lowconvc = nn.Sequential(
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.cagm = ChangeAwareGatingModule(out_channels * 2)
-        self.dropout = nn.Dropout2d(p=drop_rate)
-
-    def forward(self, x0, x1, xc, feat0=None, feat1=None):
-        x0 = self.highconv0(x0)
-        x1 = self.highconv1(x1)
-        xc = self.highconvc(torch.cat([xc, x0, x1], dim=1))
-
-        if self.use_lateral:
-            if feat0 is None or feat1 is None:
-                raise ValueError(
-                    "use_lateral=True requires feat0 and feat1."
-                )
-            x0 = F.interpolate(
-                x0,
-                scale_factor=2,
-                mode="bilinear",
-                align_corners=False,
-            )
-            x1 = F.interpolate(
-                x1,
-                scale_factor=2,
-                mode="bilinear",
-                align_corners=False,
-            )
-            xc = F.interpolate(
-                xc,
-                scale_factor=2,
-                mode="bilinear",
-                align_corners=False,
-            )
-            f0 = self.feat_conv0(feat0)
-            f1 = self.feat_conv0(feat1)
+        key_padding_mask = None
+        attn_mask = None
+        if query_memory_mask is None:
+            if memory_mask is not None:
+                if not memory_mask.any(dim=-1).all():
+                    raise ValueError("Every sample needs at least one valid memory token")
+                key_padding_mask = ~memory_mask
         else:
-            f0 = self.feat_conv0(x0)
-            f1 = self.feat_conv0(x1)
+            allowed = query_memory_mask
+            if memory_mask is not None:
+                allowed = allowed & memory_mask.unsqueeze(1)
+            if not allowed.any(dim=-1).all():
+                raise ValueError("Every query must have at least one allowed memory token")
+            attn_mask = (
+                (~allowed)
+                .unsqueeze(1)
+                .expand(b, self.num_heads, q, l)
+                .reshape(b * self.num_heads, q, l)
+            )
 
-        fc = self.feat_convc(torch.abs(f0 - f1))
-        hardship_map = self.cagm(torch.cat([xc, fc], dim=1))
-        w_high = hardship_map[:, 0].unsqueeze(1)
-        w_low = hardship_map[:, 1].unsqueeze(1)
-
-        x0 = self.lowconv0((w_high * x0) + (w_low * f0))
-        x1 = self.lowconv1((w_high * x1) + (w_low * f1))
-        xc = self.lowconvc((w_high * xc) + (w_low * fc))
-
-        x0 = self.dropout(x0)
-        x1 = self.dropout(x1)
-        xc = self.dropout(xc)
-        return x0, x1, xc
+        for layer in self.layers:
+            query = layer(
+                query,
+                memory,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+            )
+        return self.final_norm(query)
 
 
-class CascadeGatedDecoder(nn.Module):
-    def __init__(
-        self,
-        in_channel_list,
-        out_channels,
-        drop_rate=0.0,
-        use_refinement_block=False,
-    ):
+# -----------------------------------------------------------------------------
+# Prediction heads. They live HERE, not inside the modality adapters.
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class PredictionLogits:
+    """Loss-ready flattened logits unless forward_2d(return_maps=True).
+
+    Semantic channels follow sorted raw class IDs; raw_class_ids is metadata
+    only (loss.py still receives its dataset class_names mapping).
+    """
+
+    semantic_logits_t1: Optional[torch.Tensor] = None
+    semantic_logits_t2: Optional[torch.Tensor] = None
+    change_logits: Optional[torch.Tensor] = None
+    event_logits_t1: Optional[torch.Tensor] = None
+    event_logits_t2: Optional[torch.Tensor] = None
+    raw_class_ids: Tuple[int, ...] = ()
+    class_names: Tuple[str, ...] = ()
+    updated_queries: Optional[torch.Tensor] = None
+
+
+class QueryConditionedClassHead(nn.Module):
+    """One task query + C prototypes -> C spatial classifiers.
+
+    For each class c, w_c = MLP([prototype_c, query,
+    prototype_c * query]). The multiplicative interaction ensures the query
+    affects class-specific weights, rather than adding the same constant to
+    every class logit (which would cancel under softmax).
+
+    Receives dense features as [B,P,D] (images) or [N,D] (ragged points).
+    This class is instantiated SEPARATELY for 2D semantics, 3D semantics,
+    and 3D events; only T1/T2 of a task share its instance.
+    """
+
+    def __init__(self, decoder_dim: int = 256, logit_scale_init: float = 10.0):
         super().__init__()
-        self.use_refinement_block = use_refinement_block
-
-        self.first_feat_conv0 = nn.Sequential(
-            CBAMconv2d(
-                in_channel_list[-1],
-                out_channels,
-                kernel_size=3,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+        if decoder_dim <= 0 or logit_scale_init <= 0:
+            raise ValueError('decoder_dim and logit_scale_init must be positive')
+        self.decoder_dim = int(decoder_dim)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(decoder_dim, decoder_dim),
+            nn.LayerNorm(decoder_dim),
         )
+        self.weight_mlp = nn.Sequential(
+            nn.Linear(3 * decoder_dim, decoder_dim),
+            nn.GELU(),
+            nn.Linear(decoder_dim, decoder_dim),
+        )
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(logit_scale_init)))
 
-        fusion_blocks = []
-        for i in range(len(in_channel_list) - 1):
-            fusion_blocks.append(
-                CascadeGatedBlock(
-                    feat_channels=in_channel_list[
-                        len(in_channel_list) - i - 2
-                    ],
-                    out_channels=out_channels,
-                    drop_rate=drop_rate,
-                    use_lateral=True,
-                )
-            )
-        self.fusion_blocks = nn.ModuleList(fusion_blocks)
+    def class_weights(
+        self, query: torch.Tensor, prototypes: torch.Tensor
+    ) -> torch.Tensor:
+        if query.ndim != 2 or query.shape[-1] != self.decoder_dim:
+            raise ValueError(f'query must be [B,{self.decoder_dim}]')
+        if (
+            prototypes.ndim != 2
+            or prototypes.shape[-1] != self.decoder_dim
+            or prototypes.shape[0] == 0
+        ):
+            raise ValueError(f'prototypes must be nonempty [C,{self.decoder_dim}]')
+        query = query.to(dtype=self.weight_mlp[0].weight.dtype)
+        b, d = query.shape
+        c = prototypes.shape[0]
+        p = prototypes.to(device=query.device, dtype=query.dtype).unsqueeze(0).expand(b, c, d)
+        q = query.unsqueeze(1).expand(b, c, d)
+        weights = self.weight_mlp(torch.cat([p, q, p * q], dim=-1))
+        return F.normalize(weights.float(), dim=-1)
 
-        if use_refinement_block:
-            self.refinement_block = CascadeGatedBlock(
-                feat_channels=out_channels,
-                out_channels=out_channels,
-                drop_rate=drop_rate,
-                use_lateral=False,
-            )
-        else:
-            self.refinement_block = None
+    def _features(self, features: torch.Tensor) -> torch.Tensor:
+        if features.shape[-1] != self.decoder_dim:
+            raise ValueError('feature width does not match decoder_dim')
+        features = features.to(dtype=self.feature_projection[0].weight.dtype)
+        return F.normalize(self.feature_projection(features).float(), dim=-1)
 
-    def forward(self, feat_list_a, feat_list_b):
-        x0 = self.first_feat_conv0(feat_list_a[-1])
-        x1 = self.first_feat_conv0(feat_list_b[-1])
-        xc = torch.abs(x0 - x1)
+    def forward_image(
+        self, features: torch.Tensor, query: torch.Tensor, prototypes: torch.Tensor
+    ) -> torch.Tensor:
+        """features [B,D,H,W] -> logits [B,C,H,W]."""
+        if features.ndim != 4 or features.shape[1] != self.decoder_dim:
+            raise ValueError(f'image features must be [B,{self.decoder_dim},H,W]')
+        b, _, h, w = features.shape
+        if query.shape != (b, self.decoder_dim):
+            raise ValueError('image query batch/width does not match features')
+        pixels = features.flatten(2).transpose(1, 2)
+        weights = self.class_weights(query, prototypes)
+        scale = self.logit_scale.float().clamp(max=math.log(50.0)).exp()
+        logits = scale * torch.einsum('bpd,bcd->bpc', self._features(pixels), weights)
+        return logits.transpose(1, 2).reshape(b, -1, h, w)
 
-        for i, block in enumerate(self.fusion_blocks):
-            feat0 = feat_list_a[len(feat_list_a) - i - 2]
-            feat1 = feat_list_b[len(feat_list_b) - i - 2]
-            x0, x1, xc = block(
-                x0,
-                x1,
-                xc,
-                feat0,
-                feat1,
-            )
-
-        if self.refinement_block is not None:
-            x0, x1, xc = self.refinement_block(x0, x1, xc)
-
-        return x0, x1, xc
-
-
-# =============================================================================
-# Qwen class prototype encoder
-# =============================================================================
-
-
-class SimpleJointUNetDecoder(nn.Module):
-    """
-    Minimal joint 2D U-Net control decoder.
-
-    Input order for both times is shallow -> deep:
-        [p4, p8, p16, p32]
-
-    The decoder intentionally uses no change-aware gating, CBAM, absolute
-    difference, attention, DropPath, path dropout, or auxiliary branch.
-    T1/T2 features are simply concatenated at every scale, followed by a
-    standard Conv-BN-ReLU block. The deepest joint feature is progressively
-    upsampled and concatenated with the next shallower T1/T2 features.
-
-    One shared z4 feature finally produces x0, x1, and xc through three simple
-    heads so the surrounding PAIR semantic/change heads stay unchanged.
-    """
-
-    def __init__(
+    def forward_points(
         self,
-        in_channel_list,
-        out_channels,
-    ):
+        features: torch.Tensor,
+        batch_ids: torch.Tensor,
+        query: torch.Tensor,
+        prototypes: torch.Tensor,
+    ) -> torch.Tensor:
+        """features [N,D] + batch_ids [N] -> logits [N,C]."""
+        if features.ndim != 2 or features.shape[1] != self.decoder_dim:
+            raise ValueError(f'point features must be [N,{self.decoder_dim}]')
+        if batch_ids.ndim != 1 or batch_ids.numel() != features.shape[0]:
+            raise ValueError('batch_ids must be [N] and match point count')
+        weights = self.class_weights(query, prototypes)
+        scale = self.logit_scale.float().clamp(max=math.log(50.0)).exp()
+        return scale * torch.einsum(
+            'nd,ncd->nc', self._features(features), weights.index_select(0, batch_ids)
+        )
+
+
+class QueryConditionedBinaryHead(nn.Module):
+    """Updated change Q generates one spatial classifier, not two channels."""
+
+    def __init__(self, decoder_dim: int = 256, logit_scale_init: float = 10.0):
         super().__init__()
-        if len(in_channel_list) != 4:
-            raise ValueError(
-                "SimpleJointUNetDecoder expects four scales "
-                "[p4,p8,p16,p32]"
-            )
-
-        p4_c, p8_c, p16_c, p32_c = [int(c) for c in in_channel_list]
-        out_channels = int(out_channels)
-
-        def conv_block(in_channels: int) -> nn.Sequential:
-            return nn.Sequential(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False,
-                ),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(
-                    out_channels,
-                    out_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False,
-                ),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            )
-
-        # Deepest reasoning feature: cat(T1, T2) -> z32.
-        self.block32 = conv_block(p32_c * 2)
-
-        # Pure top-down U-Net fusion:
-        # up(z_deep) + cat(T1_skip, T2_skip) -> z_shallow.
-        self.block16 = conv_block(out_channels + p16_c * 2)
-        self.block8 = conv_block(out_channels + p8_c * 2)
-        self.block4 = conv_block(out_channels + p4_c * 2)
-
-        def output_head() -> nn.Sequential:
-            return nn.Sequential(
-                nn.Conv2d(
-                    out_channels,
-                    out_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False,
-                ),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            )
-
-        self.head_t1 = output_head()
-        self.head_t2 = output_head()
-        self.head_change = output_head()
-
-    @staticmethod
-    def _upsample_to(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(
-            x,
-            size=ref.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
+        self.decoder_dim = int(decoder_dim)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(decoder_dim, decoder_dim), nn.LayerNorm(decoder_dim)
         )
-
-    def forward(self, feat_list_a, feat_list_b):
-        if len(feat_list_a) != 4 or len(feat_list_b) != 4:
-            raise ValueError(
-                "SimpleJointUNetDecoder expects four scales for T1 and T2"
-            )
-
-        p4_t1, p8_t1, p16_t1, p32_t1 = feat_list_a
-        p4_t2, p8_t2, p16_t2, p32_t2 = feat_list_b
-
-        z32 = self.block32(torch.cat([p32_t1, p32_t2], dim=1))
-
-        z16 = self.block16(
-            torch.cat(
-                [
-                    self._upsample_to(z32, p16_t1),
-                    p16_t1,
-                    p16_t2,
-                ],
-                dim=1,
-            )
+        self.query_to_weight = nn.Sequential(
+            nn.Linear(decoder_dim, decoder_dim), nn.GELU(),
+            nn.Linear(decoder_dim, decoder_dim),
         )
-        z8 = self.block8(
-            torch.cat(
-                [
-                    self._upsample_to(z16, p8_t1),
-                    p8_t1,
-                    p8_t2,
-                ],
-                dim=1,
-            )
+        self.query_to_bias = nn.Linear(decoder_dim, 1)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(logit_scale_init)))
+
+    def forward(self, features: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """[B,D,H,W] + [B,D] -> [B,H,W] raw (pre-sigmoid) logits."""
+        if features.ndim != 4 or features.shape[1] != self.decoder_dim:
+            raise ValueError(f'change features must be [B,{self.decoder_dim},H,W]')
+        b, _, h, w = features.shape
+        if query.shape != (b, self.decoder_dim):
+            raise ValueError('change query shape mismatch')
+        feature_dtype = self.feature_projection[0].weight.dtype
+        pixels = F.normalize(
+            self.feature_projection(
+                features.flatten(2).transpose(1, 2).to(dtype=feature_dtype)
+            ).float(), dim=-1,
         )
-        z4 = self.block4(
-            torch.cat(
-                [
-                    self._upsample_to(z8, p4_t1),
-                    p4_t1,
-                    p4_t2,
-                ],
-                dim=1,
-            )
-        )
-
-        x0 = self.head_t1(z4)
-        x1 = self.head_t2(z4)
-        xc = self.head_change(z4)
-        return x0, x1, xc
+        query = query.to(dtype=self.query_to_weight[0].weight.dtype)
+        weights = F.normalize(self.query_to_weight(query).float(), dim=-1)
+        bias = self.query_to_bias(query).float()
+        scale = self.logit_scale.float().clamp(max=math.log(50.0)).exp()
+        logits = scale * torch.einsum('bpd,bd->bp', pixels, weights) + bias
+        return logits.reshape(b, h, w)
 
 
-class QwenClassPrototypeEncoder(nn.Module):
+class PAIRChangeDecoder(nn.Module):
+    """Shared Q decoder and complete modality-specific prediction heads.
+
+    2D input:
+      memory [B,L,D], task_hidden [B,qwen_dim],
+      pixel_features_t1/t2/change [B,D,H,W].
+
+    3D input:
+      memory [B,L,D], task_hidden [B,qwen_dim],
+      point_features_t1/t2 [N1,D]/[N2,D],
+      event_features_t1/t2 [N1,D]/[N2,D],
+      point_batch_t1/t2 [N1]/[N2].
+
+    query_memory_mask is optional [B,Q,L], True=allowed. Alternatively,
+    memory_time_ids [B,L] (1=T1, 2=T2, 0=padding) builds task-aware masks:
+      2D sem1->T1, sem2->T2, change->both;
+      3D sem1->T1, sem2->T2, events->both.
+
+    The adapter is responsible for constructing cross-temporal change/event
+    features and spatial memory. The entire path from these features to logits
+    is owned by this module. No losses or post-sigmoid/softmax live here.
     """
-    DatasetSpec.class_names -> text prompts -> Qwen -> semantic prototypes.
 
-    Raw dataset IDs are kept only for target/prediction mapping. Prototype
-    positions are compact and ordered by sorted raw ID.
-    """
+    TASKS_2D_SCD = ('Semantic T1', 'Semantic T2', 'Binary Change')
+    TASKS_2D_BCD = ('Binary Change',)
+    TASKS_3D = ('Semantic T1', 'Semantic T2', 'Event T1', 'Event T2')
+    EVENT_SUPPORT_T1 = (0, 1)
+    EVENT_SUPPORT_T2 = (0, 2)
 
     def __init__(
         self,
         *,
         qwen_dim: int,
-        decoder_dim: int,
-        prompt_template: str = "A remote sensing semantic class: {name}.",
-    ):
-        super().__init__()
-        self.qwen_dim = int(qwen_dim)
-        self.decoder_dim = int(decoder_dim)
-        self.prompt_template = str(prompt_template)
-        self.projection = nn.Sequential(
-            nn.Linear(self.qwen_dim, self.decoder_dim),
-            nn.LayerNorm(self.decoder_dim),
-        )
-
-    @staticmethod
-    def normalize_class_dict(
-        class_names: Dict[int, str],
-    ) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
-        if not isinstance(class_names, dict):
-            raise TypeError("DatasetSpec.class_names must be Dict[int, str]")
-        if not class_names:
-            raise ValueError("class_names cannot be empty")
-
-        normalized = {}
-        for raw_id, name in class_names.items():
-            if isinstance(raw_id, bool) or not isinstance(raw_id, int):
-                raise TypeError(f"class ID must be int, got {raw_id!r}")
-            if not isinstance(name, str) or not name.strip():
-                raise TypeError(
-                    f"class name for ID {raw_id} must be non-empty str"
-                )
-            normalized[int(raw_id)] = name.strip()
-
-        raw_ids = tuple(sorted(normalized))
-        names = tuple(normalized[raw_id] for raw_id in raw_ids)
-        return raw_ids, names
-
-    @staticmethod
-    def _last_valid_hidden(
-        hidden: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask = attention_mask.to(dtype=torch.long)
-        positions = torch.arange(
-            mask.shape[1], device=mask.device, dtype=torch.long
-        ).unsqueeze(0)
-        last_index = (positions * mask).amax(dim=1)
-        batch_index = torch.arange(hidden.shape[0], device=hidden.device)
-        return hidden[batch_index, last_index]
-
-    def forward(
-        self,
-        *,
-        class_names: Dict[int, str],
-        qwen_backbone,
-        detach_qwen: bool = True,
-    ):
-        raw_ids, names = self.normalize_class_dict(class_names)
-
-        tokenizer = qwen_backbone.tokenizer
-        if tokenizer.eos_token is None:
-            raise RuntimeError("Qwen tokenizer must define an EOS token")
-        prompts = [
-            self.prompt_template.format(name=name) + tokenizer.eos_token
-            for name in names
-        ]
-
-        qwen_model = qwen_backbone.model
-        device = next(qwen_model.parameters()).device
-        encoded = tokenizer(
-            prompts,
-            padding=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        encoded = {
-            key: value.to(device)
-            for key, value in encoded.items()
-        }
-
-        def run_qwen():
-            output = qwen_model(
-                input_ids=encoded["input_ids"],
-                attention_mask=encoded["attention_mask"],
-                output_hidden_states=True,
-                return_dict=True,
-                use_cache=False,
-            )
-            return self._last_valid_hidden(
-                output.hidden_states[-1],
-                encoded["attention_mask"],
-            )
-
-        if detach_qwen:
-            # Prototype text encoding is a read-only Qwen pass. Temporarily
-            # disable ordinary module dropout for deterministic class features,
-            # then restore the exact pre-existing train/eval state of every
-            # Qwen submodule.  Do not call qwen_model.train(True) here: PAIR
-            # intentionally keeps some frozen foundation-model submodules
-            # (notably the Vision base) in eval mode during training.
-            module_training_states = [
-                (module, bool(module.training))
-                for module in qwen_model.modules()
-            ]
-            qwen_model.eval()
-            try:
-                with torch.no_grad():
-                    language_hidden = run_qwen().detach()
-            finally:
-                for module, was_training in module_training_states:
-                    module.training = was_training
-        else:
-            language_hidden = run_qwen()
-
-        projection_dtype = self.projection[0].weight.dtype
-        prototypes = self.projection(
-            language_hidden.to(dtype=projection_dtype)
-        )
-        prototypes = F.normalize(prototypes.float(), dim=-1)
-        return raw_ids, names, prototypes
-
-
-# =============================================================================
-# Unified decoder
-# =============================================================================
-
-
-class UnifiedChangeDecoder(nn.Module):
-    """
-    One shared decoder core for 2D / 3D / 2D3D.
-
-    The shared token decoder is used by the 3D semantic/event route.
-    The 2D binary/SCD route uses forward_2d_cg() and a single binary
-    change logit map.
-    """
-
-    EVENT_CLASSES = (
-        "unchanged",
-        "removed",
-        "added",
-    )
-
-    def __init__(
-        self,
-        *,
         decoder_dim: int = 256,
-        qwen_dim: int = 2560,
-        vision_dim: int = 1024,
+        num_layers: int = 2,
         num_heads: int = 8,
-        num_shared_blocks: int = 2,
-        reasoning_chunk_size: int = 4096,
+        mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        num_modalities: int = 2,
-        initial_logit_scale: float = 10.0,
-        unified_num_tokens: int = 64,
-        unified_num_layers: int = 2,
-        unified_num_heads: int = 8,
-        unified_mlp_ratio: float = 2.0,
-        unified_dropout: float = 0.0,
-        enable_2d: bool = True,
-        enable_3d: bool = True,
-        enable_semantic: bool = True,
-    ):
+    ) -> None:
         super().__init__()
         self.decoder_dim = int(decoder_dim)
         self.qwen_dim = int(qwen_dim)
-        self.vision_dim = int(vision_dim)
-        self.enable_2d = bool(enable_2d)
-        self.enable_3d = bool(enable_3d)
-        self.enable_semantic = bool(enable_semantic)
-        if not (self.enable_2d or self.enable_3d):
-            raise ValueError("UnifiedChangeDecoder needs at least one active route")
-
-        self.token_embedding = UnifiedTokenEmbedding(
-            self.decoder_dim,
-            num_modalities=num_modalities,
+        self.class_encoder = QwenClassPrototypeEncoder(
+            qwen_dim=qwen_dim, decoder_dim=decoder_dim
         )
-        # 2D pyramid identity: P4/P8/P16/P32. This is the dense-token-side
-        # counterpart to the explicit natural-language pyramid labels inserted
-        # into Qwen's prompt. It is shared across both times.
-        self.scale_embedding_2d = (
-            nn.Embedding(4, self.decoder_dim)
-            if self.enable_2d
-            else None
+        self.query_decoder = TransformerQueryDecoder(
+            decoder_dim=decoder_dim, num_layers=num_layers, num_heads=num_heads,
+            mlp_ratio=mlp_ratio, dropout=dropout,
         )
-        self.reasoning_projection = nn.Sequential(
-            nn.Linear(self.qwen_dim, self.decoder_dim),
-            nn.LayerNorm(self.decoder_dim),
-        )
-        self.reasoning_injection = ReasoningInjection(
-            self.decoder_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            query_chunk_size=reasoning_chunk_size,
-        )
-
-        # Shared 2D/3D global decoder directly after dense<-LLM cross-attention.
-        # It compresses each sample's joint T1/T2 dense tokens to a fixed set
-        # of learned tokens, performs self-attention only on that short set,
-        # and writes the global information back to every dense token.
-        self.unified_attention = FixedTokenAttention(
-            self.decoder_dim,
-            num_tokens=unified_num_tokens,
-            num_layers=unified_num_layers,
-            num_heads=unified_num_heads,
-            mlp_ratio=unified_mlp_ratio,
-            dropout=unified_dropout,
-        )
-
-        # Shared task conditioning remains active for every route.
-        self.task_conditioning = TaskConditioning(
-            self.qwen_dim,
-            self.decoder_dim,
-        )
-
-        # 3D-only post-Unified processing.  These modules are intentionally not
-        # constructed for a 2D-only run.
-        self.temporal_fusion = (
-            SparseTemporalFusion(self.decoder_dim)
-            if self.enable_3d
-            else None
-        )
-        self.shared_blocks = nn.ModuleList(
-            [
-                SharedDenseBlock(
-                    self.decoder_dim,
-                    mlp_ratio=4.0,
-                    dropout=dropout,
-                )
-                for _ in range(int(num_shared_blocks))
-            ]
-            if self.enable_3d
-            else []
-        )
-        self.semantic_head = (
-            nn.Sequential(
-                nn.LayerNorm(self.decoder_dim),
-                nn.Linear(self.decoder_dim, self.decoder_dim),
-                nn.GELU(),
-            )
-            if self.enable_3d and self.enable_semantic
-            else None
-        )
-        self.change_head = (
-            nn.Sequential(
-                nn.LayerNorm(self.decoder_dim),
-                nn.Linear(self.decoder_dim, self.decoder_dim),
-                nn.GELU(),
-            )
-            if self.enable_3d
-            else None
-        )
-
-        # 2D route: every pyramid level has already passed through the same
-        # dense<-LLM Cross-Attn + shared Unified Decoder, so all four U-Net
-        # inputs live in decoder_dim. The U-Net itself remains deliberately
-        # plain: cat -> Conv-BN-ReLU -> upsample, with no change-aware gating.
-        self.cg_decoder_2d = (
-            SimpleJointUNetDecoder(
-                in_channel_list=(
-                    self.decoder_dim,
-                    self.decoder_dim,
-                    self.decoder_dim,
-                    self.decoder_dim,
-                ),
-                out_channels=self.decoder_dim,
-            )
-            if self.enable_2d
-            else None
-        )
-
-        # Output heads are route-aware.  Shared semantic language prototypes are
-        # kept whenever any active dataset has semantic supervision.
-        self.classifier_cd = (
-            nn.Sequential(
-                nn.Conv2d(self.decoder_dim, self.decoder_dim // 2, kernel_size=1),
-                nn.BatchNorm2d(self.decoder_dim // 2),
-                nn.ReLU(),
-                nn.Conv2d(self.decoder_dim // 2, 1, kernel_size=1),
-            )
-            if self.enable_2d
-            else None
-        )
-        self.event_head = (
-            nn.Linear(self.decoder_dim, 3)
-            if self.enable_3d
-            else None
-        )
-
-        self.class_encoder = (
-            QwenClassPrototypeEncoder(
-                qwen_dim=self.qwen_dim,
-                decoder_dim=self.decoder_dim,
-            )
-            if self.enable_semantic
-            else None
-        )
-        if self.enable_semantic:
-            self.logit_scale = nn.Parameter(
-                torch.tensor(float(initial_logit_scale)).log()
-            )
-        else:
-            self.register_parameter("logit_scale", None)
+        # Shared query decoder, but NOT shared image and point prediction heads.
+        self.image_semantic_head = QueryConditionedClassHead(decoder_dim)
+        self.image_change_head = QueryConditionedBinaryHead(decoder_dim)
+        self.point_semantic_head = QueryConditionedClassHead(decoder_dim)
+        self.point_event_head = QueryConditionedClassHead(decoder_dim)
+        self.event_prototypes = nn.Parameter(torch.randn(3, decoder_dim) * 0.02)
 
     @staticmethod
-    def _normalize_2d_prediction_mode(prediction_mode: str) -> str:
-        prediction_mode = str(prediction_mode).lower().strip()
-        aliases = {
-            "scd": "scd",
-            "semantic": "scd",
-            "semantic_change": "scd",
-            "bcd": "bcd",
-            "binary": "bcd",
-            "binary_change": "bcd",
-        }
-        if prediction_mode not in aliases:
-            raise ValueError(
-                "prediction_mode must be 'scd' or 'bcd', "
-                f"got {prediction_mode!r}"
-            )
-        return aliases[prediction_mode]
-
-    def _validate_2d_pyramid(
-        self,
-        feat_list: Sequence[torch.Tensor],
+    def _make_temporal_mask(
+        memory_time_ids: torch.Tensor,
+        query_count: int,
         *,
-        name: str,
-    ) -> None:
-        if not isinstance(feat_list, (list, tuple)):
-            raise TypeError(f"{name} must be a list/tuple of four tensors")
-        if len(feat_list) != 4:
-            raise ValueError(
-                f"{name} must contain four scales [1/4,1/8,1/16,1/32], "
-                f"got {len(feat_list)}"
-            )
-
-        expected_channels = (
-            self.decoder_dim,
-            self.decoder_dim,
-            self.decoder_dim,
-            self.decoder_dim,
-        )
-        batch_size = None
-        previous_hw = None
-
-        for i, (feat, expected_c) in enumerate(
-            zip(feat_list, expected_channels)
-        ):
-            if not torch.is_tensor(feat) or feat.ndim != 4:
-                raise ValueError(
-                    f"{name}[{i}] must be [B,C,H,W], "
-                    f"got {type(feat)!r} / "
-                    f"{getattr(feat, 'shape', None)}"
-                )
-            if feat.shape[1] != expected_c:
-                raise ValueError(
-                    f"{name}[{i}] channel dim must be {expected_c}, "
-                    f"got {feat.shape[1]}"
-                )
-            if batch_size is None:
-                batch_size = feat.shape[0]
-            elif feat.shape[0] != batch_size:
-                raise ValueError(
-                    f"{name} has inconsistent batch dimensions"
-                )
-            if not torch.isfinite(feat).all():
-                raise ValueError(f"{name}[{i}] contains NaN/Inf")
-
-            hw = tuple(feat.shape[-2:])
-            if hw[0] <= 0 or hw[1] <= 0:
-                raise ValueError(f"{name}[{i}] has invalid spatial size {hw}")
-
-            if previous_hw is not None:
-                expected_hw = (
-                    previous_hw[0] // 2,
-                    previous_hw[1] // 2,
-                )
-                if hw != expected_hw:
-                    raise ValueError(
-                        f"{name} must be a strict x2 pyramid shallow->deep; "
-                        f"scale {i-1}={previous_hw}, scale {i}={hw}, "
-                        f"expected {expected_hw}"
-                    )
-            previous_hw = hw
-
-    def _semantic_logits_2d(
-        self,
-        feature: torch.Tensor,
-        prototypes: torch.Tensor,
+        is_3d: bool,
     ) -> torch.Tensor:
-        if self.logit_scale is None:
-            raise RuntimeError("Semantic prototype head is not configured for this run")
-        feature = F.normalize(feature.float(), dim=1)
-        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
-        return scale * torch.einsum(
-            "bdhw,kd->bkhw",
-            feature,
-            prototypes,
-        )
-
-    def _binary_logits_2d(self, feature: torch.Tensor) -> torch.Tensor:
-        if self.classifier_cd is None:
-            raise RuntimeError("2D change head is not configured for this run")
-        logits = self.classifier_cd(feature)
-        if logits.ndim != 4 or logits.shape[1] != 1:
-            raise RuntimeError(
-                "2D change classifier must return [B,1,H,W], "
-                f"got {tuple(logits.shape)}"
-            )
-        return logits[:, 0]
-
-    def forward_2d_cg(
-        self,
-        *,
-        feat_pyramid_t1: Sequence[torch.Tensor],
-        feat_pyramid_t2: Sequence[torch.Tensor],
-        prediction_mode: str,
-        class_names: Optional[Dict[int, str]] = None,
-        qwen_backbone=None,
-        detach_qwen_class_encoder: bool = True,
-    ) -> Cascade2DDecoderOutput:
-        """
-        PAIR V2 2D route.
-
-        Expected feature order for both times:
-            [1/4, 1/8, 1/16, 1/32]
-
-        For Qwen3-VL-4B at 512x512 this is conceptually:
-            P4  reasoned feature @ 128x128, decoder_dim channels
-            P8  reasoned feature @  64x64, decoder_dim channels
-            P16 reasoned feature @  32x32, decoder_dim channels
-            P32 reasoned feature @  16x16, decoder_dim channels
-
-        Every level is produced before this function by:
-            dense Vision Q + its Qwen LLM pyramid K/V
-            -> shared Cross-Attn
-            -> joint T1/T2 multi-scale Unified Decoder
-            -> <TASK> conditioning
-
-        SCD and BCD share the exact same simple joint U-Net and explicit xc
-        output feature. Only the final prediction route differs.
-        """
-        if not self.enable_2d or self.cg_decoder_2d is None:
-            raise RuntimeError("2D decoder route is not configured for this run")
-        prediction_mode = self._normalize_2d_prediction_mode(
-            prediction_mode
-        )
-        self._validate_2d_pyramid(
-            feat_pyramid_t1,
-            name="feat_pyramid_t1",
-        )
-        self._validate_2d_pyramid(
-            feat_pyramid_t2,
-            name="feat_pyramid_t2",
-        )
-
-        for i, (feat1, feat2) in enumerate(
-            zip(feat_pyramid_t1, feat_pyramid_t2)
+        if memory_time_ids.ndim != 2 or memory_time_ids.dtype not in (
+            torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
         ):
-            if feat1.shape != feat2.shape:
-                raise ValueError(
-                    f"T1/T2 pyramid shape mismatch at scale {i}: "
-                    f"{tuple(feat1.shape)} vs {tuple(feat2.shape)}"
-                )
-
-        # No path dropout or auxiliary supervision is used here.
-
-        x0, x1, xc = self.cg_decoder_2d(
-            feat_pyramid_t1,
-            feat_pyramid_t2,
-        )
-
-        change_logits = self._binary_logits_2d(xc)
-
-        if prediction_mode == "scd":
-            if class_names is None:
-                raise ValueError("SCD route requires class_names")
-            if qwen_backbone is None:
-                raise ValueError("SCD route requires qwen_backbone")
-
-            if self.class_encoder is None:
-                raise RuntimeError(
-                    "Semantic prototype head is not configured for this run"
-                )
-            raw_class_ids, ordered_class_names, prototypes = self.class_encoder(
-                class_names=class_names,
-                qwen_backbone=qwen_backbone,
-                detach_qwen=detach_qwen_class_encoder,
-            )
-            semantic_logits_t1 = self._semantic_logits_2d(x0, prototypes)
-            semantic_logits_t2 = self._semantic_logits_2d(x1, prototypes)
+            raise ValueError('memory_time_ids must be an integer tensor [B,L]')
+        if not torch.all((memory_time_ids >= 0) & (memory_time_ids <= 2)):
+            raise ValueError('memory_time_ids only permits 0=pad, 1=T1, 2=T2')
+        b, length = memory_time_ids.shape
+        both = memory_time_ids != 0
+        if is_3d:
+            if query_count != 4:
+                raise ValueError('3D requires exactly four task queries')
+            masks = (memory_time_ids == 1, memory_time_ids == 2, both, both)
+        elif query_count == 3:
+            masks = (memory_time_ids == 1, memory_time_ids == 2, both)
+        elif query_count == 1:
+            masks = (both,)
         else:
-            semantic_logits_t1 = None
-            semantic_logits_t2 = None
-            raw_class_ids = tuple()
-            ordered_class_names = tuple()
+            raise ValueError('2D requires one BCD query or three SCD queries')
+        mask = torch.stack(masks, dim=1)
+        if mask.shape != (b, query_count, length):
+            raise AssertionError('unexpected temporal mask dimensions')
+        return mask
 
-        return Cascade2DDecoderOutput(
-            semantic_logits_t1=semantic_logits_t1,
-            semantic_logits_t2=semantic_logits_t2,
-            change_logits=change_logits,
-            raw_class_ids=raw_class_ids,
-            class_names=ordered_class_names,
-        )
-
-    def _prepare_reasoning(
-        self,
-        tokens: UnifiedTokenSet,
-        *,
-        time_id: int,
-    ):
-        tokens.validate(
-            feature_dim=self.qwen_dim,
-            name="reasoning_tokens",
-        )
-        projected = UnifiedTokenSet(
-            features=self.reasoning_projection(tokens.features),
-            positions=tokens.positions,
-            modality_ids=tokens.modality_ids,
-            batch_ids=tokens.batch_ids,
-        )
-        embedded = self.token_embedding(projected, time_id=time_id)
-        return embedded, tokens.batch_ids
-
-    def _semantic_logits(
-        self,
-        feature: torch.Tensor,
-        prototypes: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.logit_scale is None:
-            raise RuntimeError("Semantic prototype head is not configured for this run")
-        feature = F.normalize(feature.float(), dim=-1)
-        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
-        return scale * (feature @ prototypes.T)
-
-    def _inject_reasoning_one_time(
+    def _decode(
         self,
         *,
-        dense_tokens: UnifiedTokenSet,
-        dense_time_id: int,
-        reasoning_tokens: UnifiedTokenSet,
-        reasoning_time_id: int,
-        scale_id: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Fuse one temporal dense stream with Qwen reasoning.
-
-        Q and K/V receive feature + position + modality + time embeddings.
-        For the 2D route, both sides additionally receive the same P4/P8/P16/
-        P32 scale embedding. The 3D route leaves scale_id=None.
-        """
-        dense_tokens.validate(
-            feature_dim=self.decoder_dim,
-            name="dense_tokens",
-        )
-        x = self.token_embedding(
-            dense_tokens,
-            time_id=dense_time_id,
-        )
-        reasoning, reasoning_batch_ids = self._prepare_reasoning(
-            reasoning_tokens,
-            time_id=reasoning_time_id,
-        )
-
-        if scale_id is not None:
-            if self.scale_embedding_2d is None:
-                raise RuntimeError("2D scale embedding is not configured")
-            scale_id = int(scale_id)
-            if scale_id < 0 or scale_id >= 4:
-                raise ValueError(f"2D scale_id must be 0..3, got {scale_id}")
-            scale = self.scale_embedding_2d.weight[scale_id]
-            x = x + scale.to(device=x.device, dtype=x.dtype)
-            reasoning = reasoning + scale.to(
-                device=reasoning.device, dtype=reasoning.dtype
-            )
-
-        return self.reasoning_injection(
-            dense=x,
-            dense_batch_ids=dense_tokens.batch_ids,
-            reasoning=reasoning,
-            reasoning_batch_ids=reasoning_batch_ids,
-        )
-
-    def fuse_2d_multiscale_reasoning(
-        self,
-        *,
-        dense_t1: Sequence[UnifiedTokenSet],
-        dense_t2: Sequence[UnifiedTokenSet],
-        reasoning_t1: Sequence[UnifiedTokenSet],
-        reasoning_t2: Sequence[UnifiedTokenSet],
-        task_hidden: torch.Tensor,
-    ) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
-        """Reason over all four 2D pyramid levels before the U-Net.
-
-        Level order is [P4,P8,P16,P32]. Each dense level is used as Q and
-        cross-attends to the matching Qwen LLM hidden block as K/V.  The
-        Cross-Attn output has no raw dense residual, so every decoder-visible
-        pyramid feature is reasoning-derived.  The resulting features from
-        every level and both times are then concatenated into one shared latent
-        Unified Decoder call. Finally <TASK> conditions the complete token set
-        and the original per-level topology is restored.
-        """
-        groups = (dense_t1, dense_t2, reasoning_t1, reasoning_t2)
-        if any(not isinstance(x, (list, tuple)) or len(x) != 4 for x in groups):
-            raise ValueError(
-                "fuse_2d_multiscale_reasoning expects four levels "
-                "[P4,P8,P16,P32] for every T1/T2 dense/reasoning stream"
-            )
-
-        x1_parts = []
-        x2_parts = []
-        lengths1 = []
-        lengths2 = []
-        for scale_id in range(4):
-            d1 = dense_t1[scale_id]
-            d2 = dense_t2[scale_id]
-            r1 = reasoning_t1[scale_id]
-            r2 = reasoning_t2[scale_id]
-            d1.validate(feature_dim=self.decoder_dim, name=f"dense_t1_p{4 * (2 ** scale_id)}")
-            d2.validate(feature_dim=self.decoder_dim, name=f"dense_t2_p{4 * (2 ** scale_id)}")
-            r1.validate(feature_dim=self.qwen_dim, name=f"reasoning_t1_scale{scale_id}")
-            r2.validate(feature_dim=self.qwen_dim, name=f"reasoning_t2_scale{scale_id}")
-
-            x1 = self._inject_reasoning_one_time(
-                dense_tokens=d1,
-                dense_time_id=0,
-                reasoning_tokens=r1,
-                reasoning_time_id=0,
-                scale_id=scale_id,
-            )
-            x2 = self._inject_reasoning_one_time(
-                dense_tokens=d2,
-                dense_time_id=1,
-                reasoning_tokens=r2,
-                reasoning_time_id=1,
-                scale_id=scale_id,
-            )
-            x1_parts.append(x1)
-            x2_parts.append(x2)
-            lengths1.append(int(x1.shape[0]))
-            lengths2.append(int(x2.shape[0]))
-
-        x1_all = torch.cat(x1_parts, dim=0)
-        x2_all = torch.cat(x2_parts, dim=0)
-        batch_ids1 = torch.cat([x.batch_ids for x in dense_t1], dim=0)
-        batch_ids2 = torch.cat([x.batch_ids for x in dense_t2], dim=0)
-
-        # One shared global reasoning bottleneck across every scale and time.
-        x1_all, x2_all = self.unified_attention.forward_pair(
-            x1=x1_all,
-            batch_ids1=batch_ids1,
-            x2=x2_all,
-            batch_ids2=batch_ids2,
-        )
-        x1_all = self.task_conditioning(
-            x=x1_all,
-            batch_ids=batch_ids1,
-            task_hidden=task_hidden,
-        )
-        x2_all = self.task_conditioning(
-            x=x2_all,
-            batch_ids=batch_ids2,
-            task_hidden=task_hidden,
-        )
-
-        return (
-            tuple(torch.split(x1_all, lengths1, dim=0)),
-            tuple(torch.split(x2_all, lengths2, dim=0)),
-        )
-
-    def fuse_2d_dense_reasoning(
-        self,
-        *,
-        dense_t1: UnifiedTokenSet,
-        dense_t2: UnifiedTokenSet,
-        reasoning_t1: UnifiedTokenSet,
-        reasoning_t2: UnifiedTokenSet,
-        task_hidden: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Restore PAIR's 2D dense-query / LLM-KV fusion.
-
-        T1 and T2 share exactly the same projection, positional/modality/time
-        embeddings and cross-attention parameters.  The only temporal
-        distinction is the learned time embedding (0 for T1, 1 for T2).
-
-        Returns flat fused dense features [N1,D] and [N2,D].  The caller
-        restores them to their 2D grids and uses them as the 1/32 CGDecoder
-        features.
-        """
-        dense_t1.validate(feature_dim=self.decoder_dim, name="dense_2d_t1")
-        dense_t2.validate(feature_dim=self.decoder_dim, name="dense_2d_t2")
-        reasoning_t1.validate(feature_dim=self.qwen_dim, name="reasoning_2d_t1")
-        reasoning_t2.validate(feature_dim=self.qwen_dim, name="reasoning_2d_t2")
-
-        x1 = self._inject_reasoning_one_time(
-            dense_tokens=dense_t1,
-            dense_time_id=0,
-            reasoning_tokens=reasoning_t1,
-            reasoning_time_id=0,
-            scale_id=3,
-        )
-        x2 = self._inject_reasoning_one_time(
-            dense_tokens=dense_t2,
-            dense_time_id=1,
-            reasoning_tokens=reasoning_t2,
-            reasoning_time_id=1,
-            scale_id=3,
-        )
-
-        # Shared Unified Decoder: T1/T2 are mixed jointly inside each sample.
-        # The same module/parameters are also used by the 3D route.
-        x1, x2 = self.unified_attention.forward_pair(
-            x1=x1,
-            batch_ids1=dense_t1.batch_ids,
-            x2=x2,
-            batch_ids2=dense_t2.batch_ids,
-        )
-
-        # <TASK> is the shared full-context readout: it appears after both
-        # temporal inputs in the causal sequence, so condition both 2D dense
-        # streams with the same complete bi-temporal task representation.
-        x1 = self.task_conditioning(
-            x=x1,
-            batch_ids=dense_t1.batch_ids,
-            task_hidden=task_hidden,
-        )
-        x2 = self.task_conditioning(
-            x=x2,
-            batch_ids=dense_t2.batch_ids,
-            task_hidden=task_hidden,
-        )
-        return x1, x2
-
-    def forward(
-        self,
-        *,
-        dense_t1: UnifiedTokenSet,
-        dense_t2: UnifiedTokenSet,
-        reasoning_t1: UnifiedTokenSet,
-        reasoning_t2: UnifiedTokenSet,
-        task_hidden: torch.Tensor,
-        links_t1_to_t2: TemporalLinks,
-        links_t2_to_t1: TemporalLinks,
-        class_names: Dict[int, str],
         qwen_backbone,
-        detach_qwen_class_encoder: bool = True,
-    ) -> UnifiedDecoderOutput:
-        if not self.enable_3d:
-            raise RuntimeError("3D/token decoder route is not configured for this run")
-        if self.temporal_fusion is None or self.change_head is None:
-            raise RuntimeError("3D decoder modules are not configured for this run")
-        if self.semantic_head is None or self.class_encoder is None:
-            raise RuntimeError(
-                "3D semantic prototype path is not configured for this run"
+        task_hidden: torch.Tensor,
+        task_descriptions: Sequence[str],
+        class_names: Optional[Dict[int, str]],
+        memory: torch.Tensor,
+        memory_mask: Optional[torch.Tensor],
+        query_memory_mask: Optional[torch.Tensor],
+        memory_time_ids: Optional[torch.Tensor],
+        is_3d: bool,
+        detach_qwen_class_encoder: bool,
+    ) -> Tuple[QueryEncodingOutput, torch.Tensor]:
+        if memory_time_ids is not None:
+            if query_memory_mask is not None:
+                raise ValueError('Pass only one of memory_time_ids / query_memory_mask')
+            if memory_time_ids.shape != memory.shape[:2]:
+                raise ValueError('memory_time_ids shape must be [B,L]')
+            if memory_time_ids.device != memory.device:
+                raise ValueError('memory_time_ids must be on memory.device')
+            query_memory_mask = self._make_temporal_mask(
+                memory_time_ids, len(task_descriptions), is_3d=is_3d,
             )
-        dense_t1.validate(
-            feature_dim=self.decoder_dim,
-            name="dense_t1",
-        )
-        dense_t2.validate(
-            feature_dim=self.decoder_dim,
-            name="dense_t2",
-        )
-        reasoning_t1.validate(
-            feature_dim=self.qwen_dim,
-            name="reasoning_t1",
-        )
-        reasoning_t2.validate(
-            feature_dim=self.qwen_dim,
-            name="reasoning_t2",
-        )
-
-        # 1) Dense Q attends to Qwen LLM K/V independently for T1/T2.
-        x1 = self._inject_reasoning_one_time(
-            dense_tokens=dense_t1,
-            dense_time_id=0,
-            reasoning_tokens=reasoning_t1,
-            reasoning_time_id=0,
-        )
-        x2 = self._inject_reasoning_one_time(
-            dense_tokens=dense_t2,
-            dense_time_id=1,
-            reasoning_tokens=reasoning_t2,
-            reasoning_time_id=1,
-        )
-
-        # 2) Shared 2D/3D Unified Decoder. T1 and T2 tokens from the same
-        # sample are mixed jointly through the fixed learned-token bottleneck.
-        x1, x2 = self.unified_attention.forward_pair(
-            x1=x1,
-            batch_ids1=dense_t1.batch_ids,
-            x2=x2,
-            batch_ids2=dense_t2.batch_ids,
-        )
-
-        # Shared task conditioning after the global decoder.  The 2D route
-        # applies the same module at the corresponding point before CGDecoder.
-        x1 = self.task_conditioning(
-            x=x1,
-            batch_ids=dense_t1.batch_ids,
-            task_hidden=task_hidden,
-        )
-        x2 = self.task_conditioning(
-            x=x2,
-            batch_ids=dense_t2.batch_ids,
-            task_hidden=task_hidden,
-        )
-
-        # 3) Sparse T1 <-> T2 interaction. Both directions use pre-fusion x1/x2.
-        temporal_x1 = self.temporal_fusion(
-            target=x1,
-            source=x2,
-            links=links_t1_to_t2,
-        )
-        temporal_x2 = self.temporal_fusion(
-            target=x2,
-            source=x1,
-            links=links_t2_to_t1,
-        )
-        x1, x2 = temporal_x1, temporal_x2
-
-        # 4) Shared dense refinement.
-        for block in self.shared_blocks:
-            x1 = block(x1)
-            x2 = block(x2)
-
-        # 5) Shared semantic/change representations.
-        semantic_feature_t1 = self.semantic_head(x1)
-        semantic_feature_t2 = self.semantic_head(x2)
-        change_feature_t1 = self.change_head(x1)
-        change_feature_t2 = self.change_head(x2)
-
-        # 6) Dataset-specific semantic language prototypes.
-        raw_class_ids, ordered_class_names, prototypes = self.class_encoder(
-            class_names=class_names,
+            if memory_mask is not None:
+                if not torch.equal(memory_mask, memory_time_ids != 0):
+                    raise ValueError('memory_mask must match nonzero memory_time_ids')
+            else:
+                memory_mask = memory_time_ids != 0
+        encoding = self.class_encoder(
             qwen_backbone=qwen_backbone,
+            task_hidden=task_hidden,
+            task_descriptions=task_descriptions,
+            class_names=class_names,
             detach_qwen=detach_qwen_class_encoder,
         )
-        semantic_logits_t1 = self._semantic_logits(
-            semantic_feature_t1,
-            prototypes,
+        queries = self.query_decoder(
+            query=encoding.task_queries,
+            memory=memory,
+            memory_mask=memory_mask,
+            query_memory_mask=query_memory_mask,
         )
-        semantic_logits_t2 = self._semantic_logits(
-            semantic_feature_t2,
-            prototypes,
+        return encoding, queries
+
+    def forward_2d(
+        self,
+        *,
+        qwen_backbone,
+        task_hidden: torch.Tensor,
+        memory: torch.Tensor,
+        pixel_features_t1: torch.Tensor,
+        pixel_features_t2: torch.Tensor,
+        change_features: torch.Tensor,
+        prediction_mode: str = 'scd',
+        class_names: Optional[Dict[int, str]] = None,
+        output_sizes: Optional[Sequence[Tuple[int, int]]] = None,
+        return_maps: bool = False,
+        memory_mask: Optional[torch.Tensor] = None,
+        query_memory_mask: Optional[torch.Tensor] = None,
+        memory_time_ids: Optional[torch.Tensor] = None,
+        detach_qwen_class_encoder: bool = True,
+    ) -> PredictionLogits:
+        """Return flat logits for loss.py, or dense logits if return_maps=True.
+
+        output_sizes handles variable per-sample target raster H,W with bilinear
+        logit interpolation (not interpolating class IDs/probabilities).
+        """
+        mode = prediction_mode.strip().lower()
+        if mode not in ('scd', 'bcd'):
+            raise ValueError("prediction_mode must be 'scd' or 'bcd'")
+        if mode == 'scd' and not class_names:
+            raise ValueError('SCD requires a nonempty class_names dict')
+        if mode == 'bcd' and class_names:
+            raise ValueError('BCD cannot receive semantic class definitions')
+        if mode == 'bcd':
+            class_names = None
+        if (
+            pixel_features_t1.ndim != 4
+            or pixel_features_t1.shape != pixel_features_t2.shape
+            or pixel_features_t1.shape != change_features.shape
+        ):
+            raise ValueError('2D feature maps must have matching [B,D,H,W] shapes')
+        b, d, h, w = change_features.shape
+        if d != self.decoder_dim or memory.shape[0] != b:
+            raise ValueError('2D image feature width / memory batch mismatch')
+        if output_sizes is not None:
+            if len(output_sizes) != b or any(
+                len(size) != 2 or int(size[0]) <= 0 or int(size[1]) <= 0
+                for size in output_sizes
+            ):
+                raise ValueError('output_sizes must contain B positive (H,W) pairs')
+            if return_maps and any(tuple(map(int,s)) != (h,w) for s in output_sizes):
+                raise ValueError('return_maps=True requires output_sizes to match feature size')
+
+        descriptions = self.TASKS_2D_SCD if mode == 'scd' else self.TASKS_2D_BCD
+        encoded, queries = self._decode(
+            qwen_backbone=qwen_backbone, task_hidden=task_hidden,
+            task_descriptions=descriptions,
+            class_names=class_names, memory=memory,
+            memory_mask=memory_mask,
+            query_memory_mask=query_memory_mask,
+            memory_time_ids=memory_time_ids,
+            is_3d=False,
+            detach_qwen_class_encoder=detach_qwen_class_encoder,
+        )
+        semantic_t1 = semantic_t2 = None
+        if mode == 'scd':
+            proto = encoded.semantic_prototypes
+            semantic_t1 = self.image_semantic_head.forward_image(
+                pixel_features_t1, queries[:, 0], proto
+            )
+            semantic_t2 = self.image_semantic_head.forward_image(
+                pixel_features_t2, queries[:, 1], proto
+            )
+        change_query = queries[:, 2] if mode == 'scd' else queries[:, 0]
+        change = self.image_change_head(change_features, change_query)
+        if not return_maps:
+            semantic_t1, semantic_t2, change = self._flatten_2d(
+                semantic_t1, semantic_t2, change, output_sizes
+            )
+        return PredictionLogits(
+            semantic_logits_t1=semantic_t1,
+            semantic_logits_t2=semantic_t2,
+            change_logits=change,
+            raw_class_ids=encoded.raw_class_ids,
+            class_names=encoded.class_names,
+            updated_queries=queries,
         )
 
-        # 7) 3D directional event classifier.
-        if self.event_head is None:
-            raise RuntimeError("3D event head is not configured for this run")
-        event_logits_t1 = self.event_head(change_feature_t1)
-        event_logits_t2 = self.event_head(change_feature_t2)
-
-        return UnifiedDecoderOutput(
-            semantic_feature_t1=semantic_feature_t1,
-            semantic_feature_t2=semantic_feature_t2,
-            change_feature_t1=change_feature_t1,
-            change_feature_t2=change_feature_t2,
-            semantic_logits_t1=semantic_logits_t1,
-            semantic_logits_t2=semantic_logits_t2,
-            semantic_prototypes=prototypes,
-            event_logits_t1=event_logits_t1,
-            event_logits_t2=event_logits_t2,
-            raw_class_ids=raw_class_ids,
-            class_names=ordered_class_names,
+    @staticmethod
+    def _flatten_2d(
+        semantic_t1: Optional[torch.Tensor],
+        semantic_t2: Optional[torch.Tensor],
+        change: torch.Tensor,
+        output_sizes: Optional[Sequence[Tuple[int,int]]],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        b, h, w = change.shape
+        if output_sizes is None:
+            output_sizes = ((h, w),) * b
+        sem1_parts, sem2_parts, change_parts = [], [], []
+        for index, size in enumerate(output_sizes):
+            target_hw = (int(size[0]), int(size[1]))
+            def sem_part(sem):
+                if sem is None:
+                    return None
+                x = sem[index:index+1]
+                if tuple(x.shape[-2:]) != target_hw:
+                    x = F.interpolate(x, size=target_hw, mode='bilinear', align_corners=False)
+                return x[0].permute(1,2,0).reshape(-1, x.shape[1])
+            a, bb = sem_part(semantic_t1), sem_part(semantic_t2)
+            if a is not None: sem1_parts.append(a)
+            if bb is not None: sem2_parts.append(bb)
+            c = change[index:index+1].unsqueeze(1)
+            if tuple(c.shape[-2:]) != target_hw:
+                c = F.interpolate(c, size=target_hw, mode='bilinear', align_corners=False)
+            change_parts.append(c.reshape(-1))
+        return (
+            torch.cat(sem1_parts, dim=0) if sem1_parts else None,
+            torch.cat(sem2_parts, dim=0) if sem2_parts else None,
+            torch.cat(change_parts, dim=0),
         )
 
+    @staticmethod
+    def _check_point_features(
+        features: torch.Tensor, batch_ids: torch.Tensor, batch_size: int,
+        decoder_dim: int, name: str,
+    ) -> None:
+        if (
+            features.ndim != 2 or features.shape[1] != decoder_dim or
+            batch_ids.ndim != 1 or batch_ids.shape[0] != features.shape[0] or
+            batch_ids.dtype != torch.long or batch_ids.device != features.device
+        ):
+            raise ValueError(f'{name}: expected features [N,{decoder_dim}] and long batch_ids [N]')
+        if features.shape[0] == 0:
+            raise ValueError(f'{name}: empty point cloud')
+        if (batch_ids < 0).any() or (batch_ids >= batch_size).any():
+            raise ValueError(f'{name}: batch_ids out of [0,B)')
 
-# =============================================================================
-# Small helper for aligned 2D testing
-# =============================================================================
+    @staticmethod
+    def _mask_event_logits(logits: torch.Tensor, *, phase: int) -> torch.Tensor:
+        """Prevent illegal event categories before both loss and inference.
 
+        Values remain [N,3] with a finite minimum suitable for FP32/BF16.
+        masked_fill also blocks gradients toward the illegal logit channel.
+        Loss still performs its independent active-support CE and Dice.
+        """
+        illegal_index = 2 if phase == 1 else 1 if phase == 2 else None
+        if illegal_index is None:
+            raise ValueError('phase must be 1 or 2')
+        invalid = torch.zeros_like(logits, dtype=torch.bool)
+        invalid[:, illegal_index] = True
+        return logits.masked_fill(invalid, -1e4)
 
-def build_identity_temporal_links(
-    num_tokens: int,
-    *,
-    device: torch.device,
-) -> TemporalLinks:
-    """Same-position T1/T2 links for an already co-registered flat 2D token grid."""
-    source_indices = torch.arange(
-        int(num_tokens),
-        dtype=torch.long,
-        device=device,
-    ).unsqueeze(1)
-    weights = torch.ones(
-        (int(num_tokens), 1),
-        dtype=torch.float32,
-        device=device,
-    )
-    return TemporalLinks(
-        source_indices=source_indices,
-        weights=weights,
-    )
+    def forward_3d(
+        self,
+        *,
+        qwen_backbone,
+        task_hidden: torch.Tensor,
+        memory: torch.Tensor,
+        point_features_t1: torch.Tensor,
+        point_features_t2: torch.Tensor,
+        event_features_t1: torch.Tensor,
+        event_features_t2: torch.Tensor,
+        point_batch_t1: torch.Tensor,
+        point_batch_t2: torch.Tensor,
+        class_names: Dict[int, str],
+        memory_mask: Optional[torch.Tensor] = None,
+        query_memory_mask: Optional[torch.Tensor] = None,
+        memory_time_ids: Optional[torch.Tensor] = None,
+        detach_qwen_class_encoder: bool = True,
+    ) -> PredictionLogits:
+        """3D per-point semantic and active-support event logits, ready for loss."""
+        if not class_names:
+            raise ValueError('3D semantic classes are required')
+        b = memory.shape[0]
+        for name, features, point_batch in (
+            ('point_features_t1', point_features_t1, point_batch_t1),
+            ('point_features_t2', point_features_t2, point_batch_t2),
+            ('event_features_t1', event_features_t1, point_batch_t1),
+            ('event_features_t2', event_features_t2, point_batch_t2),
+        ):
+            self._check_point_features(features, point_batch, b, self.decoder_dim, name)
+        encoded, queries = self._decode(
+            qwen_backbone=qwen_backbone, task_hidden=task_hidden,
+            task_descriptions=self.TASKS_3D, class_names=class_names,
+            memory=memory, memory_mask=memory_mask,
+            query_memory_mask=query_memory_mask,
+            memory_time_ids=memory_time_ids, is_3d=True,
+            detach_qwen_class_encoder=detach_qwen_class_encoder,
+        )
+        sem1 = self.point_semantic_head.forward_points(
+            point_features_t1, point_batch_t1, queries[:,0], encoded.semantic_prototypes
+        )
+        sem2 = self.point_semantic_head.forward_points(
+            point_features_t2, point_batch_t2, queries[:,1], encoded.semantic_prototypes
+        )
+        evt_proto = F.normalize(self.event_prototypes.float(), dim=-1)
+        evt1 = self.point_event_head.forward_points(
+            event_features_t1, point_batch_t1, queries[:,2], evt_proto
+        )
+        evt2 = self.point_event_head.forward_points(
+            event_features_t2, point_batch_t2, queries[:,3], evt_proto
+        )
+        evt1 = self._mask_event_logits(evt1, phase=1)
+        evt2 = self._mask_event_logits(evt2, phase=2)
+        return PredictionLogits(
+            semantic_logits_t1=sem1, semantic_logits_t2=sem2,
+            event_logits_t1=evt1, event_logits_t2=evt2,
+            raw_class_ids=encoded.raw_class_ids,
+            class_names=encoded.class_names,
+            updated_queries=queries,
+        )
