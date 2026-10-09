@@ -92,27 +92,13 @@ class _PixelShuffleStage(nn.Module):
 class ImageSingleAdapterOutput:
     """Single-temporal ViT/LLM spatial memory and full-resolution features.
 
-    Mirrors PointSingleAdapterOutput's role; tensors remain image-specific.
+    One phase of the same encode_single/fuse_temporal pipeline as PointAdapter.
     memory_features: [B,D,Hv,Wv] at the Qwen visual grid.
     pixel_features: [B,D,Hp,Wp] at the common RGB resolution.
     """
 
     memory_features: torch.Tensor
     pixel_features: torch.Tensor
-
-
-@dataclass
-class ImageSingleAdapterOutput:
-    """Single-temporal ViT/LLM spatial memory and full-resolution features.
-
-    Mirrors PointSingleAdapterOutput's role; tensors remain image-specific.
-    memory_features: [B,D,Hv,Wv] at the Qwen visual grid.
-    pixel_features: [B,D,Hp,Wp] at the common RGB resolution.
-    """
-
-    memory_features: torch.Tensor
-    pixel_features: torch.Tensor
-
 
 @dataclass
 class ImageAdapterOutput:
@@ -135,17 +121,9 @@ class ImageAdapterOutput:
             "output_sizes": self.output_sizes,
         }
 
-
 class ImageAdapter(nn.Module):
-    """ViT+LLM visual memory, temporal high-resolution RGB dense features.
 
-    All visual fusion / upsample / RGB modules are shared across T1/T2.
-    The Change fusion is separate and jointly uses both temporal features.
-
-    The only interpolation of dense features is spatial alignment and final
-    RGB-size alignment. Two PixelShuffle stages are genuinely learnable.
-    """
-
+    # Modules shared by T1 and T2.
     def __init__(
         self,
         *,
@@ -206,6 +184,7 @@ class ImageAdapter(nn.Module):
             _norm(decoder_dim), nn.GELU(),
         )
 
+    # Input preparation and validation.
     @staticmethod
     def _cast_to_module(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
         """Match parameter dtype/device with or without autocast enabled."""
@@ -327,6 +306,7 @@ class ImageAdapter(nn.Module):
 
         return resize_and_stack(imgs1), resize_and_stack(imgs2), target_sizes
 
+    # Single-temporal spatial memory and full-resolution features.
     def _encode_spatial_memory(
         self,
         premerge: Mapping[int, torch.Tensor],
@@ -398,93 +378,7 @@ class ImageAdapter(nn.Module):
             pixel_features=pixel_features,
         )
 
-    def _fuse_temporal_features(
-        self,
-        pixel_features_t1: torch.Tensor,
-        pixel_features_t2: torch.Tensor,
-    ) -> torch.Tensor:
-        """Joint T1/T2 high-resolution Change representation."""
-        c1 = self.temporal_reduce(pixel_features_t1)
-        c2 = self.temporal_reduce(pixel_features_t2)
-        return self.change_fuse(
-            torch.cat((c1, c2, (c2 - c1).abs(), c1 * c2), dim=1)
-        )
-
-    def fuse_temporal(
-        self,
-        t1: ImageSingleAdapterOutput,
-        t2: ImageSingleAdapterOutput,
-        *,
-        output_sizes: Sequence[Tuple[int, int]],
-    ) -> ImageAdapterOutput:
-        """Produce two-temporal K/V Memory and full-resolution Change features.
-
-        Exactly the same public staged pipeline as PointAdapter.fuse_temporal.
-        The Memory interface is shared, while the Dense feature names remain
-        modality-specific (pixel_features vs point_features).
-        """
-        mem1, mem2 = t1.memory_features, t2.memory_features
-        if mem1.ndim != 4 or mem2.shape != mem1.shape:
-            raise ValueError('T1/T2 image memory maps must have the same [B,D,Hv,Wv] shape')
-        b, channels, hv, wv = mem1.shape
-        if channels != self.decoder_dim:
-            raise ValueError('Image memory channel count differs from decoder_dim')
-        if t1.pixel_features.shape != t2.pixel_features.shape:
-            raise ValueError('T1/T2 full-resolution image feature shapes must match')
-        if len(output_sizes) != b:
-            raise ValueError('output_sizes must contain B entries')
-        sizes = tuple((int(h), int(w)) for h, w in output_sizes)
-        if any(h <= 0 or w <= 0 for h, w in sizes):
-            raise ValueError('output_sizes must be positive')
-
-        change = self._fuse_temporal_features(t1.pixel_features, t2.pixel_features)
-        memory = torch.cat((mem1.flatten(2).transpose(1, 2),
-                            mem2.flatten(2).transpose(1, 2)), dim=1)
-        count = hv * wv
-        memory_time_ids = torch.cat((
-            torch.ones((b, count), device=mem1.device, dtype=torch.long),
-            torch.full((b, count), 2, device=mem1.device, dtype=torch.long),
-        ), dim=1)
-        return ImageAdapterOutput(
-            memory=memory,
-            memory_time_ids=memory_time_ids,
-            pixel_features_t1=t1.pixel_features,
-            pixel_features_t2=t2.pixel_features,
-            change_features=change,
-            output_sizes=sizes,
-        )
-
-    def encode_single(
-        self,
-        *,
-        premerge: Mapping[int, torch.Tensor],
-        llm_visual: Any,
-        rgb: torch.Tensor,
-        name: str = 'llm_visual',
-    ) -> ImageSingleAdapterOutput:
-        """Encode one temporal image after shared RGB preparation.
-
-        premerge is the restored ViT map dictionary, llm_visual contains
-        native Qwen LLM visual-position hidden (not a positional embedding).
-        rgb must be an already prepared [B,3,Hp,Wp] floating-point tensor.
-        Both temporal calls use exactly the same learnable weights.
-        """
-        b, hv, wv, device = self._validate_vision_maps(premerge, name + '_premerge')
-        if next(self.parameters()).device != device:
-            raise ValueError('ImageAdapter and ViT features must be on the same device')
-        if not torch.is_tensor(rgb) or rgb.ndim != 4 or rgb.shape[:2] != (b, 3):
-            raise ValueError('rgb must be a prepared [B,3,Hp,Wp] tensor')
-        if rgb.device != device:
-            raise ValueError('rgb and ViT maps must be on the same device')
-        spatial_memory_map = self._encode_spatial_memory(
-            premerge, llm_visual, batch_size=b, spatial_hw=(hv, wv), name=name,
-        )
-        pixel_features = self._encode_spatial_features(spatial_memory_map, rgb)
-        return ImageSingleAdapterOutput(
-            memory_features=spatial_memory_map,
-            pixel_features=pixel_features,
-        )
-
+    # Two-temporal features, memory, and prediction bridge.
     def _fuse_temporal_features(
         self,
         pixel_features_t1: torch.Tensor,
@@ -550,24 +444,32 @@ class ImageAdapter(nn.Module):
         llm_visual_t2: Any,
         images_t1: ImageInput,
         images_t2: ImageInput,
-        pixel_size: Optional[Tuple[int,int]] = None,
-        output_sizes: Optional[Sequence[Tuple[int,int]]] = None,
+        pixel_size: Optional[Tuple[int, int]] = None,
+        output_sizes: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> ImageAdapterOutput:
-        """Shared adapter entry: encode_single(T1/T2) -> fuse_temporal()."""
-        b, hv, wv, device = self._validate_vision_maps(premerge_t1, 'premerge_t1')
-        b2, hv2, wv2, device2 = self._validate_vision_maps(premerge_t2, 'premerge_t2')
-        if (b, hv, wv, device) != (b2, hv2, wv2, device2):
-            raise ValueError('Two temporal ViT maps must have the same batch/spatial grid')
-        if device != next(self.parameters()).device:
-            raise ValueError('ImageAdapter and ViT features must be on the same device')
-        rgb1, rgb2, sizes = self._prepare_rgb_pair(
-            images_t1, images_t2, batch_size=b, device=device,
+        """Encode T1/T2 once, then combine their spatial features and memory."""
+        # Only extract dimensions for RGB preparation. Do not validate premerge
+        # twice: encode_single() validates the complete ViT map for each phase.
+        if not isinstance(premerge_t1, Mapping):
+            raise TypeError("premerge_t1 must map ViT layer indices to tensors")
+        reference = premerge_t1.get(self.layer_indices[0])
+        if not torch.is_tensor(reference) or reference.ndim != 4:
+            raise ValueError("premerge_t1 is missing a BCHW reference layer")
+        batch_size = reference.shape[0]
+        device = reference.device
+
+        rgb_t1, rgb_t2, sizes = self._prepare_rgb_pair(
+            images_t1, images_t2, batch_size=batch_size, device=device,
             pixel_size=pixel_size, output_sizes=output_sizes,
         )
-        t1 = self.encode_single(premerge=premerge_t1, llm_visual=llm_visual_t1,
-                                rgb=rgb1, name='llm_visual_t1')
-        t2 = self.encode_single(premerge=premerge_t2, llm_visual=llm_visual_t2,
-                                rgb=rgb2, name='llm_visual_t2')
+        t1 = self.encode_single(
+            premerge=premerge_t1, llm_visual=llm_visual_t1,
+            rgb=rgb_t1, name="llm_visual_t1",
+        )
+        t2 = self.encode_single(
+            premerge=premerge_t2, llm_visual=llm_visual_t2,
+            rgb=rgb_t2, name="llm_visual_t2",
+        )
         return self.fuse_temporal(t1, t2, output_sizes=sizes)
 
     def predict(

@@ -35,7 +35,7 @@ TensorOrList = Union[torch.Tensor, List[torch.Tensor]]
 
 @dataclass
 class PointAdapterConfig:
-    # Frozen Utonia output width.
+    # Utonia output width; freezing is controlled by the outer model.
     utonia_dim: int = 1386
 
     # Unified decoder working width.
@@ -162,23 +162,8 @@ def _offset_from_batch(batch: torch.Tensor) -> torch.Tensor:
 
 
 class PointAdapter(nn.Module):
-    """
-    Utonia 3D adapter with two paths, named consistently with ImageAdapter.
 
-    LLM input path:
-        raw Utonia [N,utonia_dim] -> spatial sampling [K,utonia_dim]
-        -> llm_token_project -> [K,qwen_dim] -> XYZ embedding -> <POINT>.
-        These are LLM input tokens, NOT Transformer Decoder Queries.
-
-    Spatial prediction path:
-        recovered Utonia [N,utonia_dim] -> point_project [N,decoder_dim]
-        -> optional intensity and raw-point detail residuals.
-        Temporal geometry fusion produces full-point Event features and
-        time-labeled spatial Memory, used as Decoder K/V.
-
-    The point head and Multi-box guidance are in change_decoder.py.
-    """
-
+    # Modules shared by T1 and T2.
     def __init__(self, config: Optional[PointAdapterConfig] = None):
         super().__init__()
         self.config = config or PointAdapterConfig()
@@ -205,7 +190,7 @@ class PointAdapter(nn.Module):
             raise ValueError("detail/event residual strengths must be inside (0,1)")
 
         # ------------------------------------------------------------------
-        # Spatial feature branch: frozen Utonia representation -> PAIR decoder width.
+        # Spatial feature branch: Utonia representation -> PAIR decoder width.
         # ------------------------------------------------------------------
         self.point_project = nn.Sequential(
             nn.Linear(cfg.utonia_dim, cfg.decoder_dim),
@@ -289,9 +274,7 @@ class PointAdapter(nn.Module):
         self.qwen_dim = cfg.qwen_dim
         self.llm_tokens_per_cloud = cfg.llm_tokens_per_cloud
 
-    # ------------------------------------------------------------------
-    # Input normalization / validation
-    # ------------------------------------------------------------------
+    # Input preparation and validation.
     def _extract(self, point_encoded: Any):
         if torch.is_tensor(point_encoded):
             features = point_encoded
@@ -427,9 +410,7 @@ class PointAdapter(nn.Module):
             intensity_mask,
         )
 
-    # ------------------------------------------------------------------
-    # Spatial feature branch
-    # ------------------------------------------------------------------
+    # Single-temporal full-resolution spatial features.
     def _project_point_features(
         self,
         features: torch.Tensor,
@@ -467,9 +448,6 @@ class PointAdapter(nn.Module):
         dense = geometry + delta * mask
         return dense, bool(intensity_mask.any().item())
 
-    # ------------------------------------------------------------------
-    # Original-resolution point detail. Inputs are NOT fed into Utonia.
-    # ------------------------------------------------------------------
     @staticmethod
     def _raw_attribute(raw: Optional[Dict[str, torch.Tensor]], name: str,
                        n: int, width: int, device: torch.device,
@@ -573,6 +551,338 @@ class PointAdapter(nn.Module):
         )
         return self._fuse_point_detail(point_features, detail), intensity_used
 
+    # Single-temporal Qwen LLM point tokens.
+    def _uniform_indices(self, n: int, device: torch.device):
+        k = min(n, self.llm_tokens_per_cloud)
+        if k == n:
+            return torch.arange(n, device=device)
+        return torch.linspace(0, n - 1, k, device=device).long()
+
+    def _estimate_voxel_size(self, coord: torch.Tensor) -> float:
+        if self.config.llm_voxel_size is not None:
+            return float(self.config.llm_voxel_size)
+
+        extent = (
+            coord.float().amax(0) - coord.float().amin(0)
+        ).clamp_min(1e-6)
+
+        xy_extent = float(torch.max(extent[:2]).item())
+        if xy_extent <= 1e-6:
+            xy_extent = float(torch.max(extent).item())
+
+        target_regions = max(
+            float(self.llm_tokens_per_cloud)
+            * self.config.llm_voxel_oversample_factor,
+            1.0,
+        )
+        cells_per_axis = math.sqrt(target_regions)
+        return max(xy_extent / max(cells_per_axis, 1.0), 1e-6)
+
+    def _voxel_pool(
+        self,
+        features: torch.Tensor,
+        coord: torch.Tensor,
+    ):
+        """
+        Mean-pool RAW Utonia features and XYZ inside spatial voxels.
+
+        features is intentionally [N,utonia_dim] here: LLM sampling happens
+        before the point projection to decoder_dim.
+        """
+        llm_voxel_size = self._estimate_voxel_size(coord)
+
+        # Pool in FP32 for numerical stability, then restore source dtype.
+        feat_f = features.float()
+        coord_f = coord.float()
+
+        origin = coord_f.amin(0, keepdim=True)
+        grid = torch.floor((coord_f - origin) / llm_voxel_size).long()
+
+        _, inverse = torch.unique(
+            grid,
+            dim=0,
+            sorted=True,
+            return_inverse=True,
+        )
+        m = int(inverse.max().item()) + 1
+
+        pooled_feat = torch.zeros(
+            m,
+            feat_f.shape[1],
+            device=features.device,
+            dtype=feat_f.dtype,
+        )
+        pooled_coord = torch.zeros(
+            m,
+            3,
+            device=coord.device,
+            dtype=coord_f.dtype,
+        )
+        counts = torch.zeros(
+            m,
+            1,
+            device=features.device,
+            dtype=feat_f.dtype,
+        )
+
+        pooled_feat.index_add_(0, inverse, feat_f)
+        pooled_coord.index_add_(0, inverse, coord_f)
+        counts.index_add_(
+            0,
+            inverse,
+            torch.ones(
+                features.shape[0],
+                1,
+                device=features.device,
+                dtype=feat_f.dtype,
+            ),
+        )
+        counts.clamp_min_(1.0)
+
+        pooled_feat = pooled_feat / counts
+        pooled_coord = pooled_coord / counts
+
+        return (
+            pooled_feat.to(features.dtype),
+            pooled_coord.to(coord.dtype),
+            llm_voxel_size,
+        )
+
+    def _preselect_candidates(self, coord: torch.Tensor):
+        n = int(coord.shape[0])
+        limit = self.config.llm_max_fps_candidates
+        if n <= limit:
+            return torch.arange(n, device=coord.device)
+
+        # Deterministic thinning before O(KN) FPS if the voxel set is huge.
+        return torch.linspace(
+            0,
+            n - 1,
+            limit,
+            device=coord.device,
+        ).long()
+
+    @staticmethod
+    def _fps_indices(coord: torch.Tensor, k: int):
+        n = int(coord.shape[0])
+        if k >= n:
+            return torch.arange(n, device=coord.device)
+
+        xyz = coord.float()
+        selected = torch.empty(
+            k,
+            dtype=torch.long,
+            device=coord.device,
+        )
+
+        centroid = xyz.mean(0, keepdim=True)
+        current = torch.argmax(((xyz - centroid) ** 2).sum(1))
+        min_dist = torch.full(
+            (n,),
+            float("inf"),
+            device=coord.device,
+            dtype=torch.float32,
+        )
+
+        for i in range(k):
+            selected[i] = current
+            distance = ((xyz - xyz[current].unsqueeze(0)) ** 2).sum(1)
+            min_dist = torch.minimum(min_dist, distance)
+            current = torch.argmax(min_dist)
+
+        return selected
+
+    def _voxel_resample(
+        self,
+        features: torch.Tensor,
+        coord: torch.Tensor,
+    ):
+        pooled_feat, pooled_coord, llm_voxel_size = self._voxel_pool(
+            features,
+            coord,
+        )
+        pooled_count = int(pooled_feat.shape[0])
+
+        candidates = self._preselect_candidates(pooled_coord)
+        candidate_coord = pooled_coord[candidates]
+
+        k = min(self.llm_tokens_per_cloud, int(candidate_coord.shape[0]))
+        local_idx = self._fps_indices(candidate_coord, k)
+        selected_idx = candidates[local_idx]
+
+        return (
+            pooled_feat[selected_idx],
+            pooled_coord[selected_idx],
+            selected_idx,
+            pooled_count,
+            llm_voxel_size,
+        )
+
+    @staticmethod
+    def _normalize_llm_xyz(
+        llm_sampled_xyz: torch.Tensor,
+        dense_coord: torch.Tensor,
+    ):
+        dense = dense_coord.float()
+        xyz_min = dense.amin(0)
+        xyz_max = dense.amax(0)
+        center = (xyz_min + xyz_max) * 0.5
+        scale = ((xyz_max - xyz_min).max() * 0.5).clamp_min(1e-6)
+        return (llm_sampled_xyz.float() - center) / scale
+
+    def _project_llm_point_tokens(
+        self,
+        llm_sampled_features: torch.Tensor,
+        llm_sampled_xyz: torch.Tensor,
+        dense_coord: torch.Tensor,
+    ):
+        if llm_sampled_features.ndim != 2:
+            raise ValueError(
+                "llm_sampled_features must be [K,C], got "
+                f"{tuple(llm_sampled_features.shape)}"
+            )
+        if llm_sampled_features.shape[1] != self.utonia_dim:
+            raise ValueError(
+                "LLM point-token branch must receive raw Utonia features with "
+                f"dim={self.utonia_dim}, got {llm_sampled_features.shape[1]}"
+            )
+
+        # Raw Utonia feature [K,1386] -> Qwen hidden [K,2560].
+        llm_point_tokens = self.llm_token_project(llm_sampled_features.to(dtype=self.llm_token_project.weight.dtype))
+
+        if self.llm_xyz_position is not None:
+            xyz = self._normalize_llm_xyz(llm_sampled_xyz, dense_coord)
+            xyz_embed = self.llm_xyz_position(
+                xyz.to(dtype=self.llm_xyz_position[0].weight.dtype)
+            ).to(dtype=llm_point_tokens.dtype)
+            llm_point_tokens = llm_point_tokens + xyz_embed
+
+        return self.llm_token_norm(llm_point_tokens)
+
+    def encode_single(self, point_encoded: Any,
+                              *, raw_point_dict: Optional[Dict[str,torch.Tensor]] = None
+                              ) -> PointSingleAdapterOutput:
+        (
+            features,
+            coord,
+            batch,
+            offset,
+            intensity,
+            intensity_mask,
+        ) = self._extract(point_encoded)
+
+        # --------------------------------------------------------------
+        # Branch A: full-resolution spatial point features.
+        # --------------------------------------------------------------
+        point_features, intensity_used = self._encode_spatial_features(
+            features, coord, batch, intensity, intensity_mask, raw_point_dict,
+        )
+
+        # --------------------------------------------------------------
+        # Branch B: Qwen LLM point tokens.
+        #
+        # Sample raw Utonia features BEFORE point projection to decoder_dim.
+        # --------------------------------------------------------------
+        num_batches = int(offset.numel())
+
+        llm_tokens_all = []
+        llm_features_all = []
+        llm_xyz_all = []
+        llm_indices_all = []
+        pooled_counts = []
+        voxel_sizes = []
+
+        for batch_id in range(num_batches):
+            mask = batch == batch_id
+            if not mask.any():
+                raise RuntimeError(
+                    f"empty cloud at batch index {batch_id}"
+                )
+
+            # LLM input tokens are sampled from raw Utonia, not from point_features.
+            local_llm_features = features[mask]  # [Nb,1386]
+            local_coord = coord[mask]
+
+            if self.config.llm_sampling == "uniform":
+                idx = self._uniform_indices(
+                    local_llm_features.shape[0],
+                    local_llm_features.device,
+                )
+                llm_sampled_features = local_llm_features[idx]
+                llm_sampled_xyz = local_coord[idx]
+                pooled_count = int(local_llm_features.shape[0])
+                llm_voxel_size = None
+            else:
+                (
+                    llm_sampled_features,
+                    llm_sampled_xyz,
+                    idx,
+                    pooled_count,
+                    llm_voxel_size,
+                ) = self._voxel_resample(
+                    local_llm_features,
+                    local_coord,
+                )
+
+            llm_point_tokens = self._project_llm_point_tokens(
+                llm_sampled_features,
+                llm_sampled_xyz,
+                local_coord,
+            )
+
+            if llm_point_tokens.ndim != 2 or llm_point_tokens.shape[1] != self.qwen_dim:
+                raise RuntimeError(
+                    f"unexpected token shape {tuple(llm_point_tokens.shape)}"
+                )
+            if llm_point_tokens.shape[0] > self.llm_tokens_per_cloud:
+                raise RuntimeError(
+                    "Qwen <POINT> token budget exceeded"
+                )
+            if not torch.isfinite(llm_point_tokens).all():
+                raise RuntimeError(
+                    "PointAdapter produced NaN/Inf LLM point tokens"
+                )
+
+            llm_tokens_all.append(llm_point_tokens)
+            llm_features_all.append(llm_sampled_features)
+            llm_xyz_all.append(llm_sampled_xyz)
+            llm_indices_all.append(idx)
+            pooled_counts.append(pooled_count)
+            voxel_sizes.append(
+                None if llm_voxel_size is None else float(llm_voxel_size)
+            )
+
+        if num_batches == 1:
+            llm_tokens_out = llm_tokens_all[0]
+            llm_features_out = llm_features_all[0]
+            llm_xyz_out = llm_xyz_all[0]
+            llm_indices_out = llm_indices_all[0]
+            pooled_counts_out = pooled_counts[0]
+            voxel_sizes_out = voxel_sizes[0]
+        else:
+            llm_tokens_out = llm_tokens_all
+            llm_features_out = llm_features_all
+            llm_xyz_out = llm_xyz_all
+            llm_indices_out = llm_indices_all
+            pooled_counts_out = pooled_counts
+            voxel_sizes_out = voxel_sizes
+
+        return PointSingleAdapterOutput(
+            llm_point_tokens=llm_tokens_out,
+            llm_sampled_features=llm_features_out,
+            llm_sampled_xyz=llm_xyz_out,
+            llm_sampled_indices=llm_indices_out,
+            point_features=point_features,
+            point_xyz=coord,
+            point_batch=batch,
+            point_offset=offset,
+            original_point_count=int(features.shape[0]),
+            llm_pooled_voxel_count=pooled_counts_out,
+            llm_effective_voxel_size=voxel_sizes_out,
+            intensity_used=intensity_used,
+        )
+
+    # Two-temporal matching, event features, and memory.
     @staticmethod
     def _packed_grid(xyz: torch.Tensor, origin: torch.Tensor,
                      cell_size: float, limits: torch.Tensor) -> torch.Tensor:
@@ -758,345 +1068,7 @@ class PointAdapter(nn.Module):
             **decoder_kwargs,
         )
 
-    # ------------------------------------------------------------------
-    # Per-cloud spatial sampling for the LLM point-token branch
-    # ------------------------------------------------------------------
-    def _uniform_indices(self, n: int, device: torch.device):
-        k = min(n, self.llm_tokens_per_cloud)
-        if k == n:
-            return torch.arange(n, device=device)
-        return torch.linspace(0, n - 1, k, device=device).long()
-
-    def _estimate_voxel_size(self, coord: torch.Tensor) -> float:
-        if self.config.llm_voxel_size is not None:
-            return float(self.config.llm_voxel_size)
-
-        extent = (
-            coord.float().amax(0) - coord.float().amin(0)
-        ).clamp_min(1e-6)
-
-        xy_extent = float(torch.max(extent[:2]).item())
-        if xy_extent <= 1e-6:
-            xy_extent = float(torch.max(extent).item())
-
-        target_regions = max(
-            float(self.llm_tokens_per_cloud)
-            * self.config.llm_voxel_oversample_factor,
-            1.0,
-        )
-        cells_per_axis = math.sqrt(target_regions)
-        return max(xy_extent / max(cells_per_axis, 1.0), 1e-6)
-
-    def _voxel_pool(
-        self,
-        features: torch.Tensor,
-        coord: torch.Tensor,
-    ):
-        """
-        Mean-pool RAW Utonia features and XYZ inside spatial voxels.
-
-        features is intentionally [N,utonia_dim] here: LLM sampling happens
-        before the point projection to decoder_dim.
-        """
-        llm_voxel_size = self._estimate_voxel_size(coord)
-
-        # Pool in FP32 for numerical stability, then restore source dtype.
-        feat_f = features.float()
-        coord_f = coord.float()
-
-        origin = coord_f.amin(0, keepdim=True)
-        grid = torch.floor((coord_f - origin) / llm_voxel_size).long()
-
-        _, inverse = torch.unique(
-            grid,
-            dim=0,
-            sorted=True,
-            return_inverse=True,
-        )
-        m = int(inverse.max().item()) + 1
-
-        pooled_feat = torch.zeros(
-            m,
-            feat_f.shape[1],
-            device=features.device,
-            dtype=feat_f.dtype,
-        )
-        pooled_coord = torch.zeros(
-            m,
-            3,
-            device=coord.device,
-            dtype=coord_f.dtype,
-        )
-        counts = torch.zeros(
-            m,
-            1,
-            device=features.device,
-            dtype=feat_f.dtype,
-        )
-
-        pooled_feat.index_add_(0, inverse, feat_f)
-        pooled_coord.index_add_(0, inverse, coord_f)
-        counts.index_add_(
-            0,
-            inverse,
-            torch.ones(
-                features.shape[0],
-                1,
-                device=features.device,
-                dtype=feat_f.dtype,
-            ),
-        )
-        counts.clamp_min_(1.0)
-
-        pooled_feat = pooled_feat / counts
-        pooled_coord = pooled_coord / counts
-
-        return (
-            pooled_feat.to(features.dtype),
-            pooled_coord.to(coord.dtype),
-            llm_voxel_size,
-        )
-
-    def _preselect_candidates(self, coord: torch.Tensor):
-        n = int(coord.shape[0])
-        limit = self.config.llm_max_fps_candidates
-        if n <= limit:
-            return torch.arange(n, device=coord.device)
-
-        # Deterministic thinning before O(KN) FPS if the voxel set is huge.
-        return torch.linspace(
-            0,
-            n - 1,
-            limit,
-            device=coord.device,
-        ).long()
-
-    @staticmethod
-    def _fps_indices(coord: torch.Tensor, k: int):
-        n = int(coord.shape[0])
-        if k >= n:
-            return torch.arange(n, device=coord.device)
-
-        xyz = coord.float()
-        selected = torch.empty(
-            k,
-            dtype=torch.long,
-            device=coord.device,
-        )
-
-        centroid = xyz.mean(0, keepdim=True)
-        current = torch.argmax(((xyz - centroid) ** 2).sum(1))
-        min_dist = torch.full(
-            (n,),
-            float("inf"),
-            device=coord.device,
-            dtype=torch.float32,
-        )
-
-        for i in range(k):
-            selected[i] = current
-            distance = ((xyz - xyz[current].unsqueeze(0)) ** 2).sum(1)
-            min_dist = torch.minimum(min_dist, distance)
-            current = torch.argmax(min_dist)
-
-        return selected
-
-    def _voxel_resample(
-        self,
-        features: torch.Tensor,
-        coord: torch.Tensor,
-    ):
-        pooled_feat, pooled_coord, llm_voxel_size = self._voxel_pool(
-            features,
-            coord,
-        )
-        pooled_count = int(pooled_feat.shape[0])
-
-        candidates = self._preselect_candidates(pooled_coord)
-        candidate_coord = pooled_coord[candidates]
-
-        k = min(self.llm_tokens_per_cloud, int(candidate_coord.shape[0]))
-        local_idx = self._fps_indices(candidate_coord, k)
-        selected_idx = candidates[local_idx]
-
-        return (
-            pooled_feat[selected_idx],
-            pooled_coord[selected_idx],
-            selected_idx,
-            pooled_count,
-            llm_voxel_size,
-        )
-
-    # ------------------------------------------------------------------
-    # Qwen LLM-point-token projection
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _normalize_llm_xyz(
-        llm_sampled_xyz: torch.Tensor,
-        dense_coord: torch.Tensor,
-    ):
-        dense = dense_coord.float()
-        xyz_min = dense.amin(0)
-        xyz_max = dense.amax(0)
-        center = (xyz_min + xyz_max) * 0.5
-        scale = ((xyz_max - xyz_min).max() * 0.5).clamp_min(1e-6)
-        return (llm_sampled_xyz.float() - center) / scale
-
-    def _project_llm_point_tokens(
-        self,
-        llm_sampled_features: torch.Tensor,
-        llm_sampled_xyz: torch.Tensor,
-        dense_coord: torch.Tensor,
-    ):
-        if llm_sampled_features.ndim != 2:
-            raise ValueError(
-                "llm_sampled_features must be [K,C], got "
-                f"{tuple(llm_sampled_features.shape)}"
-            )
-        if llm_sampled_features.shape[1] != self.utonia_dim:
-            raise ValueError(
-                "LLM point-token branch must receive raw Utonia features with "
-                f"dim={self.utonia_dim}, got {llm_sampled_features.shape[1]}"
-            )
-
-        # Raw Utonia feature [K,1386] -> Qwen hidden [K,2560].
-        llm_point_tokens = self.llm_token_project(llm_sampled_features.to(dtype=self.llm_token_project.weight.dtype))
-
-        if self.llm_xyz_position is not None:
-            xyz = self._normalize_llm_xyz(llm_sampled_xyz, dense_coord)
-            xyz_embed = self.llm_xyz_position(
-                xyz.to(dtype=self.llm_xyz_position[0].weight.dtype)
-            ).to(dtype=llm_point_tokens.dtype)
-            llm_point_tokens = llm_point_tokens + xyz_embed
-
-        return self.llm_token_norm(llm_point_tokens)
-
-    # ------------------------------------------------------------------
-    # One-epoch feature encoding (called before and/or after Qwen forward)
-    # ------------------------------------------------------------------
-    def encode_single(self, point_encoded: Any,
-                              *, raw_point_dict: Optional[Dict[str,torch.Tensor]] = None
-                              ) -> PointSingleAdapterOutput:
-        (
-            features,
-            coord,
-            batch,
-            offset,
-            intensity,
-            intensity_mask,
-        ) = self._extract(point_encoded)
-
-        # --------------------------------------------------------------
-        # Branch A: full-resolution spatial point features.
-        # --------------------------------------------------------------
-        point_features, intensity_used = self._encode_spatial_features(
-            features, coord, batch, intensity, intensity_mask, raw_point_dict,
-        )
-
-        # --------------------------------------------------------------
-        # Branch B: Qwen LLM point tokens.
-        #
-        # Sample raw Utonia features BEFORE point projection to decoder_dim.
-        # --------------------------------------------------------------
-        num_batches = int(offset.numel())
-
-        llm_tokens_all = []
-        llm_features_all = []
-        llm_xyz_all = []
-        llm_indices_all = []
-        pooled_counts = []
-        voxel_sizes = []
-
-        for batch_id in range(num_batches):
-            mask = batch == batch_id
-            if not mask.any():
-                raise RuntimeError(
-                    f"empty cloud at batch index {batch_id}"
-                )
-
-            # LLM input tokens are sampled from raw Utonia, not from point_features.
-            local_llm_features = features[mask]  # [Nb,1386]
-            local_coord = coord[mask]
-
-            if self.config.llm_sampling == "uniform":
-                idx = self._uniform_indices(
-                    local_llm_features.shape[0],
-                    local_llm_features.device,
-                )
-                llm_sampled_features = local_llm_features[idx]
-                llm_sampled_xyz = local_coord[idx]
-                pooled_count = int(local_llm_features.shape[0])
-                llm_voxel_size = None
-            else:
-                (
-                    llm_sampled_features,
-                    llm_sampled_xyz,
-                    idx,
-                    pooled_count,
-                    llm_voxel_size,
-                ) = self._voxel_resample(
-                    local_llm_features,
-                    local_coord,
-                )
-
-            llm_point_tokens = self._project_llm_point_tokens(
-                llm_sampled_features,
-                llm_sampled_xyz,
-                local_coord,
-            )
-
-            if llm_point_tokens.ndim != 2 or llm_point_tokens.shape[1] != self.qwen_dim:
-                raise RuntimeError(
-                    f"unexpected token shape {tuple(llm_point_tokens.shape)}"
-                )
-            if llm_point_tokens.shape[0] > self.llm_tokens_per_cloud:
-                raise RuntimeError(
-                    "Qwen <POINT> token budget exceeded"
-                )
-            if not torch.isfinite(llm_point_tokens).all():
-                raise RuntimeError(
-                    "PointAdapter produced NaN/Inf LLM point tokens"
-                )
-
-            llm_tokens_all.append(llm_point_tokens)
-            llm_features_all.append(llm_sampled_features)
-            llm_xyz_all.append(llm_sampled_xyz)
-            llm_indices_all.append(idx)
-            pooled_counts.append(pooled_count)
-            voxel_sizes.append(
-                None if llm_voxel_size is None else float(llm_voxel_size)
-            )
-
-        if num_batches == 1:
-            llm_tokens_out = llm_tokens_all[0]
-            llm_features_out = llm_features_all[0]
-            llm_xyz_out = llm_xyz_all[0]
-            llm_indices_out = llm_indices_all[0]
-            pooled_counts_out = pooled_counts[0]
-            voxel_sizes_out = voxel_sizes[0]
-        else:
-            llm_tokens_out = llm_tokens_all
-            llm_features_out = llm_features_all
-            llm_xyz_out = llm_xyz_all
-            llm_indices_out = llm_indices_all
-            pooled_counts_out = pooled_counts
-            voxel_sizes_out = voxel_sizes
-
-        return PointSingleAdapterOutput(
-            llm_point_tokens=llm_tokens_out,
-            llm_sampled_features=llm_features_out,
-            llm_sampled_xyz=llm_xyz_out,
-            llm_sampled_indices=llm_indices_out,
-            point_features=point_features,
-            point_xyz=coord,
-            point_batch=batch,
-            point_offset=offset,
-            original_point_count=int(features.shape[0]),
-            llm_pooled_voxel_count=pooled_counts_out,
-            llm_effective_voxel_size=voxel_sizes_out,
-            intensity_used=intensity_used,
-        )
-
+    # Parameter statistics.
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
@@ -1106,67 +1078,3 @@ class PointAdapter(nn.Module):
             for p in self.parameters()
             if p.requires_grad
         )
-
-
-if __name__ == "__main__":
-    cfg = PointAdapterConfig()
-    adapter = PointAdapter(cfg)
-
-    n1, n2 = 2500, 4200
-    n = n1 + n2
-
-    coord = torch.randn(n, 3)
-    feat = torch.randn(n, cfg.utonia_dim)
-    batch = torch.cat([
-        torch.zeros(n1, dtype=torch.long),
-        torch.ones(n2, dtype=torch.long),
-    ])
-
-    intensity = torch.rand(n, 1)
-    intensity_mask = torch.cat([
-        torch.zeros(n1, 1, dtype=torch.bool),
-        torch.ones(n2, 1, dtype=torch.bool),
-    ])
-
-    out = adapter.encode_single({
-        "features": feat,
-        "coord": coord,
-        "batch": batch,
-        "intensity": intensity,
-        "intensity_mask": intensity_mask,
-    })
-
-    assert out.point_features.shape == (n, cfg.decoder_dim)
-    assert isinstance(out.llm_point_tokens, list) and len(out.llm_point_tokens) == 2
-    assert all(
-        x.ndim == 2
-        and x.shape[1] == cfg.qwen_dim
-        and x.shape[0] <= cfg.llm_tokens_per_cloud
-        for x in out.llm_point_tokens
-    )
-
-    # LLM samples retain raw Utonia channel width.
-    assert isinstance(out.llm_sampled_features, list)
-    assert all(
-        x.ndim == 2 and x.shape[1] == cfg.utonia_dim
-        for x in out.llm_sampled_features
-    )
-
-    # Geometry-only path must not require intensity.
-    geo = adapter.encode_single({
-        "features": feat[:n1],
-        "coord": coord[:n1],
-        "batch": torch.zeros(n1, dtype=torch.long),
-    })
-    assert geo.point_features.shape == (n1, cfg.decoder_dim)
-    assert geo.intensity_used is False
-    assert geo.llm_sampled_features.shape[1] == cfg.utonia_dim
-
-    print("PointAdapter standalone tests: PASS")
-    print("dense:", tuple(out.point_features.shape))
-    print("tokens:", [tuple(x.shape) for x in out.llm_point_tokens])
-    print(
-        "sampled raw Utonia features:",
-        [tuple(x.shape) for x in out.llm_sampled_features],
-    )
-    print("trainable params:", adapter.trainable_parameter_count())
