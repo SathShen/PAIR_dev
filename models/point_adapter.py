@@ -1,12 +1,16 @@
-"""PAIR 3D point adapter: Utonia + LLM point tokens + spatial prediction features.
+"""PAIR 3D adapter: Utonia and native Qwen point-position hidden -> spatial features.
 
 The public terminology mirrors image_adapter.py:
   * LLM path: pretrained Utonia [N,utonia_dim] -> spatial sampling ->
     llm_point_tokens [K,qwen_dim], consumed by Qwen's <POINT> positions.
-  * Spatial path: original point Utonia -> point detail MLP -> full-resolution
-    point_features [N,decoder_dim]. This builds dense spatial memory (K/V).
-  * Temporal path: T1/T2 coordinate-based matching -> event_features,
-    and capped per-epoch spatial memory tokens for shared Query Decoder.
+  * Spatial path: recovered Utonia stages [54,108,216,432,576] -> separate
+    learned level projections -> fused spatial features [N,D]. Native Qwen
+    point-position hidden is then projected/aligned and fused into K/V memory.
+  * Dense path: fused spatial features -> original point detail MLP ->
+    point_features [N,D]. K/V is sampled BEFORE original point detail,
+    matching ImageAdapter's memory-then-high-resolution feature sequence.
+  * Decoder handles all temporal matching and Event feature creation.
+    This adapter only returns memory, full-resolution point features, and XYZ.
 
 PointSingleAdapterOutput is a SINGLE-cloud output. PointAdapterOutput matches
 ImageAdapterOutput's PAIR-level role: a two-epoch spatial adapter result with
@@ -15,7 +19,8 @@ and 3D MultiBoxGuidance remain in change_decoder.py.
 
 This module does NOT create the task Query: Qwen returns task_hidden after it
 processes llm_point_tokens, and change_decoder.py builds initial task Queries.
-Nor does it currently re-inject LLM point-position hidden into 3D memory.
+LLM point-position hidden must be supplied after Qwen forward in the SAME
+order as llm_point_tokens; sampled XYZ provides the geometry for alignment.
 """
 
 from __future__ import annotations
@@ -26,7 +31,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
@@ -37,6 +41,12 @@ TensorOrList = Union[torch.Tensor, List[torch.Tensor]]
 class PointAdapterConfig:
     # Utonia output width; freezing is controlled by the outer model.
     utonia_dim: int = 1386
+    # Utonia encoder stage channel order matches point_encoder._recover_multiscale.
+    # For nonstandard small models, None falls back to a single stage; set this
+    # explicitly for custom multi-stage Utonia encoders.
+    utonia_stage_channels: Optional[Tuple[int, ...]] = None
+    utonia_chunk_size: int = 4096
+    utonia_checkpoint: bool = True
 
     # Unified decoder working width.
     decoder_dim: int = 256
@@ -68,22 +78,19 @@ class PointAdapterConfig:
     detail_residual_init: float = 0.10
     subvoxel_size: float = 0.5
 
-    # Coarse coordinate-based temporal comparison; no N1 x N2 cdist.
-    temporal_cell_size: float = 0.5
-    event_hidden_dim: int = 64
-    event_chunk_size: int = 8192
-    event_checkpoint: bool = True
-    event_residual_init: float = 0.10
-
     # Spatial representatives are used only for Decoder Memory. Final
     # logits still cover EVERY original input point.
     memory_tokens_per_cloud: int = 1024
     memory_cell_size: float = 0.5
 
+    # Bounded XYZ alignment from Qwen point-position hidden to original points.
+    llm_align_chunk_size: int = 2048
+    llm_align_neighbors: int = 3
+
 
 @dataclass
 class PointSingleAdapterOutput:
-    """Single-epoch Utonia: LLM point tokens and full-resolution point features."""
+    """Single epoch before Qwen: Utonia memory base, point detail and LLM tokens."""
     # Tensor for B=1, list[Tensor] for B>1.
     llm_point_tokens: TensorOrList
 
@@ -92,8 +99,12 @@ class PointSingleAdapterOutput:
     llm_sampled_xyz: TensorOrList
     llm_sampled_indices: TensorOrList
 
-    # Original point topology, ready for the new shared change decoder.
-    point_features: torch.Tensor
+    # Deliberately NOT final point features: Qwen hidden is fused AFTER this
+    # stage, and original-resolution detail is attached only after K/V creation.
+    memory_features: torch.Tensor      # [N,D] 5 Utonia levels fused, pre-Qwen
+    point_detail: torch.Tensor         # [N,16] raw XYZ/RGB/normal/intensity
+    point_intensity: Optional[torch.Tensor]
+    point_intensity_mask: Optional[torch.Tensor]
     point_xyz: torch.Tensor
     point_batch: torch.Tensor
     point_offset: torch.Tensor
@@ -115,15 +126,11 @@ class PointAdapterOutput:
     memory_time_ids: torch.Tensor        # [B,L], 0=pad, 1=T1, 2=T2
     point_features_t1: torch.Tensor      # [N1,256]
     point_features_t2: torch.Tensor      # [N2,256]
-    event_features_t1: torch.Tensor      # [N1,256]
-    event_features_t2: torch.Tensor      # [N2,256]
     point_batch_t1: torch.Tensor         # [N1]
     point_batch_t2: torch.Tensor         # [N2]
     point_xyz_t1: torch.Tensor           # [N1,3], original reference frame
     point_xyz_t2: torch.Tensor           # [N2,3]
     box_scene_bounds: torch.Tensor       # [B,2,3], common T1/T2 bounds
-    temporal_match_ratio_t1: float
-    temporal_match_ratio_t2: float
 
     def decoder_inputs(self) -> Dict[str, torch.Tensor]:
         return {
@@ -131,8 +138,6 @@ class PointAdapterOutput:
             "memory_time_ids": self.memory_time_ids,
             "point_features_t1": self.point_features_t1,
             "point_features_t2": self.point_features_t2,
-            "event_features_t1": self.event_features_t1,
-            "event_features_t2": self.event_features_t2,
             "point_batch_t1": self.point_batch_t1,
             "point_batch_t2": self.point_batch_t2,
             "point_xyz_t1": self.point_xyz_t1,
@@ -171,6 +176,20 @@ class PointAdapter(nn.Module):
 
         if min(cfg.utonia_dim, cfg.decoder_dim, cfg.qwen_dim, cfg.llm_tokens_per_cloud) <= 0:
             raise ValueError("feature dimensions and llm_tokens_per_cloud must be > 0")
+        if cfg.utonia_chunk_size <= 0:
+            raise ValueError("utonia_chunk_size must be positive")
+        if cfg.utonia_stage_channels is None:
+            # Official Utonia has five recovered scales, not one 1386D level.
+            self.utonia_stage_channels = (
+                (54, 108, 216, 432, 576) if cfg.utonia_dim == 1386
+                else (cfg.utonia_dim,)
+            )
+        else:
+            self.utonia_stage_channels = tuple(int(v) for v in cfg.utonia_stage_channels)
+        if (not self.utonia_stage_channels
+                or min(self.utonia_stage_channels) <= 0
+                or sum(self.utonia_stage_channels) != cfg.utonia_dim):
+            raise ValueError("utonia_stage_channels must be positive and sum to utonia_dim")
         if cfg.intensity_hidden_dim <= 0:
             raise ValueError("intensity_hidden_dim must be > 0")
         if cfg.llm_sampling not in ("voxel", "uniform"):
@@ -181,24 +200,36 @@ class PointAdapter(nn.Module):
             raise ValueError("voxel_oversample_factor must be > 0")
         if cfg.llm_max_fps_candidates < cfg.llm_tokens_per_cloud:
             raise ValueError("llm_max_fps_candidates must be >= llm_tokens_per_cloud")
-        if min(cfg.detail_hidden_dim, cfg.detail_chunk_size, cfg.event_hidden_dim,
-               cfg.event_chunk_size, cfg.memory_tokens_per_cloud) <= 0:
-            raise ValueError("point-detail, event, and memory dimensions must be positive")
-        if min(cfg.subvoxel_size, cfg.temporal_cell_size, cfg.memory_cell_size) <= 0:
+        if min(cfg.detail_hidden_dim, cfg.detail_chunk_size, cfg.memory_tokens_per_cloud) <= 0:
+            raise ValueError("point-detail and memory dimensions must be positive")
+        if min(cfg.llm_align_chunk_size, cfg.llm_align_neighbors) <= 0:
+            raise ValueError("llm_align_chunk_size and llm_align_neighbors must be positive")
+        if min(cfg.subvoxel_size, cfg.memory_cell_size) <= 0:
             raise ValueError("point spatial cell sizes must be positive")
-        if not (0 < cfg.detail_residual_init < 1 and 0 < cfg.event_residual_init < 1):
-            raise ValueError("detail/event residual strengths must be inside (0,1)")
+        if not 0 < cfg.detail_residual_init < 1:
+            raise ValueError("detail_residual_init must be inside (0,1)")
 
         # ------------------------------------------------------------------
-        # Spatial feature branch: Utonia representation -> PAIR decoder width.
+        # Utonia multi-scale feature fusion, corresponding to 2D level_fusion
+        # and vit_fuse. Spatial scales were already mapped to original points
+        # by point_encoder; split according to its documented concatenation.
+        # Chunk projection avoids retaining N x (5*decoder_dim) activations.
         # ------------------------------------------------------------------
-        self.point_project = nn.Sequential(
-            nn.Linear(cfg.utonia_dim, cfg.decoder_dim),
+        self.level_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(channels, cfg.decoder_dim),
+                nn.LayerNorm(cfg.decoder_dim),
+                nn.GELU(),
+            )
+            for channels in self.utonia_stage_channels
+        ])
+        self.utonia_fuse = nn.Sequential(
+            nn.Linear(len(self.utonia_stage_channels) * cfg.decoder_dim, cfg.decoder_dim),
             nn.LayerNorm(cfg.decoder_dim),
             nn.GELU(),
         )
 
-        # Optional LiDAR radiometry for the spatial feature branch.
+        # Optional LiDAR radiometry for the original-resolution detail branch.
         self.point_intensity_encoder = nn.Sequential(
             nn.Linear(1, 32),
             nn.GELU(),
@@ -255,18 +286,9 @@ class PointAdapter(nn.Module):
             math.log(cfg.detail_residual_init / (1 - cfg.detail_residual_init))
         ))
 
-        # Pairwise geometry affects Event features, not semantic features.
-        # Event match is deliberately approximate (same spatial cell), with
-        # exact zero memory if no match; later kNN refinement can replace it.
-        self.temporal_event_mlp = nn.Sequential(
-            nn.Linear(2 * cfg.decoder_dim + 2, cfg.event_hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.event_hidden_dim, cfg.decoder_dim),
-        )
-        self.temporal_event_norm = nn.LayerNorm(cfg.decoder_dim)
-        self.temporal_event_strength = nn.Parameter(torch.tensor(
-            math.log(cfg.event_residual_init / (1 - cfg.event_residual_init))
-        ))
+        # Mirrors image_adapter.llm_visual_project: this projects native
+        # post-Qwen point-position hidden, NOT the pre-Qwen point tokens.
+        self.llm_point_project = nn.Linear(cfg.qwen_dim, cfg.decoder_dim)
         self.spatial_memory_norm = nn.LayerNorm(cfg.decoder_dim)
 
         self.utonia_dim = cfg.utonia_dim
@@ -410,43 +432,47 @@ class PointAdapter(nn.Module):
             intensity_mask,
         )
 
-    # Single-temporal full-resolution spatial features.
-    def _project_point_features(
+    # Multi-scale Utonia features, before Qwen hidden and raw-point detail.
+    def _fuse_utonia_chunk(self, features: torch.Tensor) -> torch.Tensor:
+        levels = torch.split(features, self.utonia_stage_channels, dim=1)
+        projected = [module(level) for module, level in zip(self.level_fusion, levels)]
+        return self.utonia_fuse(torch.cat(projected, dim=1))
+
+    def _project_utonia_features(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2 or features.shape[1] != self.utonia_dim:
+            raise ValueError(f"Utonia features must be [N,{self.utonia_dim}]")
+        outputs = []
+        dtype = self.level_fusion[0][0].weight.dtype
+        for start in range(0, features.shape[0], self.config.utonia_chunk_size):
+            part = features[start:start + self.config.utonia_chunk_size].to(dtype=dtype)
+            if self.training and self.config.utonia_checkpoint:
+                fused = checkpoint(self._fuse_utonia_chunk, part, use_reentrant=False)
+            else:
+                fused = self._fuse_utonia_chunk(part)
+            outputs.append(fused)
+        return torch.cat(outputs, dim=0)
+
+    # The intensity side path is original-resolution detail, NOT coarse memory.
+    def _fuse_intensity(
         self,
-        features: torch.Tensor,
+        point_features: torch.Tensor,
         intensity: Optional[torch.Tensor],
         intensity_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, bool]:
-        # Utonia [N,1386] -> decoder feature [N,256].
-        geometry = self.point_project(features.to(dtype=self.point_project[0].weight.dtype))
-
-        # NYC-SCD and other XYZ-only datasets take this exact path.
+    ) -> torch.Tensor:
         if intensity is None:
-            return geometry, False
-
+            return point_features
         if intensity_mask is None:
-            raise RuntimeError(
-                "internal error: intensity exists but intensity_mask is None"
+            raise RuntimeError("intensity exists without intensity_mask")
+        mask = intensity_mask.to(dtype=point_features.dtype)
+        encoded = self.point_intensity_encoder(
+            (intensity * mask).to(dtype=self.point_intensity_encoder[0].weight.dtype)
+        ).to(dtype=point_features.dtype) * mask
+        correction = self.point_intensity_fuse(
+            torch.cat((point_features, encoded), dim=1).to(
+                dtype=self.point_intensity_fuse[0].weight.dtype
             )
-
-        mask = intensity_mask.to(dtype=geometry.dtype)
-
-        intensity_feature = self.point_intensity_encoder(
-            intensity.to(dtype=self.point_intensity_encoder[0].weight.dtype)
-            * mask.to(dtype=self.point_intensity_encoder[0].weight.dtype)
-        ).to(dtype=geometry.dtype)
-
-        # Keep invalid/missing intensity points exactly zero in the side branch.
-        intensity_feature = intensity_feature * mask
-
-        delta = self.point_intensity_fuse(
-            torch.cat([geometry, intensity_feature], dim=1).to(
-                dtype=self.point_intensity_fuse[0].weight.dtype)
-        ).to(dtype=geometry.dtype)
-
-        # Invalid/missing intensity points are exactly geometry-only.
-        dense = geometry + delta * mask
-        return dense, bool(intensity_mask.any().item())
+        ).to(dtype=point_features.dtype)
+        return point_features + correction * mask
 
     @staticmethod
     def _raw_attribute(raw: Optional[Dict[str, torch.Tensor]], name: str,
@@ -530,26 +556,94 @@ class PointAdapter(nn.Module):
         return dense + torch.sigmoid(self.point_detail_strength) * self.point_detail_norm(correction)
 
     def _encode_spatial_features(
-        self,
-        features: torch.Tensor,
-        coord: torch.Tensor,
-        batch: torch.Tensor,
-        intensity: Optional[torch.Tensor],
-        intensity_mask: Optional[torch.Tensor],
-        raw_point_dict: Optional[Dict[str, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, bool]:
-        """Utonia + original-resolution point detail, analogous to ImageAdapter.
+        self, memory_features: torch.Tensor, single: PointSingleAdapterOutput,
+    ) -> torch.Tensor:
+        """Fused K/V memory -> all original points + raw detail, as in 2D."""
+        detailed = self._fuse_point_detail(memory_features, single.point_detail)
+        return self._fuse_intensity(
+            detailed, single.point_intensity, single.point_intensity_mask,
+        )
 
-        This does not alter sampling or voxel inverse mapping: features here
-        are already aligned with the original input point order.
+    # Native Qwen point-position hidden: project and align back to every point.
+    def _llm_hidden_list(
+        self, value: TensorOrList, single: PointSingleAdapterOutput, name: str,
+    ) -> List[torch.Tensor]:
+        """Normalize post-Qwen readouts to one [Ki,qwen_dim] tensor per cloud.
+
+        The Ki rows MUST match llm_point_tokens order, including any voxel/FPS
+        sampling. This is not the same as the pre-Qwen llm_point_tokens tensor.
         """
-        point_features, intensity_used = self._project_point_features(
-            features, intensity, intensity_mask,
-        )
-        detail = self._prepare_point_detail(
-            coord, batch, raw_point_dict, intensity, intensity_mask,
-        )
-        return self._fuse_point_detail(point_features, detail), intensity_used
+        counts = single.llm_sampled_xyz
+        xyz_list = [counts] if torch.is_tensor(counts) else counts
+        batch_size = len(xyz_list)
+        if torch.is_tensor(value):
+            if batch_size == 1 and value.ndim == 2:
+                values = [value]
+            elif value.ndim == 3 and value.shape[0] == batch_size:
+                values = [value[i, :xyz_list[i].shape[0]] for i in range(batch_size)]
+                # Padded [B,K,C] is permitted, but never truncate real tokens.
+                if any(value.shape[1] < x.shape[0] for x in xyz_list):
+                    raise ValueError(f"{name}: padded tensor has fewer tokens than sampled points")
+            else:
+                raise ValueError(f"{name}: expected [K,C] for B=1 or [B,K,C]")
+        elif isinstance(value, (tuple, list)) and len(value) == batch_size:
+            values = list(value)
+        else:
+            raise ValueError(f"{name}: expected {batch_size} per-cloud Qwen hidden tensors")
+        for bid, (hidden, xyz) in enumerate(zip(values, xyz_list)):
+            expected = (xyz.shape[0], self.qwen_dim)
+            if not torch.is_tensor(hidden) or hidden.shape != expected:
+                raise ValueError(
+                    f"{name}[{bid}]: post-Qwen hidden must be {expected}; "
+                    f"got {getattr(hidden, 'shape', None)}"
+                )
+            if hidden.device != single.memory_features.device:
+                raise ValueError(f"{name}[{bid}]: LLM hidden and Utonia features must share device")
+            if not hidden.is_floating_point():
+                raise TypeError(f"{name}[{bid}]: LLM hidden must be floating-point")
+        return values
+
+    def _encode_spatial_memory(
+        self, single: PointSingleAdapterOutput, llm_point: TensorOrList, name: str,
+    ) -> torch.Tensor:
+        """Utonia + native LLM hidden, analogous to ImageAdapter memory fusion.
+
+        Interpolation: nearest 3 (or fewer) sampled Qwen token positions in XYZ,
+        inverse-distance weighted. Compute small [chunk,Ki] distance matrices,
+        NEVER [N,Ki] globally or [N,Ki,D]. Gradients flow to the Qwen hidden
+        states and llm_point_project; only XYZ nearest-neighbor selection is
+        non-differentiable, as in conventional point-cloud interpolation.
+        """
+        hidden_list = self._llm_hidden_list(llm_point, single, name)
+        xyz_list = (single.llm_sampled_xyz if isinstance(single.llm_sampled_xyz, list)
+                    else [single.llm_sampled_xyz])
+        b = single.point_batch
+        original = single.memory_features
+        output = []
+        for bid, (hidden, sampled_xyz) in enumerate(zip(hidden_list, xyz_list)):
+            idx = torch.nonzero(b == bid, as_tuple=False).flatten()
+            if idx.numel() == 0 or sampled_xyz.shape[0] == 0:
+                raise ValueError(f"{name}: cloud {bid} has no points or Qwen tokens")
+            projected = self.llm_point_project(
+                hidden.to(dtype=self.llm_point_project.weight.dtype)
+            )
+            # Work with local coordinates, not huge UTM/ECEF coordinates.
+            # Preserve the input-point order within each batch item.
+            origin = single.point_xyz[idx[0]].detach().float()
+            src = sampled_xyz.detach().float() - origin
+            k = min(self.config.llm_align_neighbors, src.shape[0])
+            for start in range(0, idx.numel(), self.config.llm_align_chunk_size):
+                selection = idx[start:start + self.config.llm_align_chunk_size]
+                target = single.point_xyz[selection].detach().float() - origin
+                with torch.no_grad():
+                    distances = torch.cdist(target, src)
+                    nearest_distance, nearest = distances.topk(k, largest=False, dim=1)
+                    weights = 1.0 / nearest_distance.clamp_min(1e-4)
+                    weights = weights / weights.sum(dim=1, keepdim=True)
+                # Only [chunk,k,D], not [chunk,Ki,D].
+                aligned = (projected[nearest] * weights.to(projected.dtype).unsqueeze(-1)).sum(dim=1)
+                output.append(original[selection] + aligned.to(dtype=original.dtype))
+        return self.spatial_memory_norm(torch.cat(output, dim=0))
 
     # Single-temporal Qwen LLM point tokens.
     def _uniform_indices(self, n: int, device: torch.device):
@@ -772,11 +866,13 @@ class PointAdapter(nn.Module):
         ) = self._extract(point_encoded)
 
         # --------------------------------------------------------------
-        # Branch A: full-resolution spatial point features.
+        # Branch A: Utonia multi-scale fusion, before Qwen hidden / detail.
         # --------------------------------------------------------------
-        point_features, intensity_used = self._encode_spatial_features(
-            features, coord, batch, intensity, intensity_mask, raw_point_dict,
+        memory_features = self._project_utonia_features(features)
+        point_detail = self._prepare_point_detail(
+            coord, batch, raw_point_dict, intensity, intensity_mask,
         )
+        intensity_used = bool(intensity_mask.any().item()) if intensity_mask is not None else False
 
         # --------------------------------------------------------------
         # Branch B: Qwen LLM point tokens.
@@ -872,7 +968,10 @@ class PointAdapter(nn.Module):
             llm_sampled_features=llm_features_out,
             llm_sampled_xyz=llm_xyz_out,
             llm_sampled_indices=llm_indices_out,
-            point_features=point_features,
+            memory_features=memory_features,
+            point_detail=point_detail,
+            point_intensity=intensity,
+            point_intensity_mask=intensity_mask,
             point_xyz=coord,
             point_batch=batch,
             point_offset=offset,
@@ -882,64 +981,8 @@ class PointAdapter(nn.Module):
             intensity_used=intensity_used,
         )
 
-    # Two-temporal matching, event features, and memory.
-    @staticmethod
-    def _packed_grid(xyz: torch.Tensor, origin: torch.Tensor,
-                     cell_size: float, limits: torch.Tensor) -> torch.Tensor:
-        grid = torch.floor((xyz.float() - origin) / cell_size).long()
-        if bool((grid < 0).any()):
-            raise ValueError('coordinate origin is inconsistent across epochs')
-        nx, ny, nz = (int(v) for v in limits.tolist())
-        if nx * ny * nz >= (1 << 62):
-            raise OverflowError('spatial grid cannot be packed safely in int64')
-        return (grid[:, 0] * (ny * nz) + grid[:, 1] * nz + grid[:, 2])
-
-    @staticmethod
-    def _shared_grid_keys(coord1: torch.Tensor, coord2: torch.Tensor,
-                          cell_size: float):
-        xyz1, xyz2 = coord1.float(), coord2.float()
-        origin = torch.minimum(xyz1.amin(0), xyz2.amin(0))
-        maximum = torch.maximum(xyz1.amax(0), xyz2.amax(0))
-        limits = torch.floor((maximum - origin) / cell_size).long() + 2
-        return (PointAdapter._packed_grid(xyz1, origin, cell_size, limits),
-                PointAdapter._packed_grid(xyz2, origin, cell_size, limits))
-
-    @staticmethod
-    def _same_voxel_lookup(target_key: torch.Tensor, source_key: torch.Tensor):
-        # No [Nt,Ns] distance matrix, only sorting and searchsorted.
-        ordered, perm = torch.sort(source_key)
-        ix = torch.searchsorted(ordered.contiguous(), target_key.contiguous())
-        ix = ix.clamp(max=ordered.numel() - 1)
-        valid = ordered[ix] == target_key
-        return perm[ix], valid
-
-    def _fuse_temporal_features(self, local: torch.Tensor, other: torch.Tensor,
-                        local_xyz: torch.Tensor, other_xyz: torch.Tensor,
-                        source_indices: torch.Tensor, matched: torch.Tensor):
-        parts = []
-        step = self.config.event_chunk_size
-        dense_dtype = self.temporal_event_mlp[0].weight.dtype
-        for start in range(0, local.shape[0], step):
-            end = min(start + step, local.shape[0])
-            a = local[start:end]
-            pick = source_indices[start:end]
-            mask = matched[start:end, None]
-            b = other[pick] * mask.to(dtype=other.dtype)
-            distance = ((local_xyz[start:end].float() - other_xyz[pick].float())
-                        .square().sum(-1, keepdim=True).sqrt())
-            distance = (distance / self.config.temporal_cell_size).clamp(max=4.0)
-            distance = distance * mask.float()
-            fields = torch.cat((a, b-a, distance.to(dtype=a.dtype),
-                                mask.to(dtype=a.dtype)), dim=-1).to(dense_dtype)
-            if self.training and self.config.event_checkpoint:
-                delta = checkpoint(self.temporal_event_mlp, fields, use_reentrant=False)
-            else:
-                delta = self.temporal_event_mlp(fields)
-            parts.append(a + torch.sigmoid(self.temporal_event_strength) *
-                         self.temporal_event_norm(delta.to(a.dtype)))
-        return torch.cat(parts, dim=0)
-
-    def _encode_spatial_memory(self, features: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+    # Spatial memory representative sampling (not temporal matching).
+    def _sample_spatial_memory(self, features: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
         # Extract one point per occupied cell, then cap the memory budget.
         # No dense spatial [num_voxels,256] pooling tensor is instantiated.
         with torch.no_grad():
@@ -961,68 +1004,59 @@ class PointAdapter(nn.Module):
             cap = self.config.memory_tokens_per_cloud
             if selected.numel() > cap:
                 selected = selected[:cap]
-        return self.spatial_memory_norm(features[selected])
+        return features[selected]  # already normalized by _encode_spatial_memory
 
-    def fuse_temporal(self, t1: PointSingleAdapterOutput,
-                     t2: PointSingleAdapterOutput) -> PointAdapterOutput:
-        """Construct shared 2D/3D QueryDecoder-compatible memory and 3D Event features.
+    def fuse_temporal(
+        self, t1: PointSingleAdapterOutput, t2: PointSingleAdapterOutput,
+        *, llm_point_t1: TensorOrList, llm_point_t2: TensorOrList,
+    ) -> PointAdapterOutput:
+        """Fuse each phase's Utonia and T_mm; return Memory, F_point, and XYZ.
 
-        Batches are ragged, phases must share their metric coordinate reference.
-        Temporal matching is SAME-CELL, NOT exact nearest-neighbor correspondence.
+        This adapter does NOT match T1/T2 points or create F_event.
         """
-        if t1.point_features.shape[1] != self.decoder_dim or t2.point_features.shape[1] != self.decoder_dim:
-            raise ValueError('point feature width differs from decoder_dim')
-        if t1.point_batch.device != t2.point_batch.device or t1.point_batch[-1] != t2.point_batch[-1]:
+        if t1.memory_features.shape[1] != self.decoder_dim or t2.memory_features.shape[1] != self.decoder_dim:
+            raise ValueError('memory feature width differs from decoder_dim')
+        if t1.point_batch.device != t2.point_batch.device or int(t1.point_batch[-1]) != int(t2.point_batch[-1]):
             raise ValueError('T1/T2 must have the same number of cloud batch items')
-        B = int(t1.point_offset.numel())
-        x1, x2 = t1.point_features, t2.point_features
-        coords1, coords2 = t1.point_xyz, t2.point_xyz
-        batches1, batches2 = t1.point_batch, t2.point_batch
-        event1, event2 = [], []
-        memories = []
+        batch_size = int(t1.point_offset.numel())
+        if batch_size != int(t2.point_offset.numel()):
+            raise ValueError('T1/T2 offset length mismatch')
+        fused_t1 = self._encode_spatial_memory(t1, llm_point_t1, 'llm_point_t1')
+        fused_t2 = self._encode_spatial_memory(t2, llm_point_t2, 'llm_point_t2')
+        point_t1 = self._encode_spatial_features(fused_t1, t1)
+        point_t2 = self._encode_spatial_features(fused_t2, t2)
+        xyz_t1, xyz_t2 = t1.point_xyz, t2.point_xyz
+        batch_t1, batch_t2 = t1.point_batch, t2.point_batch
+        spatial_memories = []
         bounds = []
-        matches1 = matches2 = 0
-        for bid in range(B):
-            ix1 = torch.nonzero(batches1 == bid, as_tuple=False).flatten()
-            ix2 = torch.nonzero(batches2 == bid, as_tuple=False).flatten()
+        for bid in range(batch_size):
+            ix1 = torch.nonzero(batch_t1 == bid, as_tuple=False).flatten()
+            ix2 = torch.nonzero(batch_t2 == bid, as_tuple=False).flatten()
             if ix1.numel() == 0 or ix2.numel() == 0:
                 raise ValueError('T1 and T2 must have points in every batch item')
-            a, b = x1[ix1], x2[ix2]
-            xyz1, xyz2 = coords1[ix1], coords2[ix2]
-            lower = torch.minimum(xyz1.amin(0), xyz2.amin(0))
-            upper = torch.maximum(xyz1.amax(0), xyz2.amax(0))
+            coords1, coords2 = xyz_t1[ix1], xyz_t2[ix2]
+            lower = torch.minimum(coords1.amin(0), coords2.amin(0))
+            upper = torch.maximum(coords1.amax(0), coords2.amax(0))
             bounds.append(torch.stack((lower, upper), dim=0))
-            with torch.no_grad():
-                key1,key2 = self._shared_grid_keys(xyz1, xyz2, self.config.temporal_cell_size)
-                to2, valid1 = self._same_voxel_lookup(key1, key2)
-                to1, valid2 = self._same_voxel_lookup(key2, key1)
-            matches1 += int(valid1.sum().item())
-            matches2 += int(valid2.sum().item())
-            event1.append(self._fuse_temporal_features(a, b, xyz1, xyz2, to2, valid1))
-            event2.append(self._fuse_temporal_features(b, a, xyz2, xyz1, to1, valid2))
-            m1 = self._encode_spatial_memory(a, xyz1)
-            m2 = self._encode_spatial_memory(b, xyz2)
-            memories.append((m1,m2))
-        # max lengths vary per batch. Padding is ignored through time_ids=0.
-        max_len = max(m1.shape[0] + m2.shape[0] for m1,m2 in memories)
-        memory = x1.new_zeros((B,max_len,self.decoder_dim))
-        time_ids = torch.zeros((B,max_len),device=x1.device,dtype=torch.long)
-        for bid,(m1,m2) in enumerate(memories):
-            n1,n2 = m1.shape[0],m2.shape[0]
-            memory[bid,:n1] = m1
-            memory[bid,n1:n1+n2] = m2
-            time_ids[bid,:n1] = 1
-            time_ids[bid,n1:n1+n2] = 2
+            spatial_memories.append((
+                self._sample_spatial_memory(fused_t1[ix1], coords1),
+                self._sample_spatial_memory(fused_t2[ix2], coords2),
+            ))
+        max_length = max(a.shape[0] + b.shape[0] for a, b in spatial_memories)
+        memory = point_t1.new_zeros((batch_size, max_length, self.decoder_dim))
+        memory_time_ids = torch.zeros((batch_size, max_length), device=memory.device, dtype=torch.long)
+        for bid, (a, b) in enumerate(spatial_memories):
+            n1, n2 = a.shape[0], b.shape[0]
+            memory[bid, :n1] = a
+            memory[bid, n1:n1+n2] = b
+            memory_time_ids[bid, :n1] = 1
+            memory_time_ids[bid, n1:n1+n2] = 2
         return PointAdapterOutput(
-            memory=memory, memory_time_ids=time_ids,
-            point_features_t1=x1, point_features_t2=x2,
-            event_features_t1=torch.cat(event1,0),
-            event_features_t2=torch.cat(event2,0),
-            point_batch_t1=batches1, point_batch_t2=batches2,
-            point_xyz_t1=coords1, point_xyz_t2=coords2,
-            box_scene_bounds=torch.stack(bounds,0),
-            temporal_match_ratio_t1=matches1/max(1,x1.shape[0]),
-            temporal_match_ratio_t2=matches2/max(1,x2.shape[0]),
+            memory=memory, memory_time_ids=memory_time_ids,
+            point_features_t1=point_t1, point_features_t2=point_t2,
+            point_batch_t1=batch_t1, point_batch_t2=batch_t2,
+            point_xyz_t1=xyz_t1, point_xyz_t2=xyz_t2,
+            box_scene_bounds=torch.stack(bounds, 0),
         )
 
     def forward(
@@ -1030,6 +1064,8 @@ class PointAdapter(nn.Module):
         *,
         point_encoded_t1: Any,
         point_encoded_t2: Any,
+        llm_point_t1: TensorOrList,
+        llm_point_t2: TensorOrList,
         raw_point_dict_t1: Optional[Dict[str, torch.Tensor]] = None,
         raw_point_dict_t2: Optional[Dict[str, torch.Tensor]] = None,
     ) -> PointAdapterOutput:
@@ -1041,12 +1077,15 @@ class PointAdapter(nn.Module):
         """
         t1 = self.encode_single(point_encoded_t1, raw_point_dict=raw_point_dict_t1)
         t2 = self.encode_single(point_encoded_t2, raw_point_dict=raw_point_dict_t2)
-        return self.fuse_temporal(t1, t2)
+        return self.fuse_temporal(
+            t1, t2, llm_point_t1=llm_point_t1, llm_point_t2=llm_point_t2,
+        )
 
     def predict(
         self, *, decoder: nn.Module, qwen_backbone: Any,
         task_hidden: torch.Tensor, class_names: Dict[int, str],
         point_encoded_t1: Any, point_encoded_t2: Any,
+        llm_point_t1: TensorOrList, llm_point_t2: TensorOrList,
         raw_point_dict_t1: Optional[Dict[str,torch.Tensor]] = None,
         raw_point_dict_t2: Optional[Dict[str,torch.Tensor]] = None,
         boxes_3d: Optional[torch.Tensor] = None,
@@ -1058,6 +1097,7 @@ class PointAdapter(nn.Module):
         prepared = self.forward(
             point_encoded_t1=point_encoded_t1,
             point_encoded_t2=point_encoded_t2,
+            llm_point_t1=llm_point_t1, llm_point_t2=llm_point_t2,
             raw_point_dict_t1=raw_point_dict_t1,
             raw_point_dict_t2=raw_point_dict_t2,
         )

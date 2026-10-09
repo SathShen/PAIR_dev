@@ -19,7 +19,6 @@ Output contracts (PAIRChangeDecoder.forward_2d):
   memory_time_ids:    [B,2*Hv*Wv], 1 for T1 and 2 for T2
   pixel_features_t1: [B,D,Hp,Wp]
   pixel_features_t2: [B,D,Hp,Wp]
-  change_features:   [B,D,Hp,Wp]
   output_sizes:       per-sample (H,W), for final logit interpolation/flattening
 
 Memory deliberately has NO new positional embedding: the ViT intermediates and
@@ -90,7 +89,7 @@ class _PixelShuffleStage(nn.Module):
 
 @dataclass
 class ImageSingleAdapterOutput:
-    """Single-temporal ViT/LLM spatial memory and full-resolution features.
+    """Single-temporal F_fuse and F_pixel.
 
     One phase of the same encode_single/fuse_temporal pipeline as PointAdapter.
     memory_features: [B,D,Hv,Wv] at the Qwen visual grid.
@@ -102,13 +101,12 @@ class ImageSingleAdapterOutput:
 
 @dataclass
 class ImageAdapterOutput:
-    """Adapter output compatible with PAIRChangeDecoder.forward_2d."""
+    """F_fuse sampled/flattened as memory and full-resolution F_pixel for both phases."""
 
     memory: torch.Tensor
     memory_time_ids: torch.Tensor
     pixel_features_t1: torch.Tensor
     pixel_features_t2: torch.Tensor
-    change_features: torch.Tensor
     output_sizes: Tuple[Tuple[int, int], ...]
 
     def decoder_inputs(self) -> Dict[str, Any]:
@@ -117,7 +115,6 @@ class ImageAdapterOutput:
             "memory_time_ids": self.memory_time_ids,
             "pixel_features_t1": self.pixel_features_t1,
             "pixel_features_t2": self.pixel_features_t2,
-            "change_features": self.change_features,
             "output_sizes": self.output_sizes,
         }
 
@@ -133,13 +130,12 @@ class ImageAdapter(nn.Module):
         layer_indices: Sequence[int] = (5, 11, 17),
         up_channels: Tuple[int, int] = (128, 64),
         rgb_channels: int = 32,
-        temporal_channels: int = 64,
     ) -> None:
         super().__init__()
         layers = tuple(int(x) for x in layer_indices)
         if not layers or len(set(layers)) != len(layers):
             raise ValueError("layer_indices must be nonempty, with no duplicates")
-        if min(vision_dim, qwen_dim, decoder_dim, rgb_channels, temporal_channels, *up_channels) <= 0:
+        if min(vision_dim, qwen_dim, decoder_dim, rgb_channels, *up_channels) <= 0:
             raise ValueError("All channel dimensions must be positive")
         if len(up_channels) != 2:
             raise ValueError("up_channels must specify exactly two PixelShuffle stages")
@@ -174,16 +170,6 @@ class ImageAdapter(nn.Module):
             nn.Conv2d(up_channels[1] + rgb_channels, decoder_dim, kernel_size=1, bias=False),
             _norm(decoder_dim), nn.GELU(),
         )
-        # Explicit temporal comparison: no single-temporal Change shortcuts.
-        self.temporal_reduce = nn.Conv2d(decoder_dim, temporal_channels, kernel_size=1)
-        self.change_fuse = nn.Sequential(
-            nn.Conv2d(4 * temporal_channels, decoder_dim, kernel_size=1, bias=False),
-            _norm(decoder_dim), nn.GELU(),
-            nn.Conv2d(decoder_dim, decoder_dim, kernel_size=3, padding=1,
-                      groups=decoder_dim, bias=False),
-            _norm(decoder_dim), nn.GELU(),
-        )
-
     # Input preparation and validation.
     @staticmethod
     def _cast_to_module(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -379,18 +365,6 @@ class ImageAdapter(nn.Module):
         )
 
     # Two-temporal features, memory, and prediction bridge.
-    def _fuse_temporal_features(
-        self,
-        pixel_features_t1: torch.Tensor,
-        pixel_features_t2: torch.Tensor,
-    ) -> torch.Tensor:
-        """Joint T1/T2 high-resolution Change representation."""
-        c1 = self.temporal_reduce(pixel_features_t1)
-        c2 = self.temporal_reduce(pixel_features_t2)
-        return self.change_fuse(
-            torch.cat((c1, c2, (c2 - c1).abs(), c1 * c2), dim=1)
-        )
-
     def fuse_temporal(
         self,
         t1: ImageSingleAdapterOutput,
@@ -398,7 +372,7 @@ class ImageAdapter(nn.Module):
         *,
         output_sizes: Sequence[Tuple[int, int]],
     ) -> ImageAdapterOutput:
-        """Produce two-temporal K/V Memory and full-resolution Change features.
+        """Combine two-temporal K/V Memory and full-resolution pixel features.
 
         Exactly the same public staged pipeline as PointAdapter.fuse_temporal.
         The Memory interface is shared, while the Dense feature names remain
@@ -418,7 +392,6 @@ class ImageAdapter(nn.Module):
         if any(h <= 0 or w <= 0 for h, w in sizes):
             raise ValueError('output_sizes must be positive')
 
-        change = self._fuse_temporal_features(t1.pixel_features, t2.pixel_features)
         memory = torch.cat((mem1.flatten(2).transpose(1, 2),
                             mem2.flatten(2).transpose(1, 2)), dim=1)
         count = hv * wv
@@ -431,7 +404,6 @@ class ImageAdapter(nn.Module):
             memory_time_ids=memory_time_ids,
             pixel_features_t1=t1.pixel_features,
             pixel_features_t2=t2.pixel_features,
-            change_features=change,
             output_sizes=sizes,
         )
 

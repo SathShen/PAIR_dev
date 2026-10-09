@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from torch.utils.checkpoint import checkpoint
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -752,22 +753,21 @@ class PAIRChangeDecoder(nn.Module):
 
     2D input:
       memory [B,L,D], task_hidden [B,qwen_dim],
-      pixel_features_t1/t2/change [B,D,H,W].
+      pixel_features_t1/t2 [B,D,H,W]. Decoder builds F_change.
 
     3D input:
       memory [B,L,D], task_hidden [B,qwen_dim],
       point_features_t1/t2 [N1,D]/[N2,D],
-      event_features_t1/t2 [N1,D]/[N2,D],
-      point_batch_t1/t2 [N1]/[N2].
+      point_batch_t1/t2 and XYZ; Decoder builds F_event T1/T2.
 
     query_memory_mask is optional [B,Q,L], True=allowed. Alternatively,
     memory_time_ids [B,L] (1=T1, 2=T2, 0=padding) builds task-aware masks:
       2D sem1->T1, sem2->T2, change->both;
       3D sem1->T1, sem2->T2, events->both.
 
-    The adapter is responsible for constructing cross-temporal change/event
-    features and spatial memory. The entire path from these features to logits
-    is owned by this module. No losses or post-sigmoid/softmax live here.
+    Adapters only construct F_pixel/F_point, spatial memory and coordinates.
+    This Decoder owns all learnable temporal fusion, Event matching, boxes,
+    queries and logits. No losses or post-sigmoid/softmax live here.
     """
 
     TASKS_2D_SCD = ('Semantic T1', 'Semantic T2', 'Binary Change')
@@ -789,6 +789,12 @@ class PAIRChangeDecoder(nn.Module):
         box_edge_softness: float = 0.08,
         box_chunk_size: int = 8,
         box_residual_init: float = 0.10,
+        temporal_channels: int = 64,
+        temporal_cell_size: float = 0.5,
+        event_hidden_dim: int = 64,
+        event_chunk_size: int = 8192,
+        event_checkpoint: bool = True,
+        event_residual_init: float = 0.10,
     ) -> None:
         super().__init__()
         self.decoder_dim = int(decoder_dim)
@@ -806,6 +812,35 @@ class PAIRChangeDecoder(nn.Module):
         self.point_semantic_head = QueryConditionedClassHead(decoder_dim)
         self.point_event_head = QueryConditionedClassHead(decoder_dim)
         self.event_prototypes = nn.Parameter(torch.randn(3, decoder_dim) * 0.02)
+        # 2D temporal fusion formerly in ImageAdapter (same operators/widths).
+        if temporal_channels <= 0:
+            raise ValueError('temporal_channels must be positive')
+        image_norm_groups = max(g for g in range(min(16, decoder_dim), 0, -1)
+                                if decoder_dim % g == 0)
+        self.temporal_reduce = nn.Conv2d(decoder_dim, temporal_channels, kernel_size=1)
+        self.change_fuse = nn.Sequential(
+            nn.Conv2d(4 * temporal_channels, decoder_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(image_norm_groups, decoder_dim), nn.GELU(),
+            nn.Conv2d(decoder_dim, decoder_dim, kernel_size=3, padding=1,
+                      groups=decoder_dim, bias=False),
+            nn.GroupNorm(image_norm_groups, decoder_dim), nn.GELU(),
+        )
+        # 3D temporal fusion formerly in PointAdapter.
+        if event_hidden_dim <= 0 or event_chunk_size <= 0 or temporal_cell_size <= 0:
+            raise ValueError('3D temporal settings must be positive')
+        if not 0 < event_residual_init < 1:
+            raise ValueError('event_residual_init must be inside (0,1)')
+        self.temporal_cell_size = float(temporal_cell_size)
+        self.event_chunk_size = int(event_chunk_size)
+        self.event_checkpoint = bool(event_checkpoint)
+        self.temporal_event_mlp = nn.Sequential(
+            nn.Linear(2 * decoder_dim + 2, event_hidden_dim), nn.GELU(),
+            nn.Linear(event_hidden_dim, decoder_dim),
+        )
+        self.temporal_event_norm = nn.LayerNorm(decoder_dim)
+        self.temporal_event_strength = nn.Parameter(torch.tensor(
+            math.log(event_residual_init / (1 - event_residual_init))
+        ))
         self.box_guidance = MultiBoxGuidance(
             decoder_dim=decoder_dim,
             max_boxes=max_box_proposals,
@@ -813,6 +848,93 @@ class PAIRChangeDecoder(nn.Module):
             box_chunk_size=box_chunk_size,
             init_residual_strength=box_residual_init,
         )
+
+    def _fuse_temporal_features(self, features_t1: torch.Tensor,
+                                features_t2: torch.Tensor) -> torch.Tensor:
+        """2D F_change from aligned F_pixel T1/T2, shared for SCD and BCD."""
+        a = self.temporal_reduce(features_t1)
+        b = self.temporal_reduce(features_t2)
+        return self.change_fuse(torch.cat((a, b, (b-a).abs(), a*b), dim=1))
+
+    @staticmethod
+    def _shared_grid_keys(xyz_t1: torch.Tensor, xyz_t2: torch.Tensor,
+                          cell_size: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Match by a common XYZ voxel grid (NOT exact nearest-neighbor matching)."""
+        a, b = xyz_t1.detach().float(), xyz_t2.detach().float()
+        origin = torch.minimum(a.amin(0), b.amin(0))
+        maximum = torch.maximum(a.amax(0), b.amax(0))
+        sizes = torch.floor((maximum - origin) / cell_size).long() + 2
+        nx, ny, nz = (int(v) for v in sizes.tolist())
+        if nx * ny * nz >= (1 << 62):
+            raise OverflowError('3D temporal grid exceeds int64 range')
+        def keys(x):
+            grid = torch.floor((x - origin) / cell_size).long()
+            if (grid < 0).any():
+                raise ValueError('inconsistent 3D coordinate reference')
+            return grid[:, 0] * (ny * nz) + grid[:, 1] * nz + grid[:, 2]
+        return keys(a), keys(b)
+
+    @staticmethod
+    def _same_voxel_lookup(target_key: torch.Tensor, source_key: torch.Tensor):
+        """Return one representative source index per matching voxel; O(N log N)."""
+        ordered, perm = torch.sort(source_key)
+        ix = torch.searchsorted(ordered.contiguous(), target_key.contiguous())
+        ix = ix.clamp(max=ordered.numel() - 1)
+        return perm[ix], ordered[ix] == target_key
+
+    def _encode_event_features(self, local: torch.Tensor, other: torch.Tensor,
+                               local_xyz: torch.Tensor, other_xyz: torch.Tensor,
+                               source_indices: torch.Tensor,
+                               matched: torch.Tensor) -> torch.Tensor:
+        """Chunked local cross-temporal F_event, preserving one logit per input point."""
+        parts = []
+        dtype = self.temporal_event_mlp[0].weight.dtype
+        for start in range(0, local.shape[0], self.event_chunk_size):
+            end = min(start + self.event_chunk_size, local.shape[0])
+            a = local[start:end]
+            pick = source_indices[start:end]
+            mask = matched[start:end, None]
+            other_features = other[pick] * mask.to(dtype=other.dtype)
+            distance = ((local_xyz[start:end].float() - other_xyz[pick].float())
+                        .square().sum(-1, keepdim=True).sqrt())
+            distance = (distance / self.temporal_cell_size).clamp(max=4.0) * mask.float()
+            fields = torch.cat((a, other_features - a, distance.to(dtype=a.dtype),
+                                mask.to(dtype=a.dtype)), dim=-1).to(dtype)
+            if self.training and self.event_checkpoint:
+                correction = checkpoint(self.temporal_event_mlp, fields,
+                                        use_reentrant=False)
+            else:
+                correction = self.temporal_event_mlp(fields)
+            parts.append(a + torch.sigmoid(self.temporal_event_strength) *
+                         self.temporal_event_norm(correction.to(dtype=a.dtype)))
+        return torch.cat(parts, dim=0)
+
+    def _fuse_temporal_points(
+        self,
+        point_features_t1: torch.Tensor,
+        point_features_t2: torch.Tensor,
+        point_xyz_t1: torch.Tensor,
+        point_xyz_t2: torch.Tensor,
+        point_batch_t1: torch.Tensor,
+        point_batch_t2: torch.Tensor,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """3D matching and Event feature construction are owned by Decoder."""
+        event1, event2 = [], []
+        for bid in range(batch_size):
+            ix1 = torch.nonzero(point_batch_t1 == bid, as_tuple=False).flatten()
+            ix2 = torch.nonzero(point_batch_t2 == bid, as_tuple=False).flatten()
+            if ix1.numel() == 0 or ix2.numel() == 0:
+                raise ValueError('each 3D batch item must contain T1 and T2 points')
+            a, b = point_features_t1[ix1], point_features_t2[ix2]
+            xyz1, xyz2 = point_xyz_t1[ix1], point_xyz_t2[ix2]
+            with torch.no_grad():
+                key1, key2 = self._shared_grid_keys(xyz1, xyz2, self.temporal_cell_size)
+                to2, valid1 = self._same_voxel_lookup(key1, key2)
+                to1, valid2 = self._same_voxel_lookup(key2, key1)
+            event1.append(self._encode_event_features(a, b, xyz1, xyz2, to2, valid1))
+            event2.append(self._encode_event_features(b, a, xyz2, xyz1, to1, valid2))
+        return torch.cat(event1, dim=0), torch.cat(event2, dim=0)
 
     @staticmethod
     def _make_temporal_mask(
@@ -943,7 +1065,6 @@ class PAIRChangeDecoder(nn.Module):
         memory: torch.Tensor,
         pixel_features_t1: torch.Tensor,
         pixel_features_t2: torch.Tensor,
-        change_features: torch.Tensor,
         prediction_mode: str = 'scd',
         class_names: Optional[Dict[int, str]] = None,
         output_sizes: Optional[Sequence[Tuple[int, int]]] = None,
@@ -973,10 +1094,9 @@ class PAIRChangeDecoder(nn.Module):
         if (
             pixel_features_t1.ndim != 4
             or pixel_features_t1.shape != pixel_features_t2.shape
-            or pixel_features_t1.shape != change_features.shape
         ):
             raise ValueError('2D feature maps must have matching [B,D,H,W] shapes')
-        b, d, h, w = change_features.shape
+        b, d, h, w = pixel_features_t1.shape
         if d != self.decoder_dim or memory.shape[0] != b:
             raise ValueError('2D image feature width / memory batch mismatch')
         if output_sizes is not None:
@@ -988,6 +1108,7 @@ class PAIRChangeDecoder(nn.Module):
             if return_maps and any(tuple(map(int,s)) != (h,w) for s in output_sizes):
                 raise ValueError('return_maps=True requires output_sizes to match feature size')
 
+        change_features = self._fuse_temporal_features(pixel_features_t1, pixel_features_t2)
         descriptions = self.TASKS_2D_SCD if mode == 'scd' else self.TASKS_2D_BCD
         encoded, queries = self._decode(
             qwen_backbone=qwen_backbone, task_hidden=task_hidden,
@@ -1135,8 +1256,6 @@ class PAIRChangeDecoder(nn.Module):
         memory: torch.Tensor,
         point_features_t1: torch.Tensor,
         point_features_t2: torch.Tensor,
-        event_features_t1: torch.Tensor,
-        event_features_t2: torch.Tensor,
         point_batch_t1: torch.Tensor,
         point_batch_t2: torch.Tensor,
         class_names: Dict[int, str],
@@ -1158,10 +1277,25 @@ class PAIRChangeDecoder(nn.Module):
         for name, features, point_batch in (
             ('point_features_t1', point_features_t1, point_batch_t1),
             ('point_features_t2', point_features_t2, point_batch_t2),
-            ('event_features_t1', event_features_t1, point_batch_t1),
-            ('event_features_t2', event_features_t2, point_batch_t2),
         ):
             self._check_point_features(features, point_batch, b, self.decoder_dim, name)
+        # XYZ is always required for 3D temporal fusion, even without boxes.
+        if point_xyz_t1 is None or point_xyz_t2 is None:
+            raise ValueError('3D Event fusion requires point_xyz_t1 and point_xyz_t2')
+        for xyz, features, name in (
+            (point_xyz_t1, point_features_t1, 'point_xyz_t1'),
+            (point_xyz_t2, point_features_t2, 'point_xyz_t2'),
+        ):
+            if xyz.shape != (features.shape[0], 3) or xyz.device != features.device:
+                raise ValueError(f'{name} must have shape [N,3] and match point feature device')
+            if not torch.isfinite(xyz).all():
+                raise ValueError(f'{name} must be finite')
+        # Keep F_event independent of Box: Box-guided refinements are residuals.
+        event_features_t1, event_features_t2 = self._fuse_temporal_points(
+            point_features_t1, point_features_t2,
+            point_xyz_t1, point_xyz_t2,
+            point_batch_t1, point_batch_t2, b,
+        )
         encoded, queries = self._decode(
             qwen_backbone=qwen_backbone, task_hidden=task_hidden,
             task_descriptions=self.TASKS_3D, class_names=class_names,
