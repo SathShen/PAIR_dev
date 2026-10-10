@@ -514,7 +514,11 @@ class QueryConditionedClassHead(nn.Module):
         for bid in range(weights.shape[0]):
             selected = torch.nonzero(batch_ids == bid, as_tuple=False).flatten()
             if selected.numel():
-                logits = logits.index_copy(0, selected, projected.index_select(0,selected) @ weights[bid].T)
+                # Autocast may return BF16/FP16 matmul results even when
+                # projected/weights and the destination logits are FP32.
+                # index_copy requires source and destination dtypes to match.
+                values = projected.index_select(0, selected) @ weights[bid].T
+                logits = logits.index_copy(0, selected, values.to(dtype=logits.dtype))
         return scale * logits
 
 
