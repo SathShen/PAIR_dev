@@ -1,26 +1,25 @@
-"""
-Batch-aware Qwen3-VL backbone wrapper for temporal PAIR.
+"""Qwen3-VL backbone for PAIR native multimodal temporal reasoning.
 
-Supports true vectorized 2D batching:
-    B prompts + B image T1 + B image T2
-        -> one Qwen processor batch
-        -> one Qwen forward
+Two-stage 3D flow: PointAdapter.encode_single -> llm_point_tokens -> this
+backbone -> llm_point_t1/t2 (T_mm) -> PointAdapter.fuse_temporal.
+For 2D, native Qwen vision DeepStack D5/D11/D17 and visual-position
+LLM hidden T_mm are returned without any custom <PYRAMID> tokens.
 
-The wrapper also keeps the single-sample API backward compatible.
+Outputs from forward():
+  task_hidden       [B,qwen_dim]  -> task Query builder (change_decoder.py)
+  llm_visual_t1/t2  list[B] of [1,Hm,Wm,qwen_dim] -> ImageAdapter
+  llm_point_t1/t2   list[B] of [Ki,qwen_dim] -> PointAdapter
+  premerge_t1/t2    maps from selected native vision levels [B,C,Hv,Wv]
 
-PAIR V2 additionally exposes the three Qwen DeepStack vision features before
-spatial merging.  Their exact block indices are checkpoint-specific (for
-example 4B and 8B use different depths) and are validated against the loaded
-checkpoint config.  The normal Qwen forward path is left untouched: features
-are captured with forward hooks while the native vision encoder runs.
-
-For point tokens the input-normalization/mask API is batch-aware, but true
-batched 3D still depends on PointAdapter producing per-sample token sets.
+Box proposals require a SEPARATE generated sequence, and require grounding
+supervision/fine-tuning for reliable PAIR 2D/3D detection. Generation is not a
+latent prediction head and is not automatically trained by mask loss.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import json
 
 import torch
 import torch.nn as nn
@@ -37,7 +36,6 @@ class Qwen3VLBackbone(nn.Module):
                  device_map: Optional[Union[str, Dict[str, Any]]] = "cuda",
                  local_files_only: bool = True,
                  point_token: str = "<POINT>", task_token: str = "<TASK>",
-                 pyramid_token: str = "<PYRAMID>",
                  vision_intermediate_layers: Optional[Sequence[int]] = None):
         super().__init__()
         self.model_dir = model_dir
@@ -47,7 +45,6 @@ class Qwen3VLBackbone(nn.Module):
         self.local_files_only = local_files_only
         self.point_token = point_token
         self.task_token = task_token
-        self.pyramid_token = pyramid_token
 
         self.processor = AutoProcessor.from_pretrained(
             model_dir, local_files_only=local_files_only
@@ -57,14 +54,10 @@ class Qwen3VLBackbone(nn.Module):
             "additional_special_tokens": [
                 self.point_token,
                 self.task_token,
-                self.pyramid_token,
             ]
         })
         self.point_token_id = self.tokenizer.convert_tokens_to_ids(self.point_token)
         self.task_token_id = self.tokenizer.convert_tokens_to_ids(self.task_token)
-        self.pyramid_token_id = self.tokenizer.convert_tokens_to_ids(
-            self.pyramid_token
-        )
 
         load_kwargs = {"dtype": dtype, "local_files_only": local_files_only}
         if device_map is not None:
@@ -106,7 +99,7 @@ class Qwen3VLBackbone(nn.Module):
         self.vision_patch_size = int(vision_config.patch_size)
         self.vision_spatial_merge_size = int(vision_config.spatial_merge_size)
 
-        # PAIR V2 uses the checkpoint's three native Qwen DeepStack depths
+        # PAIR uses the checkpoint's three native Qwen DeepStack depths
         # before the spatial merger.  The compact PAIR config may provide the
         # expected preset values; we validate them against the actual checkpoint
         # so a mismatched 4B/8B path cannot silently run with the wrong hooks.
@@ -115,7 +108,7 @@ class Qwen3VLBackbone(nn.Module):
         )
         if len(configured_deepstack) != 3:
             raise RuntimeError(
-                "PAIR V2 requires exactly three Qwen deepstack_visual_indexes, "
+                "PAIR requires exactly three Qwen deepstack_visual_indexes, "
                 f"but this checkpoint reports {configured_deepstack}"
             )
 
@@ -162,7 +155,7 @@ class Qwen3VLBackbone(nn.Module):
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
     # ------------------------------------------------------------------
-    # PAIR V2: pre-merge Qwen vision features
+    # PAIR: pre-merge Qwen vision features
     # ------------------------------------------------------------------
 
     def _vision_module(self) -> nn.Module:
@@ -382,20 +375,34 @@ class Qwen3VLBackbone(nn.Module):
 
         return stacked
 
+    def _replace_task_token_embedding(self, module, args, output):
+        """Make the added <TASK> embedding trainable with frozen Qwen weights."""
+        if not args or not torch.is_tensor(args[0]):
+            return output
+        ids = args[0]
+        if not torch.is_tensor(output) or output.ndim != 3 or ids.shape != output.shape[:2]:
+            return output
+        mask = ids.eq(self.task_token_id)
+        if not bool(mask.any()):
+            return output
+        updated = output.clone()
+        updated[mask] = self.task_token_embedding.to(device=output.device, dtype=output.dtype)
+        return updated
+
     # ------------------------------------------------------------------
-    # Batch normalization helpers
+    # Shared batch and modality preparation
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _prompt_batch(prompt) -> Tuple[List[str], bool]:
+    def _prompt_batch(prompt: Union[str, Sequence[str]]) -> Tuple[List[str], bool]:
         if isinstance(prompt, str):
             return [prompt], True
-        if isinstance(prompt, (list, tuple)) and prompt and all(isinstance(x, str) for x in prompt):
+        if isinstance(prompt, (tuple, list)) and prompt and all(isinstance(x, str) for x in prompt):
             return list(prompt), False
-        raise TypeError("prompt must be str or a non-empty sequence[str]")
+        raise TypeError("prompt must be a string or a non-empty sequence of strings")
 
     @staticmethod
-    def _value_batch(value, batch_size: int, name: str):
+    def _value_batch(value: Any, batch_size: int, name: str) -> List[Any]:
         if value is None:
             return [None] * batch_size
         if isinstance(value, (list, tuple)):
@@ -403,474 +410,500 @@ class Qwen3VLBackbone(nn.Module):
                 raise ValueError(f"{name} has {len(value)} items, expected {batch_size}")
             return list(value)
         if batch_size != 1:
-            raise ValueError(f"{name} must be a sequence of length {batch_size}")
+            raise ValueError(f"{name} must be a list/tuple of length {batch_size}")
         return [value]
 
-    def _point_token_batch(self, value, batch_size: int, name: str):
+    def _point_token_batch(self, value: Any, batch_size: int, name: str) -> List[Optional[torch.Tensor]]:
         if value is None:
             return [None] * batch_size
-
-        if isinstance(value, (list, tuple)):
-            if len(value) != batch_size:
-                raise ValueError(f"{name} has {len(value)} items, expected {batch_size}")
-            values = list(value)
-        elif torch.is_tensor(value):
-            if value.ndim == 2:
-                if batch_size != 1:
-                    raise ValueError(f"{name} [N,D] is valid only for batch_size=1")
-                values = [value]
-            elif value.ndim == 3:
-                if value.shape[0] != batch_size:
-                    raise ValueError(
-                        f"{name} batch dimension {value.shape[0]} != {batch_size}"
-                    )
-                values = [value[i] for i in range(batch_size)]
+        if torch.is_tensor(value):
+            if value.ndim == 2 and batch_size == 1:
+                value = [value]
+            elif value.ndim == 3 and value.shape[0] == batch_size:
+                value = list(value.unbind(0))
             else:
-                raise ValueError(f"{name} must be [N,D], [B,N,D], list, or None")
-        else:
-            raise TypeError(f"{name} must be tensor/list/None")
-
-        for i, tensor in enumerate(values):
-            if tensor is None:
+                raise ValueError(f"{name} must be [K,D] for B=1 or [B,K,D]")
+        if not isinstance(value, (list, tuple)) or len(value) != batch_size:
+            raise ValueError(f"{name} must contain {batch_size} point-token tensors")
+        result = list(value)
+        for b, token in enumerate(result):
+            if token is None:
                 continue
-            if not torch.is_tensor(tensor) or tensor.ndim != 2:
-                raise ValueError(f"{name}[{i}] must be [N,D]")
-            if tensor.shape[1] != self.hidden_size:
-                raise ValueError(
-                    f"{name}[{i}] hidden dim {tensor.shape[1]} != Qwen {self.hidden_size}"
-                )
-            if tensor.shape[0] <= 0:
-                raise ValueError(f"{name}[{i}] contains zero tokens")
-        return values
+            if not torch.is_tensor(token) or token.ndim != 2 or token.shape[1] != self.hidden_size:
+                raise ValueError(f"{name}[{b}] must be [K,{self.hidden_size}]")
+            if token.shape[0] == 0 or not torch.is_floating_point(token):
+                raise ValueError(f"{name}[{b}] must have nonempty floating tokens")
+        return result
 
-    def _replace_task_token_embedding(self, module, args, output):
-        """Replace only <TASK> embedding positions with the trainable PAIR vector."""
-        if not args or not torch.is_tensor(args[0]):
-            return output
-        input_ids = args[0]
-        if not (torch.is_tensor(output) and output.ndim == 3):
-            return output
-        if input_ids.shape != output.shape[:2]:
-            return output
+    def _validate_prompt(self, prompt: str) -> None:
+        for token in (self.point_token, self.task_token, "<PYRAMID>"):
+            if token in prompt:
+                raise ValueError(f"Do not manually add internal token {token!r} to prompt")
 
-        task_mask = input_ids.eq(self.task_token_id)
-        if not bool(task_mask.any()):
-            return output
-
-        out = output.clone()
-        task_vector = self.task_token_embedding.to(
-            device=out.device, dtype=out.dtype
-        )
-        out[task_mask] = task_vector
-        return out
-
-    def _validate_prompt(self, prompt: str):
-        if self.point_token in prompt:
-            raise ValueError(
-                f"Do not manually include {self.point_token}; PAIR inserts it automatically"
-            )
-        if self.task_token in prompt:
-            raise ValueError(
-                f"Do not manually include {self.task_token}; PAIR appends it as the final readout token"
-            )
-        if self.pyramid_token in prompt:
-            raise ValueError(
-                f"Do not manually include {self.pyramid_token}; "
-                "PAIR inserts image-pyramid reasoning tokens automatically"
-            )
-
-    def _build_messages(
-        self,
-        prompt,
-        image_t1,
-        image_t2,
-        n_point_t1,
-        n_point_t2,
-        pyramid_plan=None,
-    ):
+    def _build_messages(self, prompt: str, image_t1: Any, image_t2: Any,
+                        point_count_t1: int, point_count_t2: int) -> List[Dict[str, Any]]:
         self._validate_prompt(prompt)
-
-        # Causal Qwen order:
-        #   task instruction -> Time 1 modalities -> Time 2 modalities -> <TASK>.
-        #
-        # For 2D PAIR, each temporal image is explicitly described to Qwen as
-        # a four-level visual pyramid.  P4/P8/P16 are custom compressed
-        # DeepStack token blocks and P32 is the native merged Qwen image-token
-        # block.  The textual labels are intentionally part of the LLM prompt:
-        # the model is told which pyramid level, decoder scale, source Vision
-        # layer and compressed token grid each custom block represents.
         content = [{"type": "text", "text": prompt.rstrip()}]
-
-        def append_image_pyramid(time_label, image):
-            if image is None:
-                return
-
-            if pyramid_plan:
-                content.append({
-                    "type": "text",
-                    "text": (
-                        f"{time_label} visual pyramid. "
-                        "The next token blocks are multi-scale Qwen Vision features "
-                        "for the same image. Use their level/scale labels when "
-                        "reasoning about semantic content and temporal change."
-                    ),
-                })
-                # Shallow -> deep so the later/deeper causal states can see the
-                # earlier high-resolution semantic context.
-                for item in pyramid_plan:
-                    count = int(item["count"])
-                    content.append({
-                        "type": "text",
-                        "text": (
-                            f"{time_label} pyramid {item['level']} "
-                            f"(decoder scale {item['scale']}; derived from Qwen "
-                            f"Vision DeepStack layer {item['layer_idx']}; "
-                            f"compressed to {item['grid']}x{item['grid']} "
-                            "reasoning tokens):\n"
-                            + self.pyramid_token * count
-                        ),
-                    })
-
-            content.extend([
-                {
-                    "type": "text",
-                    "text": (
-                        f"{time_label} pyramid P32 "
-                        "(decoder scale 1/32; native merged Qwen image tokens):"
-                    ),
-                },
-                {"type": "image", "image": image},
-            ])
-
-        append_image_pyramid("Time 1", image_t1)
-        if n_point_t1:
-            content.append({
-                "type": "text",
-                "text": "Time 1 point cloud:\n" + self.point_token * n_point_t1,
-            })
-
-        append_image_pyramid("Time 2", image_t2)
-        if n_point_t2:
-            content.append({
-                "type": "text",
-                "text": "Time 2 point cloud:\n" + self.point_token * n_point_t2,
-            })
-
-        # Keep exactly one PAIR readout marker after the complete bi-temporal
-        # context.  Its hidden state can therefore summarize every pyramid
-        # level from both times.
+        # The standard Qwen image content retains native vision DeepStack logic.
+        for time, image, count in (
+            ("Time 1", image_t1, point_count_t1),
+            ("Time 2", image_t2, point_count_t2),
+        ):
+            if image is not None:
+                content.extend([
+                    {"type": "text", "text": f"{time} image:"},
+                    {"type": "image", "image": image},
+                ])
+            if count:
+                content.append({"type": "text", "text": f"{time} point cloud:\n" + self.point_token * count})
+        # One TASK readout after all T1/T2 modalities for causal conditioning.
         content.append({"type": "text", "text": self.task_token})
         return [{"role": "user", "content": content}]
 
     @staticmethod
-    def _image_token_counts(image_grid_thw, merge):
+    def _image_token_counts(image_grid_thw: Optional[torch.Tensor], merge: int) -> List[int]:
         if image_grid_thw is None:
             return []
         counts = []
-        for row in image_grid_thw:
-            t, h_patch, w_patch = [int(x.item()) for x in row]
-            if h_patch % merge or w_patch % merge:
-                raise RuntimeError("Qwen image grid is not divisible by spatial_merge_size")
-            counts.append(t * (h_patch // merge) * (w_patch // merge))
+        for t, h, w in image_grid_thw.tolist():
+            if h % merge or w % merge:
+                raise ValueError(f"Image patch grid {(t, h, w)} is not divisible by {merge}")
+            counts.append(int(t * (h // merge) * (w // merge)))
         return counts
 
-    @staticmethod
-    def _assign_positions(mask, batch_idx, positions, start, count):
-        if count == 0:
-            return
-        selected = positions[start:start + count]
-        if selected.numel() != count:
-            raise RuntimeError(
-                f"Could not assign {count} token positions for batch item {batch_idx}"
-            )
-        mask[batch_idx, selected] = True
-
-    # ------------------------------------------------------------------
-    # Native batched processor input
-    # ------------------------------------------------------------------
-
     def prepare_inputs(
-        self,
-        *,
-        prompt,
-        images_t1=None,
-        images_t2=None,
-        point_tokens_t1=None,
-        point_tokens_t2=None,
-        pyramid_tokens_per_level: int = 0,
-        pyramid_grid_size: int = 8,
-    ):
-        # Prevent stale 2D features from a previous Qwen forward from being
-        # consumed accidentally (especially when alternating 2D and 3D batches).
+        self, *, prompt: Union[str, Sequence[str]], images_t1: Any = None,
+        images_t2: Any = None, point_tokens_t1: Any = None,
+        point_tokens_t2: Any = None,
+    ) -> Dict[str, Any]:
+        """Build one native Qwen processor batch with exact temporal masks.
+
+        Point tokens are embedded by an embedding hook at forward time, NOT via
+        tokenizer embedding weights. This preserves gradients to PointAdapter.
+        """
         self.clear_vision_intermediate_cache()
-
         prompts, single_input = self._prompt_batch(prompt)
-        bsz = len(prompts)
-        images1 = self._value_batch(images_t1, bsz, "images_t1")
-        images2 = self._value_batch(images_t2, bsz, "images_t2")
-        points1 = self._point_token_batch(point_tokens_t1, bsz, "point_tokens_t1")
-        points2 = self._point_token_batch(point_tokens_t2, bsz, "point_tokens_t2")
+        batch_size = len(prompts)
+        images1 = self._value_batch(images_t1, batch_size, "images_t1")
+        images2 = self._value_batch(images_t2, batch_size, "images_t2")
+        points1 = self._point_token_batch(point_tokens_t1, batch_size, "point_tokens_t1")
+        points2 = self._point_token_batch(point_tokens_t2, batch_size, "point_tokens_t2")
 
-        pyramid_tokens_per_level = int(pyramid_tokens_per_level)
-        pyramid_grid_size = int(pyramid_grid_size)
-        if pyramid_tokens_per_level < 0:
-            raise ValueError("pyramid_tokens_per_level must be >= 0")
-        if pyramid_grid_size <= 0:
-            raise ValueError("pyramid_grid_size must be > 0")
-        if pyramid_tokens_per_level not in (0, pyramid_grid_size * pyramid_grid_size):
-            raise ValueError(
-                "PAIR currently expects one square compressed token grid per "
-                "pyramid level: pyramid_tokens_per_level must equal "
-                "pyramid_grid_size**2"
-            )
-
-        shallow_idx, middle_idx, deep_idx = self.vision_intermediate_layers
-        pyramid_plan = []
-        if pyramid_tokens_per_level > 0:
-            pyramid_plan = [
-                {
-                    "level": "P4",
-                    "key": "p4",
-                    "scale": "1/4",
-                    "layer_idx": int(shallow_idx),
-                    "count": pyramid_tokens_per_level,
-                    "grid": pyramid_grid_size,
-                },
-                {
-                    "level": "P8",
-                    "key": "p8",
-                    "scale": "1/8",
-                    "layer_idx": int(middle_idx),
-                    "count": pyramid_tokens_per_level,
-                    "grid": pyramid_grid_size,
-                },
-                {
-                    "level": "P16",
-                    "key": "p16",
-                    "scale": "1/16",
-                    "layer_idx": int(deep_idx),
-                    "count": pyramid_tokens_per_level,
-                    "grid": pyramid_grid_size,
-                },
-            ]
-
-        messages_batch = []
-        image_list = []
-        image_records = []
+        messages, image_list, image_records = [], [], []
         point_counts_t1, point_counts_t2 = [], []
-
-        for b in range(bsz):
+        for b in range(batch_size):
             n1 = 0 if points1[b] is None else int(points1[b].shape[0])
             n2 = 0 if points2[b] is None else int(points2[b].shape[0])
             point_counts_t1.append(n1)
             point_counts_t2.append(n2)
+            messages.append(self._build_messages(prompts[b], images1[b], images2[b], n1, n2))
+            for label, img in (("t1", images1[b]), ("t2", images2[b])):
+                if img is not None:
+                    image_list.append(img)
+                    image_records.append((b, label))
 
-            messages = self._build_messages(
-                prompts[b],
-                images1[b],
-                images2[b],
-                n1,
-                n2,
-                pyramid_plan=pyramid_plan,
-            )
-            messages_batch.append(messages)
-
-            if images1[b] is not None:
-                image_list.append(images1[b])
-                image_records.append((b, "t1"))
-            if images2[b] is not None:
-                image_list.append(images2[b])
-                image_records.append((b, "t2"))
-
-        prompt_texts = [
-            self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            for messages in messages_batch
-        ]
-
-        kwargs = dict(text=prompt_texts, padding=True, return_tensors="pt")
+        prompt_texts = [self.processor.apply_chat_template(
+            msg, tokenize=False, add_generation_prompt=True
+        ) for msg in messages]
+        kwargs = {"text": prompt_texts, "padding": True, "return_tensors": "pt"}
         if image_list:
             kwargs["images"] = image_list
         inputs = self.processor(**kwargs)
-
         input_ids = inputs["input_ids"]
-        if input_ids.shape[0] != bsz:
-            raise RuntimeError(
-                f"Processor returned batch {input_ids.shape[0]}, expected {bsz}"
-            )
+        if input_ids.shape[0] != batch_size:
+            raise RuntimeError("Processor batch size mismatch")
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
+            raise RuntimeError("Processor attention_mask shape mismatch")
 
-        image_mask = input_ids == self.image_token_id
-        point_mask = input_ids == self.point_token_id
-        task_mask = input_ids == self.task_token_id
-        pyramid_mask = input_ids == self.pyramid_token_id
-        point_mask_t1 = torch.zeros_like(point_mask)
-        point_mask_t2 = torch.zeros_like(point_mask)
-        image_mask_t1 = torch.zeros_like(image_mask)
-        image_mask_t2 = torch.zeros_like(image_mask)
+        image_mask = input_ids.eq(self.image_token_id)
+        point_mask = input_ids.eq(self.point_token_id)
+        task_mask = input_ids.eq(self.task_token_id)
+        if not bool((task_mask.sum(dim=1) == 1).all()):
+            raise RuntimeError("Each sample must contain exactly one <TASK> position")
 
-        pyramid_masks_t1 = {
-            item["key"]: torch.zeros_like(pyramid_mask)
-            for item in pyramid_plan
-        }
-        pyramid_masks_t2 = {
-            item["key"]: torch.zeros_like(pyramid_mask)
-            for item in pyramid_plan
-        }
-
-        # Every sample owns exactly one task token.
-        task_counts = task_mask.sum(1)
-        if not torch.all(task_counts == 1):
-            raise RuntimeError(
-                f"Expected one {self.task_token} per sample, got {task_counts.tolist()}"
-            )
-
-        # Per-sample point temporal masks.
-        for b in range(bsz):
+        point_mask_t1, point_mask_t2 = torch.zeros_like(point_mask), torch.zeros_like(point_mask)
+        image_mask_t1, image_mask_t2 = torch.zeros_like(image_mask), torch.zeros_like(image_mask)
+        for b in range(batch_size):
             positions = torch.nonzero(point_mask[b], as_tuple=False).flatten()
             expected = point_counts_t1[b] + point_counts_t2[b]
             if positions.numel() != expected:
-                raise RuntimeError(
-                    f"Batch {b}: expected {expected} point placeholders, "
-                    f"tokenizer produced {positions.numel()}"
-                )
-            self._assign_positions(
-                point_mask_t1, b, positions, 0, point_counts_t1[b]
-            )
-            self._assign_positions(
-                point_mask_t2, b, positions, point_counts_t1[b], point_counts_t2[b]
-            )
+                raise RuntimeError(f"Batch {b}: point tokens {positions.numel()} != {expected}")
+            point_mask_t1[b, positions[:point_counts_t1[b]]] = True
+            point_mask_t2[b, positions[point_counts_t1[b]:]] = True
+            # Processor must not move point placeholders into temporal disorder.
+            if point_counts_t1[b] and point_counts_t2[b]:
+                if not bool((positions[:point_counts_t1[b]].max() < positions[point_counts_t1[b]:].min()).item()):
+                    raise RuntimeError("Point placeholder ordering invalid")
 
-        # Assign the custom pyramid placeholders in exactly the same causal
-        # order used by _build_messages: T1 P4/P8/P16, then T2 P4/P8/P16.
-        if pyramid_plan:
-            for b in range(bsz):
-                positions = torch.nonzero(
-                    pyramid_mask[b], as_tuple=False
-                ).flatten()
-                has_t1 = images1[b] is not None
-                has_t2 = images2[b] is not None
-                expected = (int(has_t1) + int(has_t2)) * sum(
-                    int(item["count"]) for item in pyramid_plan
-                )
-                if positions.numel() != expected:
-                    raise RuntimeError(
-                        f"Batch {b}: expected {expected} pyramid placeholders, "
-                        f"tokenizer produced {positions.numel()}"
-                    )
-                cursor = 0
-                for label, enabled, target_masks in (
-                    ("t1", has_t1, pyramid_masks_t1),
-                    ("t2", has_t2, pyramid_masks_t2),
-                ):
-                    if not enabled:
-                        continue
-                    for item in pyramid_plan:
-                        count = int(item["count"])
-                        self._assign_positions(
-                            target_masks[item["key"]],
-                            b,
-                            positions,
-                            cursor,
-                            count,
-                        )
-                        cursor += count
-                if cursor != positions.numel():
-                    raise RuntimeError(
-                        f"Batch {b}: pyramid placeholder accounting mismatch "
-                        f"{cursor} != {positions.numel()}"
-                    )
-        elif bool(pyramid_mask.any()):
-            raise RuntimeError(
-                "Prompt unexpectedly contains pyramid placeholders while "
-                "pyramid_tokens_per_level=0"
-            )
-
-        # Qwen stores one image_grid_thw row per flattened supplied image.
         grid = inputs.get("image_grid_thw")
-        image_counts_in_order = self._image_token_counts(
-            grid, int(self.vision_spatial_merge_size)
-        )
-        if len(image_counts_in_order) != len(image_records):
-            raise RuntimeError(
-                f"Qwen produced {len(image_counts_in_order)} image grids for "
-                f"{len(image_records)} supplied images"
-            )
-
-        image_counts_t1 = [0] * bsz
-        image_counts_t2 = [0] * bsz
-        image_grid_indices_t1 = [None] * bsz
-        image_grid_indices_t2 = [None] * bsz
-        image_position_cursor = [0] * bsz
-        image_positions = [
-            torch.nonzero(image_mask[b], as_tuple=False).flatten()
-            for b in range(bsz)
-        ]
-
-        for grid_idx, ((b, label), count) in enumerate(
-            zip(image_records, image_counts_in_order)
-        ):
-            start = image_position_cursor[b]
+        image_counts = self._image_token_counts(grid, self.vision_spatial_merge_size)
+        if len(image_counts) != len(image_records):
+            raise RuntimeError("Image records / Qwen image_grid_thw mismatch")
+        grid_t1, grid_t2 = [None]*batch_size, [None]*batch_size
+        counts_t1, counts_t2 = [0]*batch_size, [0]*batch_size
+        cursor = [0]*batch_size
+        for grid_idx, ((b, label), count) in enumerate(zip(image_records, image_counts)):
+            positions = torch.nonzero(image_mask[b], as_tuple=False).flatten()
+            selected = positions[cursor[b]:cursor[b]+count]
+            if selected.numel() != count:
+                raise RuntimeError(f"Batch {b}: native image token count mismatch")
             target = image_mask_t1 if label == "t1" else image_mask_t2
-            self._assign_positions(target, b, image_positions[b], start, count)
-            image_position_cursor[b] += count
-
+            target[b, selected] = True
+            cursor[b] += count
             if label == "t1":
-                image_counts_t1[b] += count
-                image_grid_indices_t1[b] = grid_idx
+                grid_t1[b], counts_t1[b] = grid_idx, count
             else:
-                image_counts_t2[b] += count
-                image_grid_indices_t2[b] = grid_idx
-
-        for b in range(bsz):
-            if image_position_cursor[b] != int(image_mask[b].sum().item()):
-                raise RuntimeError(
-                    f"Batch {b}: image token accounting mismatch "
-                    f"{image_position_cursor[b]} != {int(image_mask[b].sum().item())}"
-                )
+                grid_t2[b], counts_t2[b] = grid_idx, count
+        for b in range(batch_size):
+            if cursor[b] != int(image_mask[b].sum()):
+                raise RuntimeError(f"Batch {b}: unassigned Qwen image tokens")
 
         return {
-            "batch_size": bsz,
+            "batch_size": batch_size,
             "single_input": single_input,
-            "prompt_text": prompt_texts[0] if single_input else prompt_texts,
             "prompt_texts": prompt_texts,
             "inputs": inputs,
-
-            "image_mask": image_mask,
-            "image_mask_t1": image_mask_t1,
-            "image_mask_t2": image_mask_t2,
+            "point_tokens_t1": points1,
+            "point_tokens_t2": points2,
+            "point_counts_t1": point_counts_t1,
+            "point_counts_t2": point_counts_t2,
             "point_mask": point_mask,
             "point_mask_t1": point_mask_t1,
             "point_mask_t2": point_mask_t2,
+            "image_mask": image_mask,
+            "image_mask_t1": image_mask_t1,
+            "image_mask_t2": image_mask_t2,
             "task_mask": task_mask,
-            "pyramid_mask": pyramid_mask,
-            "pyramid_masks_t1": pyramid_masks_t1,
-            "pyramid_masks_t2": pyramid_masks_t2,
-            "pyramid_plan": tuple(dict(item) for item in pyramid_plan),
-            "pyramid_tokens_per_level": pyramid_tokens_per_level,
-            "pyramid_grid_size": pyramid_grid_size,
-
             "image_records": image_records,
-            "image_counts_in_order": image_counts_in_order,
-            "image_counts_t1": image_counts_t1,
-            "image_counts_t2": image_counts_t2,
-            "point_counts_t1": point_counts_t1,
-            "point_counts_t2": point_counts_t2,
-            "image_grid_indices_t1": image_grid_indices_t1,
-            "image_grid_indices_t2": image_grid_indices_t2,
+            "image_counts_in_order": image_counts,
+            "image_grid_indices_t1": grid_t1,
+            "image_grid_indices_t2": grid_t2,
+            "image_counts_t1": counts_t1,
+            "image_counts_t2": counts_t2,
+        }
 
-            # Backward-compatible single-sample aliases.
-            "image_count": int(image_mask.sum().item()),
-            "image_count_t1": image_counts_t1[0] if single_input else sum(image_counts_t1),
-            "image_count_t2": image_counts_t2[0] if single_input else sum(image_counts_t2),
-            "point_count": int(point_mask.sum().item()),
-            "point_count_t1": point_counts_t1[0] if single_input else sum(point_counts_t1),
-            "point_count_t2": point_counts_t2[0] if single_input else sum(point_counts_t2),
-            "task_count": int(task_mask.sum().item()),
-            "image_grid_index_t1": image_grid_indices_t1[0] if single_input else None,
-            "image_grid_index_t2": image_grid_indices_t2[0] if single_input else None,
+    # ------------------------------------------------------------------
+    # Native Qwen hooks, temporal hidden readout
+    # ------------------------------------------------------------------
+
+    def _language_module(self) -> nn.Module:
+        # Supports the base Qwen model as well as common PEFT LoRA wrappers.
+        queue, visited = [self.model], set()
+        while queue:
+            module = queue.pop(0)
+            if module is None or id(module) in visited:
+                continue
+            visited.add(id(module))
+            child = getattr(module, "language_model", None)
+            if isinstance(child, nn.Module):
+                return child
+            for field in ("base_model", "model"):
+                nxt = getattr(module, field, None)
+                if isinstance(nxt, nn.Module) and nxt is not module:
+                    queue.append(nxt)
+        raise RuntimeError("Qwen language_model module not found")
+
+    def _make_point_injection_hook(self, prepared: Dict[str, Any], stats: Dict[str, int]):
+        mask = prepared["point_mask"]
+        bsz, length = mask.shape
+        point_t1, point_t2 = prepared["point_tokens_t1"], prepared["point_tokens_t2"]
+        for b in range(bsz):
+            expected = sum(0 if x is None else x.shape[0] for x in (point_t1[b], point_t2[b]))
+            if int(mask[b].sum()) != expected:
+                raise RuntimeError(f"Batch {b}: point token injection mismatch")
+
+        def hook(module, args, output):
+            if not args or not torch.is_tensor(args[0]):
+                return output
+            ids = args[0]
+            # During generate(), the cached incremental steps contain only the
+            # newly generated token. Inject only the full prompt prefill.
+            if ids.shape != (bsz, length) or not torch.is_tensor(output):
+                return output
+            if output.shape != (bsz, length, self.hidden_size):
+                raise RuntimeError("Qwen token embedding dimensions changed")
+            if not bool(mask.any()):
+                return output
+            out = output.clone()
+            for b in range(bsz):
+                parts = [part for part in (point_t1[b], point_t2[b]) if part is not None]
+                if not parts:
+                    continue
+                values = torch.cat(parts, dim=0).to(device=out.device, dtype=out.dtype)
+                out[b, mask[b].to(out.device)] = values
+                stats["replaced"] += int(values.shape[0])
+            stats["prefill_calls"] += 1
+            return out
+        return hook
+
+    @staticmethod
+    def _capture_language_hidden(store: Dict[str, torch.Tensor]):
+        def hook(module, args, output):
+            hidden = getattr(output, "last_hidden_state", None)
+            if hidden is None and isinstance(output, (tuple, list)) and output:
+                hidden = output[0]
+            if torch.is_tensor(hidden):
+                store["last_hidden"] = hidden
+        return hook
+
+    @staticmethod
+    def _image_hidden_shape(inputs: Dict[str, Any], grid_idx: Optional[int], merge: int):
+        if grid_idx is None:
+            return None
+        t, hp, wp = [int(x) for x in inputs["image_grid_thw"][grid_idx].tolist()]
+        if hp % merge or wp % merge:
+            raise RuntimeError("Invalid image patch grid shape")
+        return t, hp//merge, wp//merge
+
+    def extract_temporal_hidden(self, *, last_hidden: torch.Tensor,
+                                prepared: Dict[str, Any]) -> Dict[str, Any]:
+        """Read Qwen T_mm from native image/point input positions, never LM head.
+
+        Returns per-phase lists to preserve ragged point token counts. All
+        tensors retain gradients when Qwen LoRA is trainable.
+        """
+        bsz = prepared["batch_size"]
+        if last_hidden.ndim != 3 or last_hidden.shape[:2] != prepared["inputs"]["input_ids"].shape:
+            raise ValueError("Qwen last_hidden must match prepared input_ids [B,L,D]")
+        if last_hidden.shape[-1] != self.hidden_size:
+            raise ValueError("Qwen last hidden dimension mismatch")
+
+        def gather(mask_key):
+            mask = prepared[mask_key].to(device=last_hidden.device)
+            return [last_hidden[b, mask[b]] for b in range(bsz)]
+
+        task_list = gather("task_mask")
+        if any(x.shape != (1, self.hidden_size) for x in task_list):
+            raise RuntimeError("Each sample must have exactly one task_hidden")
+        task_hidden = torch.cat(task_list, dim=0)
+
+        point1, point2 = gather("point_mask_t1"), gather("point_mask_t2")
+        for b in range(bsz):
+            if point1[b].shape[0] != prepared["point_counts_t1"][b]:
+                raise RuntimeError(f"T1 point readout count mismatch for batch {b}")
+            if point2[b].shape[0] != prepared["point_counts_t2"][b]:
+                raise RuntimeError(f"T2 point readout count mismatch for batch {b}")
+
+        def gather_visual(mask_key, grid_indices):
+            parts = gather(mask_key)
+            outputs = []
+            for b, (tokens, idx) in enumerate(zip(parts, grid_indices)):
+                shape = self._image_hidden_shape(prepared["inputs"], idx,
+                                                 self.vision_spatial_merge_size)
+                if shape is None:
+                    if tokens.numel():
+                        raise RuntimeError(f"Image {mask_key} grid missing for sample {b}")
+                    outputs.append(None)
+                else:
+                    if tokens.shape[0] != shape[0]*shape[1]*shape[2]:
+                        raise RuntimeError(f"Image {mask_key} token shape/count mismatch")
+                    outputs.append(tokens.reshape(*shape, self.hidden_size))
+            return outputs
+
+        return {
+            "task_hidden": task_hidden,
+            "llm_visual_t1": gather_visual("image_mask_t1", prepared["image_grid_indices_t1"]),
+            "llm_visual_t2": gather_visual("image_mask_t2", prepared["image_grid_indices_t2"]),
+            "llm_point_t1": point1,
+            "llm_point_t2": point2,
+        }
+
+    def forward(self, *, prompt: Union[str, Sequence[str]], images_t1: Any = None,
+                images_t2: Any = None, point_tokens_t1: Any = None,
+                point_tokens_t2: Any = None, return_logits: bool = False,
+                use_cache: bool = False, **qwen_kwargs) -> Dict[str, Any]:
+        """One Qwen forward; capture Q and T_mm without duplicating LM layers.
+
+        Boxes are produced separately by generate_box_proposals(), not inferred
+        from hidden values. point_tokens should come from PointAdapter.encode_single.
+        """
+        prepared = self.prepare_inputs(
+            prompt=prompt, images_t1=images_t1, images_t2=images_t2,
+            point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
+        )
+        inputs = {
+            k: value.to(self.model_device) if torch.is_tensor(value) else value
+            for k, value in prepared["inputs"].items()
+        }
+        prepared["inputs"] = inputs
+        capture: Dict[str, torch.Tensor] = {}
+        stats = {"replaced": 0, "prefill_calls": 0}
+        point_handle = None
+        if bool(prepared["point_mask"].any()):
+            point_handle = self.model.get_input_embeddings().register_forward_hook(
+                self._make_point_injection_hook(prepared, stats)
+            )
+        language_handle = self._language_module().register_forward_hook(
+            self._capture_language_hidden(capture)
+        )
+        if not return_logits and "logits_to_keep" not in qwen_kwargs:
+            qwen_kwargs["logits_to_keep"] = 1
+        try:
+            outputs = self.model(**inputs, return_dict=True, use_cache=use_cache, **qwen_kwargs)
+        finally:
+            language_handle.remove()
+            if point_handle is not None:
+                point_handle.remove()
+
+        if point_handle is not None:
+            expected = sum(prepared["point_counts_t1"]) + sum(prepared["point_counts_t2"])
+            if stats["prefill_calls"] != 1 or stats["replaced"] != expected:
+                raise RuntimeError(f"Point injection failed: {stats} != {expected} tokens")
+        if "last_hidden" not in capture:
+            raise RuntimeError("Qwen language_model forward did not expose last_hidden_state")
+        temporal = self.extract_temporal_hidden(last_hidden=capture["last_hidden"], prepared=prepared)
+        images_present = len(prepared["image_records"]) > 0
+        premerge = (self.get_temporal_vision_feature_maps(prepared)
+                    if images_present else {"t1": {}, "t2": {}})
+        return {
+            **temporal,
+            "premerge_t1": premerge["t1"],
+            "premerge_t2": premerge["t2"],
+            "prepared": prepared,
+            "qwen_outputs": outputs if return_logits else None,
+        }
+
+    # ------------------------------------------------------------------
+    # Optional autoregressive box proposal interface
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_box_json(text: str, *, kind: str, max_boxes: int) -> List[Dict[str, Any]]:
+        """Parse JSON proposal sequence. No implicit guessing of coordinate units."""
+        # A Qwen response may contain a brief preamble or markdown JSON fence.
+        start, stop = text.find("{"), text.rfind("}")
+        if start < 0 or stop <= start:
+            raise ValueError("Box response does not contain a JSON object")
+        try:
+            root = json.loads(text[start:stop+1])
+        except json.JSONDecodeError as exc:
+            raise ValueError("Box response is not valid JSON") from exc
+        if not isinstance(root, dict) or not isinstance(root.get("boxes"), list):
+            raise ValueError("Box response must be an object with 'boxes' array")
+        boxes = root["boxes"]
+        if len(boxes) > max_boxes:
+            raise ValueError(f"Box count {len(boxes)} exceeds max_boxes={max_boxes}")
+        size = 4 if kind == "2d" else 6
+        answer = []
+        for i, proposal in enumerate(boxes):
+            if not isinstance(proposal, dict):
+                raise ValueError(f"Box {i} must be a JSON object")
+            coords = proposal.get("box")
+            score = proposal.get("score", 1.0)
+            if not isinstance(coords, (list, tuple)) or len(coords) != size:
+                raise ValueError(f"Box {i} needs {size} xyz/xyxy coordinates")
+            try:
+                vals = [float(v) for v in coords]
+                confidence = float(score)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Box {i} coordinates or score are not numeric") from exc
+            if not bool(torch.isfinite(torch.tensor(vals+[confidence])).all()):
+                raise ValueError(f"Box {i} contains non-finite value")
+            if not (0 <= confidence <= 1):
+                raise ValueError(f"Box {i} score must be in [0,1]")
+            half = size//2
+            if any(vals[j] >= vals[j+half] for j in range(half)):
+                raise ValueError(f"Box {i} has nonpositive width/height/depth")
+            if kind == "2d":
+                if any(v < 0 or v > 1000 for v in vals):
+                    raise ValueError("Qwen 2D Box must use [0,1000] coordinates")
+                # Qwen grounding normally uses a 0..1000 box grid. The PAIR
+                # decoder consistently accepts normalized 0..1 xyxy.
+                vals = [v / 1000.0 for v in vals]
+            answer.append({"box": vals, "score": confidence})
+        return answer
+
+    def generate_box_proposals(
+        self, *, prompt: Union[str, Sequence[str]], kind: str,
+        images_t1: Any = None, images_t2: Any = None,
+        point_tokens_t1: Any = None, point_tokens_t2: Any = None,
+        scene_bounds: Optional[Sequence[Sequence[Sequence[float]]]] = None,
+        max_boxes: int = 64, max_new_tokens: int = 512,
+        **generate_kwargs,
+    ) -> Dict[str, Any]:
+        """Generate optional multi-region proposals via Qwen LM head.
+
+        Separate from forward() because discrete generated boxes are NOT a
+        differentiable prediction head. Grounding requires additional data/loss.
+        Returns a padded tensor contract consumed by PAIRChangeDecoder.
+        """
+        if kind not in ("2d", "3d"):
+            raise ValueError("kind must be '2d' or '3d'")
+        if max_boxes < 0 or max_new_tokens <= 0:
+            raise ValueError("max_boxes >= 0 and max_new_tokens > 0 required")
+        prompts, _ = self._prompt_batch(prompt)
+        if kind == "3d":
+            if scene_bounds is None or len(scene_bounds) != len(prompts):
+                raise ValueError("3D box generation requires scene_bounds [B,2,3]")
+            context = []
+            for b, bounds in enumerate(scene_bounds):
+                if torch.is_tensor(bounds):
+                    bounds = bounds.detach().cpu().tolist()
+                if len(bounds) != 2 or any(len(row) != 3 for row in bounds):
+                    raise ValueError("scene_bounds must contain [min_xyz,max_xyz] pairs")
+                context.append(
+                    "The point clouds share the world XYZ coordinate frame. "
+                    f"Bounds are {json.dumps(bounds)}. Propose axis-aligned regions "
+                    "in this SAME world frame, as [xmin,ymin,zmin,xmax,ymax,zmax]."
+                )
+        else:
+            context = ["Give Qwen-style image coordinates [x1,y1,x2,y2] on a [0,1000] grid. For example, half-width is 500."]*len(prompts)
+        grounding_prompts = [
+            p.rstrip() + "\nFind up to " + str(max_boxes) + " candidate CHANGE REGIONS. "
+            + context[b]
+            + " Use regions, not one box per object. There may be zero changes. "
+              "Reply ONLY with strict JSON: {\"boxes\":[{\"box\":[...],\"score\":0.9},...]}. "
+              "Do not include markdown or other text."
+            for b,p in enumerate(prompts)
+        ]
+        prepared = self.prepare_inputs(
+            prompt=grounding_prompts, images_t1=images_t1, images_t2=images_t2,
+            point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
+        )
+        inputs = {k: v.to(self.model_device) if torch.is_tensor(v) else v
+                  for k,v in prepared["inputs"].items()}
+        prepared["inputs"] = inputs
+        stats = {"replaced": 0, "prefill_calls": 0}
+        handle = None
+        if bool(prepared["point_mask"].any()):
+            handle = self.model.get_input_embeddings().register_forward_hook(
+                self._make_point_injection_hook(prepared, stats)
+            )
+        try:
+            with torch.no_grad():
+                generated = self.model.generate(
+                    **inputs, max_new_tokens=max_new_tokens, **generate_kwargs
+                )
+        finally:
+            if handle is not None:
+                handle.remove()
+        if handle is not None:
+            expected = sum(prepared["point_counts_t1"]) + sum(prepared["point_counts_t2"])
+            if stats["prefill_calls"] != 1 or stats["replaced"] != expected:
+                raise RuntimeError("Point tokens not injected during box generation prefill")
+        sequences = generated.sequences if hasattr(generated, "sequences") else generated
+        if sequences.ndim != 2 or sequences.shape[0] != prepared["batch_size"]:
+            raise RuntimeError("Qwen generation must return one sequence per batch item")
+        generated_only = sequences[:, inputs["input_ids"].shape[1]:]
+        texts = self.tokenizer.batch_decode(generated_only, skip_special_tokens=True)
+        proposals = [self._parse_box_json(t, kind=kind, max_boxes=max_boxes) for t in texts]
+        dim = 4 if kind == "2d" else 6
+        boxes = torch.zeros(len(proposals), max_boxes, dim, device=self.model_device)
+        scores = torch.zeros(len(proposals), max_boxes, device=self.model_device)
+        valid = torch.zeros(len(proposals), max_boxes, dtype=torch.bool, device=self.model_device)
+        for b, items in enumerate(proposals):
+            for i, item in enumerate(items):
+                boxes[b,i] = torch.tensor(item["box"], device=boxes.device)
+                scores[b,i] = item["score"]
+                valid[b,i] = True
+        return {
+            ("boxes_2d" if kind == "2d" else "boxes_3d"): boxes,
+            "box_scores": scores,
+            "box_valid": valid,
+            "box_texts": texts,
         }
 
 
 if __name__ == "__main__":
-    print("qwen3vl_backbone.py batch-aware temporal import OK")
+    print("PAIR Qwen native DeepStack backbone; invoke after loading checkpoint")

@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-PAIR multi-dataset training.
+PAIR multi-dataset training for native Qwen3-VL DeepStack + 2D/3D adapters.
+
+Box guidance uses explicitly supplied proposals, or an explicitly enabled
+evaluation-only Qwen generator. This file does NOT train the autoregressive
+box generator. It never constructs evaluation boxes from ground-truth masks.
 
 Model construction lives in models/pair.py. This file owns only:
     config/runtime
@@ -71,7 +75,7 @@ from models.pair import PAIRModel
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, default=Path("configs/pair_train.json"))
+    p.add_argument("--config", type=Path, default=Path("configs/pair_train_qwen4b.json"))
     p.add_argument("--datasets", nargs="+", default=None)
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--resume", type=Path, default=None)
@@ -117,6 +121,8 @@ def build_settings(experiment: ExperimentConfig, cli):
         output_dir=Path(output_dir),
         resume=cli.resume,
         seed=int(experiment.experiment.get("seed", 42)),
+        train_box_mode=str(t.get("box_mode", "none")).strip().lower(),
+        val_box_mode=str(v.get("box_mode", "none")).strip().lower(),
     )
 
 
@@ -271,46 +277,117 @@ def merge_targets(samples, route):
 
 
 # =============================================================================
+# Optional multi-box proposals (never inferred from validation ground truth)
+# =============================================================================
+
+def validate_box_modes(settings):
+    if settings.train_box_mode not in {"none", "provided"}:
+        raise ValueError("training.box_mode must be 'none' or 'provided'; "
+                         "autoregressive Qwen boxes are not trained by Mask Loss")
+    if settings.val_box_mode not in {"none", "provided", "generated"}:
+        raise ValueError("validation.box_mode must be 'none', 'provided' or 'generated'")
+
+
+def collate_box_proposals(samples, route, *, device, max_proposals):
+    """Pad per-sample already-normalized 2D / world-XYZ 3D proposals.
+
+    Required top-level sample key: boxes_2d [K,4] or boxes_3d [K,6].
+    Optional top-level keys: box_valid [K] and box_scores [K].
+    Proposals must be produced independently of *validation targets*.
+    """
+    key = {"2d": "boxes_2d", "3d": "boxes_3d"}.get(route)
+    if key is None:
+        raise NotImplementedError(f"Box collation does not support route={route}")
+    d = 4 if route == "2d" else 6
+    lengths, boxes_list, valid_list, score_list = [], [], [], []
+    for i, sample in enumerate(samples):
+        if key not in sample:
+            raise KeyError(f"Sample {i} has no {key}; 'provided' box_mode requires "
+                           "proposals in the dataset sample (not in target)")
+        boxes = torch.as_tensor(sample[key], dtype=torch.float32, device=device)
+        if boxes.ndim != 2 or boxes.shape[1] != d:
+            raise ValueError(f"Sample {i} {key} must have shape [K,{d}]")
+        k = boxes.shape[0]
+        if k > max_proposals:
+            raise ValueError(f"Sample {i} has K={k} boxes, max={max_proposals}; "
+                             "select upstream instead of silently truncating")
+        valid = torch.as_tensor(sample.get("box_valid", torch.ones(k, dtype=torch.bool)),
+                                device=device)
+        score = torch.as_tensor(sample.get("box_scores", torch.ones(k)),
+                                dtype=torch.float32, device=device)
+        if valid.dtype != torch.bool or valid.shape != (k,):
+            raise ValueError(f"Sample {i} box_valid must be bool [K]")
+        if score.shape != (k,) or not bool(torch.isfinite(score).all()) or \
+                bool(((score < 0) | (score > 1)).any()):
+            raise ValueError(f"Sample {i} box_scores must be finite [K] in [0,1]")
+        if not bool(torch.isfinite(boxes).all()):
+            raise ValueError(f"Sample {i} {key} contains nonfinite coordinates")
+        if bool(valid.any()):
+            kept = boxes[valid]
+            if not bool((kept[:,d//2:] > kept[:,:d//2]).all()):
+                raise ValueError(f"Sample {i} valid {key} must have min < max")
+            if route == "2d" and bool(((kept < 0) | (kept > 1)).any()):
+                raise ValueError("2D proposal coordinates must be normalized to [0,1]")
+        lengths.append(k)
+        boxes_list.append(boxes)
+        valid_list.append(valid)
+        score_list.append(score)
+    max_k = max(lengths, default=0)
+    padded = torch.zeros(len(samples), max_k, d, dtype=torch.float32, device=device)
+    padded_valid = torch.zeros(len(samples), max_k, dtype=torch.bool, device=device)
+    padded_scores = torch.zeros(len(samples), max_k, dtype=torch.float32, device=device)
+    for i, k in enumerate(lengths):
+        padded[i, :k] = boxes_list[i]
+        padded_valid[i, :k] = valid_list[i]
+        padded_scores[i, :k] = score_list[i]
+    return {key: padded, "box_valid": padded_valid, "box_scores": padded_scores}
+
+
+# =============================================================================
 # Forward / loss / validation
 # =============================================================================
 
-def forward_loss(model, criterion, samples, spec):
+def forward_loss(model, criterion, samples, spec, *, box_mode="none"):
+    """Forward the new PAIRModel and supervise its flat logits.
+
+    box_mode='provided': use dataset-provided proposals; these are not treated
+    as grounding labels, and Mask Loss alone cannot train Qwen's box generator.
+    box_mode='generated': validation ONLY; never train with autoregressive boxes.
+    """
+    if box_mode not in ("none", "provided", "generated"):
+        raise ValueError(f"Invalid box_mode={box_mode!r}")
+    if box_mode == "generated" and model.training:
+        raise RuntimeError("Box generation is evaluation-only")
+    base = unwrap(model)
     prompts = [sample["prompt"] for sample in samples]
+    if box_mode == "provided":
+        boxes = collate_box_proposals(samples, spec.route,
+                                     device=next(base.parameters()).device,
+                                     max_proposals=base.box_max_proposals)
+    else:
+        boxes = {}
+    common = {"prompts": prompts, "class_names": spec.class_names,
+              "generate_boxes": box_mode == "generated", **boxes}
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
         prediction_mode = "bcd" if spec.label_mode == "binary" else "scd"
         prediction = model(
             images_t1=[sample["images_t1"] for sample in samples],
             images_t2=[sample["images_t2"] for sample in samples],
-            prompts=prompts,
-            class_names=spec.class_names,
             output_sizes=output_sizes,
             prediction_mode=prediction_mode,
+            **common,
         )
     elif spec.route == "3d":
         prediction = model(
             point_dicts_t1=[sample["point_dict_t1"] for sample in samples],
             point_dicts_t2=[sample["point_dict_t2"] for sample in samples],
-            prompts=prompts,
-            class_names=spec.class_names,
+            **common,
         )
     else:
-        raise NotImplementedError("PAIR 2D+3D training waits for real world-coordinate image/point correspondence")
+        raise NotImplementedError("PAIR 2D+3D training requires calibrated image/point correspondence")
     target = merge_targets(samples, spec.route)
-
-    # 2D semantic-pair SCD follows the same supervision split used by the
-    # reference SCD implementations: the binary branch learns changed vs
-    # unchanged over the full valid image, while semantic CE/Lovasz learn
-    # semantic discrimination only on changed pixels.
-    #
-    # Keep every other route unchanged:
-    #   - 2D BCD: semantic supervision remains inactive
-    #   - 3D: semantic loss stays full-valid
-    #   - post_semantic / future routes keep their existing protocol
-    semantic_changed_only = (
-        spec.route == "2d" and spec.label_mode == "semantic_pair"
-    )
-
+    semantic_changed_only = spec.route == "2d" and spec.label_mode == "semantic_pair"
     loss_output = criterion(
         prediction=prediction,
         target=target,
@@ -345,7 +422,7 @@ def validate(model, criterion, loader, spec, runtime, settings):
     )
     for samples in progress:
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec)
+            prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec, box_mode=settings.val_box_mode)
         evaluator.update(prediction, merged_target)
         batch_n = len(samples)
         for key, value in loss_output.as_dict().items():
@@ -467,57 +544,33 @@ def optimizer_group_snapshot(optimizer):
 
 
 def _architecture_module_bucket(parameter_name: str) -> str:
-    """
-    Put every model parameter into one architecture-level row.
-
-    The rows are intentionally ordered to match the actual PAIR data flow:
-        Qwen Vision -> Utonia -> PointAdapter -> Qwen LLM
-        -> decoders -> output heads
-    """
+    """Group real PAIR modules for the updated Qwen/Adapter/Decoder topology."""
     name = parameter_name.lower()
-
-    # ------------------------------------------------------------------
-    # Foundation backbones / adapters
-    # ------------------------------------------------------------------
     if name.startswith("backbone.qwen_backbone."):
-        if ".visual." in name:
-            return "Qwen Vision"
-        return "Qwen LLM"
-
+        return "Qwen Vision" if ".visual." in name else "Qwen LLM"
     if name.startswith("backbone.point_encoder."):
         return "Utonia"
-
     if name.startswith("backbone.point_adapter."):
         return "PointAdapter"
-
-    # ------------------------------------------------------------------
-    # Decoders
-    # ------------------------------------------------------------------
-    if name.startswith("decoder.cg_decoder_2d."):
-        return "2D CGDecoder"
-
-    # Output heads are separated from the decoder core below.
-    if name.startswith("decoder.classifier_cd."):
-        return "2D Change Head"
-
-    if name.startswith("decoder.class_encoder.") or name == "decoder.logit_scale":
-        return "Semantic Prototype Head"
-
-    if name.startswith("decoder.event_head."):
-        return "3D Event Head"
-
-    # Everything else under decoder is the shared/unified token decoder core:
-    # token embedding, reasoning projection/injection, temporal fusion,
-    # task conditioning, shared blocks, semantic/change latent heads.
-    if name.startswith("decoder."):
-        return "Unified Decoder"
-
-    # 2D final Qwen-ViT dense tokens -> decoder_dim before dense/LLM cross-attention.
     if name.startswith("image_adapter."):
-        return "Image Adapter"
-
-    prefix = parameter_name.split(".", 1)[0]
-    return f"Other ({prefix})"
+        return "ImageAdapter"
+    if name.startswith("decoder.class_encoder."):
+        return "Class/Task Encoder"
+    if name.startswith("decoder.query_decoder."):
+        return "Shared Query Decoder"
+    if name.startswith("decoder.image_semantic_head."):
+        return "2D Semantic Head"
+    if name.startswith("decoder.image_change_head."):
+        return "2D Change Head"
+    if name.startswith("decoder.point_semantic_head."):
+        return "3D Semantic Head"
+    if name.startswith("decoder.point_event_head.") or name.startswith("decoder.event_prototypes"):
+        return "3D Event Head"
+    if name.startswith("decoder.box_guidance."):
+        return "Multi-box Guidance"
+    if name.startswith("decoder."):
+        return "Temporal Fusion"
+    return f"Other ({parameter_name.split('.', 1)[0]})"
 
 
 def _lora_rank_from_entries(entries):
@@ -618,16 +671,10 @@ def print_trainable_parameter_report(model, optimizer):
             info["trainable_groups"].add(group_name)
 
     preferred_order = (
-        "Qwen Vision",
-        "Utonia",
-        "PointAdapter",
-        "Qwen LLM",
-        "2D CGDecoder",
-        "Unified Decoder",
-        "Semantic Prototype Head",
-        "2D Change Head",
-        "3D Event Head",
-        "Image Adapter",
+        "Qwen Vision", "Utonia", "PointAdapter", "Qwen LLM", "ImageAdapter",
+        "Class/Task Encoder", "Shared Query Decoder", "Temporal Fusion",
+        "Multi-box Guidance", "2D Semantic Head", "2D Change Head",
+        "3D Semantic Head", "3D Event Head",
     )
     ordered_names = [name for name in preferred_order if name in modules]
     ordered_names += sorted(
@@ -718,94 +765,79 @@ def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
 # Checkpoints
 # =============================================================================
 
+CHECKPOINT_FORMAT_VERSION = 3
+CHECKPOINT_ARCHITECTURE = "PAIR-Qwen3VL-native-DeepStack-query-multibox-v1"
 FOUNDATION_STATE_PREFIXES = (
     "backbone.qwen_backbone.model.",
-    "point_encoder.model.",
+    "backbone.point_encoder.model.",
 )
 
 
 def _is_foundation_state_name(name):
-    return any(name.startswith(prefix) for prefix in FOUNDATION_STATE_PREFIXES)
+    return name.startswith(FOUNDATION_STATE_PREFIXES)
 
 
 def pair_checkpoint_state(model):
-    """
-    Return the PAIR state that must be checkpointed outside the separately
-    stored Qwen/Utonia LoRA adapters.
+    """Save adapters, decoder, and every trainable non-foundation parameter.
 
-    This includes:
-      - every trainable non-foundation parameter;
-      - every persistent non-foundation buffer (notably BatchNorm running
-        statistics and num_batches_tracked).
-
-    Frozen foundation-model weights/buffers are intentionally excluded because
-    they are restored from their pretrained checkpoints. Qwen/Utonia LoRA
-    parameters are also excluded here because they are saved separately.
+    Qwen/Utonia LoRA is saved separately. If full Qwen tuning is enabled,
+    include its trainable weights as well; never silently discard them.
+    Frozen original foundation weights remain sourced from their checkpoints.
     """
     base = unwrap(model)
+    include_full_qwen = getattr(base, "qwen_tuning", "lora") == "full"
     state = base.state_dict()
-
-    trainable_names = {
-        name
-        for name, parameter in base.named_parameters()
-        if parameter.requires_grad and not _is_foundation_state_name(name)
+    trainable = {
+        name for name, param in base.named_parameters()
+        if param.requires_grad and (not _is_foundation_state_name(name)
+                                    or (include_full_qwen and name.startswith("backbone.qwen_backbone.model.")))
     }
-    buffer_names = {
-        name
-        for name, _ in base.named_buffers()
+    buffers = {
+        name for name, _ in base.named_buffers()
         if not _is_foundation_state_name(name)
+        or (include_full_qwen and name.startswith("backbone.qwen_backbone.model."))
     }
-    names = trainable_names | buffer_names
-
-    return {
-        key: value.detach().cpu()
-        for key, value in state.items()
-        if key in names
-    }
+    return {name: value.detach().cpu() for name, value in state.items()
+            if name in trainable or name in buffers}
 
 
 def load_model_state_from_checkpoint(ckpt, model):
-    """Restore model weights/buffers without touching optimizer state.
+    """Strict resume for this architecture; older PAIR versions need conversion.
 
-    New checkpoints use ``pair_state`` and include non-foundation buffers.
-    ``pair_trainable`` is accepted only so existing pre-fix checkpoints can be
-    loaded for BN recalibration/recovery. Those old checkpoints cannot restore
-    their original BatchNorm running statistics because the buffers were never
-    saved.
+    Do not silently accept missing/newly initialized modules while restoring an
+    optimizer state, since that would masquerade as a faithful training resume.
     """
-    base = unwrap(model)
-
-    pair_state = ckpt.get("pair_state")
-    legacy_missing_buffers = pair_state is None
-    if pair_state is None:
-        pair_state = ckpt.get("pair_trainable", {})
-
-    if pair_state:
-        current = base.state_dict()
-        current.update(pair_state)
-        base.load_state_dict(current, strict=False)
-
-    # Compatibility with pre-PAIRModel checkpoints. strict=False is intentional:
-    # old decoder checkpoints do not contain the newer event head.
-    if "decoder" in ckpt:
-        base.decoder.load_state_dict(ckpt["decoder"], strict=False)
-    if "image_adapter" in ckpt and base.image_adapter is not None:
-        base.image_adapter.load_state_dict(ckpt["image_adapter"], strict=False)
-
-    load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
-    load_custom_lora_state_dict(
-        base.qwen_backbone.model,
-        ckpt.get("vision_lora", {}),
-        kind="vision",
-    )
-    if base.point_encoder is not None:
-        load_custom_lora_state_dict(
-            base.point_encoder.model,
-            ckpt.get("point_lora", {}),
-            kind="utonia",
+    if ckpt.get("checkpoint_format_version") != CHECKPOINT_FORMAT_VERSION or \
+            ckpt.get("architecture") != CHECKPOINT_ARCHITECTURE:
+        raise RuntimeError(
+            "Checkpoint does not match the rebuilt PAIR architecture. "
+            "Old Pyramid/decoder checkpoints cannot be resumed with this train.py; "
+            "start a new run or write an explicit weight-conversion script."
         )
-
-    return legacy_missing_buffers
+    base = unwrap(model)
+    saved = ckpt.get("pair_state")
+    if not isinstance(saved, dict):
+        raise RuntimeError("Missing pair_state in checkpoint")
+    expected = pair_checkpoint_state(base)
+    missing = set(expected) - set(saved)
+    unexpected = set(saved) - set(expected)
+    bad_shapes = [k for k in expected.keys() & saved.keys()
+                  if tuple(expected[k].shape) != tuple(saved[k].shape)]
+    if missing or unexpected or bad_shapes:
+        raise RuntimeError("PAIR checkpoint state mismatch: "
+                           f"missing={sorted(missing)[:12]}, "
+                           f"unexpected={sorted(unexpected)[:12]}, "
+                           f"shape_mismatch={sorted(bad_shapes)[:12]}")
+    current = base.state_dict()
+    current.update(saved)
+    base.load_state_dict(current, strict=True)
+    load_lora_state_dict(base.qwen_backbone.model, ckpt.get("lora", {}))
+    load_custom_lora_state_dict(base.qwen_backbone.model,
+                               ckpt.get("vision_lora", {}), kind="vision")
+    if base.point_encoder is not None:
+        load_custom_lora_state_dict(base.point_encoder.model,
+                                   ckpt.get("point_lora", {}), kind="utonia")
+    return False
 
 
 def save_checkpoint(
@@ -828,7 +860,8 @@ def save_checkpoint(
         "epoch": int(epoch),
         "update_in_epoch": int(update_in_epoch),
         "optimizer_step": int(optimizer_step),
-        "checkpoint_format_version": 2,
+        "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+        "architecture": CHECKPOINT_ARCHITECTURE,
         "pair_state": pair_checkpoint_state(model),
         "lora": lora_state_dict(base.qwen_backbone.model),
         "vision_lora": custom_lora_state_dict(
@@ -853,16 +886,18 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
-def load_checkpoint(path, model, optimizer, scheduler):
+def load_checkpoint(path, model, optimizer, scheduler, *,
+                    selected_datasets=None, model_config=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    legacy_missing_buffers = load_model_state_from_checkpoint(ckpt, model)
-    if legacy_missing_buffers:
-        print(
-            "Warning: legacy checkpoint uses pair_trainable and does not contain "
-            "non-parameter buffers such as BatchNorm running statistics. "
-            "Resume is allowed for recovery, but exact eval-state restoration is "
-            "not possible without BN recalibration."
-        )
+    if selected_datasets is not None and tuple(ckpt.get("selected_datasets", ())) != tuple(selected_datasets):
+        raise RuntimeError("Resume selected_datasets differ from the checkpoint: "
+                           f"saved={ckpt.get('selected_datasets')}, "
+                           f"current={list(selected_datasets)}")
+    saved_model_cfg = ckpt.get("config", {}).get("model")
+    if model_config is not None and saved_model_cfg != dict(model_config):
+        raise RuntimeError("Resume model configuration differs from checkpoint; "
+                           "architecture/weights or training setup may differ")
+    load_model_state_from_checkpoint(ckpt, model)
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return (
@@ -1122,6 +1157,7 @@ def main():
         settings = build_settings(experiment, cli)
         if settings.grad_accum < 1:
             raise ValueError("training.grad_accum must be >= 1")
+        validate_box_modes(settings)
 
         set_seed(settings.seed, runtime["rank"])
         if runtime["is_main"]:
@@ -1139,6 +1175,8 @@ def main():
                 print("Resume:", settings.resume)
             print()
 
+        if any(experiment.datasets[n].spec.route == "2d3d" for n in experiment.selected_names):
+            raise NotImplementedError("2D+3D joint training requires calibrated image/point geometry")
         registry = DatasetRegistry(experiment, runtime, num_workers=settings.num_workers)
         dataset_scheduler = MultiDatasetScheduler(experiment, registry, settings.grad_accum)
         updates_per_epoch = dataset_scheduler.updates_per_epoch
@@ -1153,6 +1191,9 @@ def main():
             runtime["device"],
             **model_flags,
         )
+        if settings.train_box_mode == "provided" and settings.val_box_mode == "generated":
+            print("NOTE: training uses provided proposals but validation uses predicted boxes; "
+                  "check proposal distribution shift.")
         if runtime["distributed"]:
             model = DDP(
                 model,
@@ -1179,7 +1220,11 @@ def main():
                 optimizer_step,
                 loaded_best_values,
                 loaded_best_epochs,
-            ) = load_checkpoint(settings.resume, model, optimizer, scheduler)
+            ) = load_checkpoint(
+                settings.resume, model, optimizer, scheduler,
+                selected_datasets=experiment.selected_names,
+                model_config=experiment.model,
+            )
             dataset_best_values.update(loaded_best_values)
             dataset_best_epochs.update(loaded_best_epochs)
 
@@ -1215,6 +1260,12 @@ def main():
             print("PAIR MULTI-DATASET TRAINING")
             print("=" * 96)
             print("Experiment:", experiment.experiment["name"])
+            print(f"Box guidance: train={settings.train_box_mode}, val={settings.val_box_mode}")
+            if settings.train_box_mode == "none":
+                print("NOTE: Box-guided Decoder weights receive no Box-specific "
+                      "training signal without provided proposals.")
+            print("NOTE: Qwen autoregressive Box grounding is NOT trained by this "
+                  "Mask Loss training loop; it needs a separate grounding objective.")
             print("Datasets:", ", ".join(experiment.selected_names))
             print(
                 "Active model routes:",
@@ -1290,7 +1341,7 @@ def main():
                         sync_context = model.no_sync()
                     with sync_context:
                         with torch.autocast("cuda", dtype=torch.bfloat16):
-                            _, loss_output, _ = forward_loss(model, criterion, samples, spec)
+                            _, loss_output, _ = forward_loss(model, criterion, samples, spec, box_mode=settings.train_box_mode)
                             loss = loss_output.total / accumulation_steps
                         loss.backward()
                     for key, value in loss_output.as_dict().items():
