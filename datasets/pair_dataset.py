@@ -395,47 +395,31 @@ def build_canonical_target(
 
 
 def build_default_prompt(spec: DatasetSpec) -> str:
-    # Dataset-specific context is explicit in JSON so Qwen receives more than
-    # only a generic route label.  Structural routing is still inferred from
-    # the prepared directory; description is semantic/task context only.
-    text = spec.description.strip()
-    if text and not text.endswith((".", "!", "?")):
-        text += "."
-    if text:
-        text += " "
+    """Compact task prompt: keep useful dataset context, remove duplicated prose."""
+    description = spec.description.strip()
+    summary = description.split(".", 1)[0].strip() if description else ""
+    parts = [summary] if summary else []
 
     if spec.has_point:
-        text += (
-            "Perform 3D semantic change reasoning between Time 1 and Time 2. "
-            "Predict the semantic class at both times and the per-point change event."
+        parts.append(
+            "3D SCD: semantic T1/T2; events T1 0=unchanged,1=removed; "
+            "T2 0=unchanged,2=added."
         )
+    elif spec.label_mode == "semantic_pair":
+        parts.append("2D SCD: detect change; classify changed pixels at T1/T2.")
+    elif spec.label_mode == "post_semantic":
+        parts.append("2D change detection: detect change; classify supervised T2 semantics.")
+    elif spec.label_mode == "binary":
+        parts.append("2D binary change detection.")
     else:
-        text += (
-            "Perform change detection between Time 1 and Time 2. "
-            "Identify unchanged and changed regions."
-        )
-        if spec.label_mode == "semantic_pair":
-            text += " For changed regions, infer the semantic class before and after change."
-        elif spec.label_mode == "post_semantic":
-            text += (
-                " The pre-change semantic class may be unknown, while the post-change "
-                "class is supervised."
-            )
-        elif spec.label_mode == "binary":
-            text += (
-                " The source dataset provides binary change supervision only; do not "
-                "assume per-time semantic labels are available."
-            )
+        parts.append("Change detection T1->T2.")
 
     if spec.class_names:
-        classes = ", ".join(f"{raw_id}: {name}" for raw_id, name in spec.class_names.items())
-        if spec.label_mode == "binary":
-            text += " Valid change labels are: " + classes + "."
-        elif spec.label_mode == "post_semantic":
-            text += " Valid supervised semantic classes are: " + classes + "."
-        else:
-            text += " Valid semantic classes are: " + classes + "."
-    return text
+        classes = ",".join(
+            f"{raw_id}={name}" for raw_id, name in spec.class_names.items()
+        )
+        parts.append("Classes:" + classes + ".")
+    return " ".join(part for part in parts if part)
 
 
 # =============================================================================

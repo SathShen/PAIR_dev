@@ -422,11 +422,6 @@ class PredictionLogits:
     class_names: Tuple[str, ...] = ()
     updated_queries: Optional[torch.Tensor] = None
     box_guidance_applied: bool = False
-    # Inference-only Qwen proposals. The same boxes were used by Decoder.
-    # Kept separate from GT so validation cannot accidentally leak labels.
-    box_predictions: Optional[torch.Tensor] = None  # [B,K,4] or [B,K,6]
-    box_prediction_valid: Optional[torch.Tensor] = None  # [B,K]
-    box_prediction_scores: Optional[torch.Tensor] = None  # [B,K]
 
 
 class QueryConditionedClassHead(nn.Module):
@@ -1429,9 +1424,8 @@ class PAIRChangeDecoder(nn.Module):
 # =============================================================================
 # Weak Box supervision (joint grounding + mask training)
 # =============================================================================
-# Weak target preparation colocated with Box-guided prediction.
-# Train uses targets for teacher-forcing; val may derive weak GT solely
-# for post-forward Box metrics, never as model inputs.
+# Training-only target preparation, colocated with Box-guided prediction.
+# It does not modify PAIRChangeDecoder.forward_2d/forward_3d or inference.
 
 def _xy_buckets(xy: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor, side: int):
     span = (upper - lower).clamp_min(1e-5)
@@ -1542,8 +1536,11 @@ def build_grounding_supervision(samples: Sequence[Dict[str, Any]], route: str, *
                         else:
                             coords[axis] = 999
                             coords[axis+3] = 1000
-            formatted.append({"box": coords, "score": 1.0})
-        json_targets.append(json.dumps({"boxes": formatted}, separators=(",", ":")))
+            # Textual score carried no supervision signal: every GT score was
+            # exactly 1.0. Keep confidence as an internal decoder tensor, but
+            # train Qwen on the shortest unambiguous coordinate protocol.
+            formatted.append(coords)
+        json_targets.append(json.dumps(formatted, separators=(",", ":")))
     b = len(samples)
     k = max((box.shape[0] for box in tensors), default=0)
     padded = torch.zeros((b, k, dims), device=device, dtype=torch.float32)

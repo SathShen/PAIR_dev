@@ -451,7 +451,7 @@ class PAIRModel(nn.Module):
             prompt=prompts, images_t1=images1, images_t2=images2,
             grounding_targets=grounding_targets,
             grounding_kind="2d" if grounding_targets is not None else None,
-            grounding_max_boxes=self.box_max_proposals,
+            grounding_max_boxes=self.box_generation_max_boxes,
         )
         features = self.image_adapter(
             premerge_t1=qwen_out["premerge_t1"],
@@ -550,7 +550,7 @@ class PAIRModel(nn.Module):
             grounding_targets=grounding_targets,
             grounding_kind="3d" if grounding_targets is not None else None,
             grounding_scene_bounds=scene_bounds if grounding_targets is not None else None,
-            grounding_max_boxes=self.box_max_proposals,
+            grounding_max_boxes=self.box_generation_max_boxes,
         )
         features = self.point_adapter.fuse_temporal(
             t1, t2,

@@ -448,16 +448,16 @@ class Qwen3VLBackbone(nn.Module):
         content = [{"type": "text", "text": prompt.rstrip()}]
         # The standard Qwen image content retains native vision DeepStack logic.
         for time, image, count in (
-            ("Time 1", image_t1, point_count_t1),
-            ("Time 2", image_t2, point_count_t2),
+            ("T1", image_t1, point_count_t1),
+            ("T2", image_t2, point_count_t2),
         ):
             if image is not None:
                 content.extend([
-                    {"type": "text", "text": f"{time} image:"},
+                    {"type": "text", "text": f"{time}:"},
                     {"type": "image", "image": image},
                 ])
             if count:
-                content.append({"type": "text", "text": f"{time} point cloud:\n" + self.point_token * count})
+                content.append({"type": "text", "text": f"{time} points:" + self.point_token * count})
         # One TASK readout after all T1/T2 modalities for causal conditioning.
         content.append({"type": "text", "text": self.task_token})
         return [{"role": "user", "content": content}]
@@ -793,7 +793,7 @@ class Qwen3VLBackbone(nn.Module):
                 use_cache: bool = False, grounding_targets: Optional[Sequence[str]] = None,
                 grounding_kind: Optional[str] = None,
                 grounding_scene_bounds=None, grounding_max_boxes: int = 16,
-                grounding_max_target_tokens: int = 768, **qwen_kwargs) -> Dict[str, Any]:
+                grounding_max_target_tokens: int = 384, **qwen_kwargs) -> Dict[str, Any]:
         """One Qwen forward; capture Q and T_mm without duplicating LM layers.
 
         Boxes are produced separately by generate_box_proposals(), not inferred
@@ -870,27 +870,56 @@ class Qwen3VLBackbone(nn.Module):
     @staticmethod
     def _parse_box_json(text: str, *, kind: str, max_boxes: int,
                         scene_bounds=None) -> List[Dict[str, Any]]:
-        """Parse JSON proposal sequence. No implicit guessing of coordinate units."""
-        # A Qwen response may contain a brief preamble or markdown JSON fence.
-        start, stop = text.find("{"), text.rfind("}")
-        if start < 0 or stop <= start:
-            raise ValueError("Box response does not contain a JSON object")
+        """Parse compact box JSON while remaining backward-compatible.
+
+        Preferred protocol:
+          2D: [[x1,y1,x2,y2], ...]
+          3D: [[xmin,ymin,zmin,xmax,ymax,zmax], ...]
+
+        Legacy {"boxes":[{"box":[...],"score":...}]} is still accepted.
+        Compact boxes use score=1.0 internally; textual confidence was never
+        independently supervised (all teacher scores were 1.0).
+        """
+        # Generated text may still contain a short preamble/fence. Accept the
+        # first JSON array/object and let json.loads validate it strictly.
+        obj_start = text.find("{")
+        arr_start = text.find("[")
+        starts = [v for v in (obj_start, arr_start) if v >= 0]
+        if not starts:
+            raise ValueError("Box response does not contain JSON")
+        start = min(starts)
+        opener = text[start]
+        closer = "}" if opener == "{" else "]"
+        stop = text.rfind(closer)
+        if stop <= start:
+            raise ValueError("Box response has incomplete JSON")
         try:
             root = json.loads(text[start:stop+1])
         except json.JSONDecodeError as exc:
             raise ValueError("Box response is not valid JSON") from exc
-        if not isinstance(root, dict) or not isinstance(root.get("boxes"), list):
-            raise ValueError("Box response must be an object with 'boxes' array")
-        boxes = root["boxes"]
+
+        if isinstance(root, list):
+            boxes = root
+        elif isinstance(root, dict) and isinstance(root.get("boxes"), list):
+            boxes = root["boxes"]
+        else:
+            raise ValueError("Box response must be a JSON array or an object with 'boxes'")
         if len(boxes) > max_boxes:
             raise ValueError(f"Box count {len(boxes)} exceeds max_boxes={max_boxes}")
+
         size = 4 if kind == "2d" else 6
         answer = []
         for i, proposal in enumerate(boxes):
-            if not isinstance(proposal, dict):
-                raise ValueError(f"Box {i} must be a JSON object")
-            coords = proposal.get("box")
-            score = proposal.get("score", 1.0)
+            # New compact protocol is a bare coordinate array. Legacy dicts
+            # remain accepted so old checkpoints / occasional Qwen outputs work.
+            if isinstance(proposal, (list, tuple)):
+                coords = proposal
+                score = 1.0
+            elif isinstance(proposal, dict):
+                coords = proposal.get("box")
+                score = proposal.get("score", 1.0)
+            else:
+                raise ValueError(f"Box {i} must be a coordinate array or JSON object")
             if not isinstance(coords, (list, tuple)) or len(coords) != size:
                 raise ValueError(f"Box {i} needs {size} xyz/xyxy coordinates")
             try:
@@ -908,8 +937,6 @@ class Qwen3VLBackbone(nn.Module):
             if kind == "2d":
                 if any(v < 0 or v > 1000 for v in vals):
                     raise ValueError("Qwen 2D Box must use [0,1000] coordinates")
-                # Qwen grounding normally uses a 0..1000 box grid. The PAIR
-                # decoder consistently accepts normalized 0..1 xyxy.
                 vals = [v / 1000.0 for v in vals]
             else:
                 if scene_bounds is None:
@@ -919,8 +946,6 @@ class Qwen3VLBackbone(nn.Module):
                 bnd = torch.as_tensor(scene_bounds,device="cpu",dtype=torch.float64)
                 if bnd.shape != (2,3):
                     raise ValueError("scene_bounds must be [2,3]")
-                # Convert Qwen 0..1000 box coordinates to original XYZ used by
-                # PointAdapter and the 3D Soft Spatial Gate.
                 lo,span = bnd[0],(bnd[1]-bnd[0]).clamp_min(1e-3)
                 norm = torch.tensor(vals,dtype=torch.float64).view(2,3)/1000.0
                 world = lo.unsqueeze(0)+norm*span.unsqueeze(0)
@@ -930,33 +955,34 @@ class Qwen3VLBackbone(nn.Module):
 
     @staticmethod
     def _grounding_prompts(prompts, *, kind, scene_bounds, max_boxes):
-        """One EXACT instruction template for teacher forcing and inference."""
+        """Compact instruction shared by teacher forcing and generation."""
         if kind == "3d":
             if scene_bounds is None or len(scene_bounds) != len(prompts):
                 raise ValueError("3D box generation requires scene_bounds [B,2,3]")
             context = []
-            for b, bounds in enumerate(scene_bounds):
+            for bounds in scene_bounds:
                 if torch.is_tensor(bounds):
                     bounds = bounds.detach().cpu().tolist()
                 if len(bounds) != 2 or any(len(row) != 3 for row in bounds):
                     raise ValueError("scene_bounds must contain [min_xyz,max_xyz] pairs")
+                # Compact separators avoid wasting prompt tokens on whitespace.
+                btxt = json.dumps(bounds, separators=(",", ":"))
                 context.append(
-                    "The point clouds share the world XYZ coordinate frame. "
-                    f"Bounds are {json.dumps(bounds)}. Propose axis-aligned regions "
-                    "as 6 integers [xmin,ymin,zmin,xmax,ymax,zmax] normalized to "
-                    "[0,1000] relative to those shared XYZ bounds (NOT raw world coordinates)."
+                    f"Bounds={btxt}. Box=[xmin,ymin,zmin,xmax,ymax,zmax], "
+                    "integer 0..1000 normalized to Bounds."
                 )
         else:
-            context = ["Give Qwen-style image coordinates [x1,y1,x2,y2] on a [0,1000] grid. For example, half-width is 500."]*len(prompts)
-        grounding_prompts = [
-            p.rstrip() + "\nFind up to " + str(max_boxes) + " candidate CHANGE REGIONS. "
+            context = [
+                "Box=[x1,y1,x2,y2], integer 0..1000."
+            ] * len(prompts)
+
+        return [
+            p.rstrip()
+            + f"\nReturn <= {max_boxes} change boxes. "
             + context[b]
-            + " Use regions, not one box per object. There may be zero changes. "
-              "Reply ONLY with strict JSON: {\"boxes\":[{\"box\":[...],\"score\":0.9},...]}. "
-              "Do not include markdown or other text."
-            for b,p in enumerate(prompts)
+            + " JSON array only; [] if none."
+            for b, p in enumerate(prompts)
         ]
-        return grounding_prompts
 
     def generate_box_proposals(
         self, *, prompt: Union[str, Sequence[str]], kind: str,
