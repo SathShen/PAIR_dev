@@ -89,6 +89,11 @@ class ChangeLossOutput:
     # normalization. Useful for debugging/logging.
     active_weight_sum: torch.Tensor
 
+    # Optional joint Qwen grounding supervision. None for Mask-only tasks.
+    # These are explicit fields rather than attributes added by train.py.
+    grounding_ce: Optional[torch.Tensor] = None
+    mask_total: Optional[torch.Tensor] = None
+
     def as_dict(self):
         # Preserve all legacy keys while exposing the new components.
         results = {
@@ -113,7 +118,7 @@ class ChangeLossOutput:
             "loss_event": self.event,
             "loss_active_weight_sum": self.active_weight_sum,
         }
-        if hasattr(self, "grounding_ce"):
+        if self.grounding_ce is not None:
             results["loss_grounding_ce"] = self.grounding_ce
             results["loss_mask_total"] = self.mask_total
         return results
@@ -1054,6 +1059,8 @@ class PAIRSemanticChangeLoss(nn.Module):
         class_names: Dict[int, str],
         dataset_name: Optional[str] = None,
         semantic_changed_only: bool = False,
+        grounding_ce: Optional[torch.Tensor] = None,
+        box_ce_weight: float = 0.3,
     ):
         # Kept for API compatibility. The supervision actually present in the
         # batch determines which task groups are active.
@@ -1199,8 +1206,26 @@ class PAIRSemanticChangeLoss(nn.Module):
             weight_sum_value
         )
 
+        # The entire joint objective lives in loss.py. The Mask objective
+        # above keeps its original active-task normalization and SSC weight.
+        # Grounding CE is a separate auxiliary loss, NOT an active-task group.
+        mask_total = None
+        if grounding_ce is not None:
+            if not isinstance(grounding_ce, torch.Tensor):
+                raise TypeError("grounding_ce must be a scalar torch.Tensor")
+            if grounding_ce.ndim != 0 or not bool(torch.isfinite(grounding_ce).item()):
+                raise ValueError("grounding_ce must be a finite scalar")
+            if grounding_ce.device != total.device:
+                raise ValueError("grounding_ce and Mask Loss must be on the same device")
+            if not (0.0 <= float(box_ce_weight) <= 10.0):
+                raise ValueError("box_ce_weight must be in [0,10]")
+            mask_total = total
+            total = mask_total + float(box_ce_weight) * grounding_ce
+
         return ChangeLossOutput(
             total=total,
+            grounding_ce=grounding_ce,
+            mask_total=mask_total,
             semantic_t1=sem1,
             semantic_t2=sem2,
             semantic_ce=sem_ce,

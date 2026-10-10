@@ -11,7 +11,7 @@ Model construction lives in models/pair.py. This file owns only:
     config/runtime
     datasets + multi-dataset scheduling
     target collation
-    loss / metrics
+    loss invocation / metrics (all loss formulas live in loss.py)
     optimizer / scheduler
     DDP
     checkpointing
@@ -419,8 +419,6 @@ def forward_loss(model, criterion, samples, spec, *, box_mode="none",
         if not isinstance(result, tuple) or len(result) != 2:
             raise RuntimeError("Joint PAIRModel must return (PredictionLogits, grounding_ce)")
         prediction, grounding_ce = result
-        if grounding_ce.ndim != 0 or not torch.isfinite(grounding_ce):
-            raise ValueError("Grounding CE must be a finite scalar")
     else:
         prediction = result
         grounding_ce = None
@@ -430,11 +428,9 @@ def forward_loss(model, criterion, samples, spec, *, box_mode="none",
         prediction=prediction, target=target,
         class_names=spec.class_names,
         semantic_changed_only=semantic_changed_only,
+        grounding_ce=grounding_ce,
+        box_ce_weight=box_ce_weight,
     )
-    if grounding_ce is not None:
-        loss_output.grounding_ce = grounding_ce
-        loss_output.mask_total = loss_output.total
-        loss_output.total = loss_output.total + box_ce_weight * grounding_ce
     return prediction, loss_output, target
 
 
