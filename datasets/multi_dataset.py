@@ -123,7 +123,10 @@ class DatasetRegistry:
         experiment: ExperimentConfig,
         runtime: Dict,
         num_workers: int,
+        validation_batch_size: Optional[int] = None,
     ):
+        if validation_batch_size is not None and validation_batch_size < 1:
+            raise ValueError("validation.per_gpu_batch_size must be >= 1")
         self.experiment = experiment
         self.runtime = runtime
         self.handles: Dict[str, DatasetHandle] = {}
@@ -170,7 +173,8 @@ class DatasetRegistry:
 
                 val_loader = DataLoader(
                     val_ds,
-                    batch_size=cfg.per_gpu_batch_size,
+                    batch_size=(validation_batch_size if validation_batch_size is not None
+                                else cfg.per_gpu_batch_size),
                     sampler=val_sampler,
                     shuffle=False,
                     num_workers=num_workers,

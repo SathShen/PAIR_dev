@@ -1,0 +1,234 @@
+{
+  "config": "configs/pair_train_qwen4b.json",
+  "checkpoint": null,
+  "cuda_device": "NVIDIA GeForce RTX 4090 D",
+  "static_model": {
+    "parameter_bytes": 9531571888,
+    "buffer_bytes": 624,
+    "static_tensor_bytes": 9531572512,
+    "dtype_bytes": {
+      "torch.float32": 657297696,
+      "torch.bfloat16": 8874274816
+    },
+    "modules": {
+      "Qwen LLM": {
+        "params": 8090775552,
+        "trainable": 47196160,
+        "frozen": 8043579392,
+        "buffers": 256
+      },
+      "Qwen Vision": {
+        "params": 840132608,
+        "trainable": 9437184,
+        "frozen": 830695424,
+        "buffers": 64
+      },
+      "Utonia": {
+        "params": 550559808,
+        "trainable": 1544832,
+        "frozen": 549014976,
+        "buffers": 288
+      },
+      "PointAdapter": {
+        "params": 21575876,
+        "trainable": 21575876,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "3D Event Head": {
+        "params": 1318916,
+        "trainable": 1318916,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "Temporal Fusion": {
+        "params": 541700,
+        "trainable": 541700,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "Class/Task Encoder": {
+        "params": 5249024,
+        "trainable": 5249024,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "Shared Query Decoder": {
+        "params": 4222976,
+        "trainable": 4222976,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "2D Semantic Head": {
+        "params": 1315844,
+        "trainable": 1315844,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "2D Change Head": {
+        "params": 792584,
+        "trainable": 792584,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "3D Semantic Head": {
+        "params": 1315844,
+        "trainable": 1315844,
+        "frozen": 0,
+        "buffers": 0
+      },
+      "Multi-box Guidance": {
+        "params": 1134600,
+        "trainable": 1134600,
+        "frozen": 0,
+        "buffers": 16
+      },
+      "ImageAdapter": {
+        "params": 12636556,
+        "trainable": 12636556,
+        "frozen": 0,
+        "buffers": 0
+      }
+    }
+  },
+  "parser_sanity": {
+    "2d": [
+      {
+        "box": [
+          0.1,
+          0.2,
+          0.7,
+          0.8
+        ],
+        "score": 0.5
+      }
+    ],
+    "3d": [
+      {
+        "box": [
+          1.0,
+          4.0,
+          9.0,
+          7.0,
+          16.0,
+          27.0
+        ],
+        "score": 0.5
+      }
+    ]
+  },
+  "boundary_cuda_input_max_bytes": {
+    "SECOND/train": {
+      "Qwen model CUDA inputs": 50404288
+    },
+    "SECOND/val_generated": {
+      "Qwen model CUDA inputs": 12593456
+    },
+    "NYC-SCD/train": {
+      "Utonia raw CUDA point batch": 855888,
+      "Qwen model CUDA inputs": 28048
+    },
+    "NYC-SCD/val_generated": {
+      "Utonia raw CUDA point batch": 192228,
+      "Qwen model CUDA inputs": 19024
+    }
+  },
+  "box_generation": [
+    {
+      "phase": "SECOND/val_generated",
+      "kind": "2d",
+      "valid_boxes": 1,
+      "parse_failures": 0,
+      "texts": [
+        "{\"boxes\":[{\"box\":[350, 30, 875, 580],\"score\":0.98}]}"
+      ]
+    },
+    {
+      "phase": "NYC-SCD/val_generated",
+      "kind": "3d",
+      "valid_boxes": 0,
+      "parse_failures": 0,
+      "texts": [
+        "{\"boxes\":[]}"
+      ]
+    }
+  ],
+  "dataset_reports": [
+    {
+      "dataset": "SECOND",
+      "train": {
+        "dataset": "SECOND",
+        "batch_size": 4,
+        "raw_cpu_batch_bytes": 50331648,
+        "raw_cuda_batch_bytes": 0,
+        "baseline_allocated": 9531720192,
+        "baseline_reserved": 9565110272,
+        "after_forward_allocated": 47863330304,
+        "after_forward_reserved": 48488251392,
+        "forward_peak_allocated": 48071560704,
+        "forward_peak_reserved": 48488251392,
+        "saved_for_backward_unique_cuda_bytes": 38209569099,
+        "after_backward_allocated": 9743783424,
+        "after_backward_reserved": 48488251392,
+        "backward_peak_allocated": 47954558464,
+        "backward_peak_reserved": 48488251392,
+        "gradient_bytes": 81750684,
+        "loss": 2.0012288093566895,
+        "seconds": 3.077107115648687,
+        "after_cleanup_allocated": 9599091712,
+        "after_cleanup_reserved": 48488251392
+      },
+      "val": {
+        "dataset": "SECOND",
+        "entry_allocated": 9599091712,
+        "entry_reserved": 48488251392,
+        "peak_allocated": 9782883328,
+        "peak_reserved": 48488251392,
+        "end_allocated": 9564500480,
+        "end_reserved": 48488251392,
+        "valid_boxes": 1,
+        "parse_failures": 0,
+        "loss": 1.8651854991912842,
+        "seconds": 2.3144060922786593
+      }
+    },
+    {
+      "dataset": "NYC-SCD",
+      "train": {
+        "dataset": "NYC-SCD",
+        "batch_size": 1,
+        "raw_cpu_batch_bytes": 2293224,
+        "raw_cuda_batch_bytes": 0,
+        "baseline_allocated": 9548760064,
+        "baseline_reserved": 9630121984,
+        "after_forward_allocated": 26277479936,
+        "after_forward_reserved": 26619150336,
+        "forward_peak_allocated": 26444962816,
+        "forward_peak_reserved": 26619150336,
+        "saved_for_backward_unique_cuda_bytes": 16737023046,
+        "after_backward_allocated": 9633081856,
+        "after_backward_reserved": 26621247488,
+        "backward_peak_allocated": 26351335424,
+        "backward_peak_reserved": 26621247488,
+        "gradient_bytes": 82598484,
+        "loss": 1.747800588607788,
+        "seconds": 1.3127328641712666,
+        "after_cleanup_allocated": 9548766208,
+        "after_cleanup_reserved": 26621247488
+      },
+      "val": {
+        "dataset": "NYC-SCD",
+        "entry_allocated": 9548766208,
+        "entry_reserved": 26621247488,
+        "peak_allocated": 9911062528,
+        "peak_reserved": 26621247488,
+        "end_allocated": 9549078528,
+        "end_reserved": 26621247488,
+        "valid_boxes": 0,
+        "parse_failures": 0,
+        "loss": 1.7487879991531372,
+        "seconds": 0.8359139310196042
+      }
+    }
+  ]
+}

@@ -1001,6 +1001,9 @@ class Qwen3VLBackbone(nn.Module):
         finally:
             if handle is not None:
                 handle.remove()
+            # Generation's Vision hook outputs are NOT consumed by ImageAdapter.
+            # Let the next normal Qwen forward capture its own DeepStack outputs.
+            self.clear_vision_intermediate_cache()
         if handle is not None:
             expected = sum(prepared["point_counts_t1"]) + sum(prepared["point_counts_t2"])
             if stats["prefill_calls"] != 1 or stats["replaced"] != expected:
@@ -1010,6 +1013,8 @@ class Qwen3VLBackbone(nn.Module):
             raise RuntimeError("Qwen generation must return one sequence per batch item")
         generated_only = sequences[:, inputs["input_ids"].shape[1]:]
         texts = self.tokenizer.batch_decode(generated_only, skip_special_tokens=True)
+        # Release generation outputs / processor batch before constructing boxes.
+        del generated, sequences, generated_only, inputs, prepared
         # Box is SOFT guidance. An invalid generated JSON/coordinate response
         # must not prevent a valid full-scene mask prediction or validation.
         proposals = []

@@ -43,16 +43,19 @@
       "r": 8,
       "alpha": 16,
       "dropout": 0.05
+    },
+    "box_generation": {
+      "max_boxes": 16
     }
   },
   "optimizer": {
-    "lr": 1e-4,
+    "lr": 0.0001,
     "scheduler": "cosine",
     "warmup_ratio": 0.03,
-    "max_grad_norm": 10.0,
-    "llm_lora_lr": 1e-4,
-    "vision_lora_lr": 1e-4,
-    "point_lora_lr": 1e-4,
+    "max_grad_norm": 3.0,
+    "llm_lora_lr": 0.0001,
+    "vision_lora_lr": 0.0001,
+    "point_lora_lr": 0.0001,
     "main_weight_decay": 0.01,
     "llm_lora_weight_decay": 0.01,
     "vision_lora_weight_decay": 0.01,
@@ -67,7 +70,8 @@
     "every_epochs": 1,
     "max_samples": 0,
     "change_threshold": 0.5,
-    "box_mode": "generated"
+    "box_mode": "generated",
+    "per_gpu_batch_size": 1
   },
   "logging": {
     "log_every": 20,
