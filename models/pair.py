@@ -464,6 +464,20 @@ class PAIRModel(nn.Module):
             **proposals,
         )
 
+        if generate_boxes is True:
+            # Expose EXACTLY the proposals used by the decoder, not a second
+            # stochastic Qwen generation. GT is never passed into this path.
+            prediction.box_predictions = proposals["boxes_2d"]
+            prediction.box_prediction_valid = proposals["box_valid"]
+            prediction.box_prediction_scores = proposals["box_scores"]
+
+        if generate_boxes is True:
+            # Expose EXACTLY the proposals used by the decoder, not a second
+            # stochastic Qwen generation. GT is never passed into this path.
+            prediction.box_predictions = proposals["boxes_3d"]
+            prediction.box_prediction_valid = proposals["box_valid"]
+            prediction.box_prediction_scores = proposals["box_scores"]
+
         if grounding_targets is not None:
             box_loss = qwen_out.get("grounding_loss")
             if box_loss is None:

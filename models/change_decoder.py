@@ -422,6 +422,11 @@ class PredictionLogits:
     class_names: Tuple[str, ...] = ()
     updated_queries: Optional[torch.Tensor] = None
     box_guidance_applied: bool = False
+    # Inference-only Qwen proposals. The same boxes were used by Decoder.
+    # Kept separate from GT so validation cannot accidentally leak labels.
+    box_predictions: Optional[torch.Tensor] = None  # [B,K,4] or [B,K,6]
+    box_prediction_valid: Optional[torch.Tensor] = None  # [B,K]
+    box_prediction_scores: Optional[torch.Tensor] = None  # [B,K]
 
 
 class QueryConditionedClassHead(nn.Module):
@@ -1424,8 +1429,9 @@ class PAIRChangeDecoder(nn.Module):
 # =============================================================================
 # Weak Box supervision (joint grounding + mask training)
 # =============================================================================
-# Training-only target preparation, colocated with Box-guided prediction.
-# It does not modify PAIRChangeDecoder.forward_2d/forward_3d or inference.
+# Weak target preparation colocated with Box-guided prediction.
+# Train uses targets for teacher-forcing; val may derive weak GT solely
+# for post-forward Box metrics, never as model inputs.
 
 def _xy_buckets(xy: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor, side: int):
     span = (upper - lower).clamp_min(1e-5)

@@ -5,7 +5,9 @@
 PAIR multi-dataset training for native Qwen3-VL DeepStack + 2D/3D adapters.
 
 Box guidance supports JOINT teacher-forced Qwen grounding CE plus Mask Loss.
-Weak training boxes come only from training masks/events; evaluation NEVER uses GT boxes.
+Weak boxes are derived from training masks/events for teacher forcing.
+At validation Qwen-generated boxes guide masks; held-out mask/event labels
+construct weak GT boxes only AFTER forward, solely for Box IoU evaluation.
 
 Model construction lives in models/pair.py. This file owns only:
     config/runtime
@@ -122,7 +124,9 @@ def build_settings(experiment: ExperimentConfig, cli):
         resume=cli.resume,
         seed=int(experiment.experiment.get("seed", 42)),
         train_box_mode=str(t.get("box_mode", "none")).strip().lower(),
-        val_box_mode=str(v.get("box_mode", "none")).strip().lower(),
+        # Joint training defaults to generated Box validation, not box-free
+        # inference. Explicit validation.box_mode still overrides the default.
+        val_box_mode=str(v.get("box_mode", "generated" if str(t.get("box_mode", "none")).lower() == "joint" else "none")).strip().lower(),
         box_ce_weight=float(t.get("box_ce_weight", 0.3)),
         box_gt_max_boxes=int(t.get("box_gt_max_boxes", 16)),
         box_dropout=float(t.get("box_dropout", 0.15)),
@@ -443,11 +447,91 @@ def all_reduce_loss_sums(sums, count, device):
     return {key: float(tensor[i].item() / count) for i, key in enumerate(keys)}
 
 
+def box_iou_matrix(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
+    """Pairwise axis-aligned 2D/3D IoU. Both tensors use the same coordinates."""
+    if pred_boxes.ndim != 2 or gt_boxes.ndim != 2 or pred_boxes.shape[-1] != gt_boxes.shape[-1]:
+        raise ValueError("pred_boxes / gt_boxes must be [P,D] / [G,D], with equal D")
+    d = pred_boxes.shape[-1]
+    if d not in (4, 6):
+        raise ValueError("2D xyxy or 3D xyzxyz boxes expected")
+    if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
+        return pred_boxes.new_zeros((pred_boxes.shape[0], gt_boxes.shape[0]))
+    axis = d // 2
+    p_lo, p_hi = pred_boxes[:, :axis], pred_boxes[:, axis:]
+    g_lo, g_hi = gt_boxes[:, :axis], gt_boxes[:, axis:]
+    lo = torch.maximum(p_lo[:, None, :], g_lo[None, :, :])
+    hi = torch.minimum(p_hi[:, None, :], g_hi[None, :, :])
+    inter = (hi - lo).clamp_min(0).prod(-1)
+    vp = (p_hi - p_lo).clamp_min(0).prod(-1)
+    vg = (g_hi - g_lo).clamp_min(0).prod(-1)
+    return inter / (vp[:, None] + vg[None, :] - inter).clamp_min(1e-12)
+
+
+def box_stats_for_batch(prediction, samples, spec, device, max_boxes):
+    """Score predicted Qwen boxes vs *weak GT boxes* from held-out labels.
+
+    The GT is constructed only AFTER the model forward, solely for metrics.
+    The decoder has already consumed predicted boxes, never these GT boxes.
+    Returns [TP@.5, pred_count, gt_count, best_iou_sum, gt_with_best_iou, samples].
+    """
+    if prediction.box_predictions is None or prediction.box_prediction_valid is None:
+        raise RuntimeError("generated validation must expose predicted Qwen boxes")
+    weak_gt = build_grounding_supervision(
+        samples, spec.route, max_boxes=max_boxes, device=device, box_dropout=0.0,
+    )
+    gt_boxes = weak_gt["boxes_2d" if spec.route == "2d" else "boxes_3d"]
+    gt_valid = weak_gt["box_valid"]
+    pred_boxes = prediction.box_predictions
+    pred_valid = prediction.box_prediction_valid
+    if pred_boxes.shape[0] != len(samples) or gt_boxes.shape[0] != len(samples):
+        raise RuntimeError("Box batch dimension mismatch")
+    values = torch.zeros(6, device=device, dtype=torch.float64)
+    for i in range(len(samples)):
+        p = pred_boxes[i][pred_valid[i]].float()
+        g = gt_boxes[i][gt_valid[i]].float()
+        values[1] += p.shape[0]
+        values[2] += g.shape[0]
+        values[5] += 1
+        values[4] += g.shape[0]  # missing predictions contribute zero IoU
+        if p.numel() == 0 or g.numel() == 0:
+            continue
+        iou = box_iou_matrix(p, g)
+        values[3] += iou.amax(dim=0).sum().double()
+        # Greedy one-to-one matching at IoU >= .5. This is P/R@.5, NOT AP.
+        candidates = iou.clone()
+        while candidates.numel():
+            flat_idx = int(candidates.argmax())
+            pi = flat_idx // candidates.shape[1]
+            gi = flat_idx % candidates.shape[1]
+            if float(candidates[pi, gi]) < 0.5:
+                break
+            values[0] += 1
+            candidates[pi, :] = -1
+            candidates[:, gi] = -1
+    return values
+
+
+def box_metrics_from_stats(stats):
+    tp, pred_count, gt_count, best_iou_sum, best_iou_count, n_samples = stats.tolist()
+    precision = tp / pred_count if pred_count else 0.0
+    recall = tp / gt_count if gt_count else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "box/Precision50": precision,
+        "box/Recall50": recall,
+        "box/F1_50": f1,
+        "box/MeanBestGTIoU": best_iou_sum / best_iou_count if best_iou_count else 0.0,
+        "box/PredBoxesPerSample": pred_count / n_samples if n_samples else 0.0,
+        "box/WeakGTBoxesPerSample": gt_count / n_samples if n_samples else 0.0,
+    }
+
+
 @torch.no_grad()
 def validate(model, criterion, loader, spec, runtime, settings):
     model.eval()
     evaluator = PAIRMetrics(spec.class_names, runtime["device"], settings.change_threshold)
     sums, count = {}, 0
+    box_stats = torch.zeros(6, device=runtime["device"], dtype=torch.float64)
     start = time.time()
     progress = tqdm(
         loader,
@@ -461,6 +545,10 @@ def validate(model, criterion, loader, spec, runtime, settings):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             prediction, loss_output, merged_target = forward_loss(model, criterion, samples, spec, box_mode=settings.val_box_mode)
         evaluator.update(prediction, merged_target)
+        if settings.val_box_mode == "generated":
+            box_stats += box_stats_for_batch(
+                prediction, samples, spec, runtime["device"], settings.box_gt_max_boxes,
+            )
         batch_n = len(samples)
         for key, value in loss_output.as_dict().items():
             sums[key] = sums.get(key, 0.0) + float(value.detach().cpu()) * batch_n
@@ -472,6 +560,10 @@ def validate(model, criterion, loader, spec, runtime, settings):
     evaluator.reduce_distributed()
     losses = all_reduce_loss_sums(sums, count, runtime["device"])
     result = evaluator.compute()
+    if settings.val_box_mode == "generated":
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(box_stats, op=dist.ReduceOp.SUM)
+        result["scalars"].update(box_metrics_from_stats(box_stats))
     result["losses"] = losses
     result["seconds"] = time.time() - start
     model.train()
@@ -1147,6 +1239,12 @@ def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
     else:
         selected = ()
 
+    # Predicted-vs-weak-GT Box quality: these are validation metrics,
+    # not teacher-forcing CE and not mask performance.
+    for key, value in scalars.items():
+        if key.startswith("box/") and isinstance(value, (int, float)):
+            writer.add_scalar(f"val/{dataset_name}/{key}", float(value), epoch)
+
     for display_name, key in selected:
         value = scalars.get(key)
         if isinstance(value, (int, float)):
@@ -1162,6 +1260,11 @@ def print_val(dataset_name, result, spec):
         if key in scalars
     ]
     suffix = " | " + " ".join(fields) if fields else ""
+    if "box/F1_50" in scalars:
+        suffix += (f" | BoxP50={scalars['box/Precision50']:.4f}"
+                   f" BoxR50={scalars['box/Recall50']:.4f}"
+                   f" BoxF1_50={scalars['box/F1_50']:.4f}"
+                   f" BoxMeanIoU={scalars['box/MeanBestGTIoU']:.4f}")
     print(f"VAL [{dataset_name}] | loss={loss:.4f}{suffix}")
     print(f"  VAL LOSS [{dataset_name}] | {format_loss_components(result['losses'], spec)}")
 
