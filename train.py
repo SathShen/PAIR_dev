@@ -1061,42 +1061,79 @@ def validation_metric_layout(spec, scalars):
     return ()
 
 
-def log_tensorboard_train(writer, values, step, dataset_name):
-    """
-    TensorBoard train logging:
-        - only total train loss for each dataset
-    """
+# Loss definitions stay in loss.py. This selection is only for display:
+# don't plot inactive heads as misleading flat-zero curves on BCD/3D runs.
+_LOG_SEMANTIC = (
+    "loss_semantic_t1", "loss_semantic_t2", "loss_semantic_ce",
+    "loss_semantic_lovasz_t1", "loss_semantic_lovasz_t2",
+    "loss_semantic_lovasz", "loss_semantic",
+)
+_LOG_CHANGE = ("loss_change_bce", "loss_change_dice", "loss_change")
+_LOG_EVENT = (
+    "loss_event_t1", "loss_event_t2", "loss_event_ce",
+    "loss_event_dice_t1", "loss_event_dice_t2",
+    "loss_event_dice", "loss_event",
+)
+
+
+def loss_logging_keys(values, spec):
+    """Return every applicable loss field exposed by ChangeLossOutput.as_dict()."""
+    keys = ["loss"]
+    for name in ("loss_mask_total", "loss_grounding_ce"):
+        if name in values:
+            keys.append(name)
+
+    route = getattr(spec, "route", None)
+    label_mode = getattr(spec, "label_mode", None)
+    if route == "3d":
+        keys.extend(_LOG_SEMANTIC)
+        keys.extend(_LOG_EVENT)
+    elif route == "2d":
+        if label_mode != "binary":
+            keys.extend(_LOG_SEMANTIC)
+        keys.extend(_LOG_CHANGE)
+        if label_mode == "semantic_pair":
+            keys.append("loss_ssc")
+    else:
+        # Keep all components for any future task route.
+        keys.extend(k for k in values if k.startswith("loss_") and k != "loss_active_weight_sum")
+
+    # The active-task denominator is a diagnostic, not a loss.
+    return tuple(dict.fromkeys(key for key in keys if key in values))
+
+
+def format_loss_components(values, spec, precision=4):
+    return " ".join(
+        f"{key}={float(values[key]):.{precision}f}"
+        for key in loss_logging_keys(values, spec)
+    )
+
+
+def _log_loss_scalars(writer, values, step, dataset_name, spec, phase):
     if writer is None:
         return
+    for key in loss_logging_keys(values, spec):
+        value = values[key]
+        if isinstance(value, (int, float)):
+            # Preserve the previous train/<dataset>/loss tag for total loss.
+            writer.add_scalar(f"{phase}/{dataset_name}/{key}", float(value), step)
+    denom = values.get("loss_active_weight_sum")
+    if isinstance(denom, (int, float)):
+        writer.add_scalar(f"{phase}/{dataset_name}/active_weight_sum", float(denom), step)
 
-    value = values.get("loss")
-    if isinstance(value, (int, float)):
-        writer.add_scalar(f"train/{dataset_name}/loss", value, step)
+
+def log_tensorboard_train(writer, values, step, dataset_name, spec=None):
+    """Log every applicable train loss per dataset at global optimizer step."""
+    _log_loss_scalars(writer, values, step, dataset_name, spec, "train")
 
 
 def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
-    """
-    TensorBoard validation logging is intentionally minimal:
-
-    2D SCD (SECOND / LandsatSCD):
-        Fscd
-
-    3D SCD (NYC-SCD):
-        SemIoU
-        EvtIoU
-        Fjse
-
-    2D BCD (LEVIR-CD):
-        F1
-
-    Validation loss and all auxiliary metrics remain available in run.log /
-    console/checkpoints, but are not written to TensorBoard.
-    """
+    """Log full validation loss breakdown and preserve existing metric tags."""
     if writer is None:
         return
+    _log_loss_scalars(writer, result["losses"], epoch, dataset_name, spec, "val")
 
     scalars = result["scalars"]
-
     if spec.route == "3d":
         selected = (
             ("SemIoU", "semantic/mIoU"),
@@ -1104,24 +1141,16 @@ def log_tensorboard_val(writer, result, epoch, dataset_name, spec):
             ("Fjse", "jse/F1"),
         )
     elif spec.label_mode in {"binary", "post_semantic"}:
-        selected = (
-            ("F1", "change/F1"),
-        )
+        selected = (("F1", "change/F1"),)
     elif spec.label_mode == "semantic_pair":
-        selected = (
-            ("Fscd", "scd/F_scd"),
-        )
+        selected = (("Fscd", "scd/F_scd"),)
     else:
         selected = ()
 
     for display_name, key in selected:
         value = scalars.get(key)
         if isinstance(value, (int, float)):
-            writer.add_scalar(
-                f"val/{dataset_name}/{display_name}",
-                value,
-                epoch,
-            )
+            writer.add_scalar(f"val/{dataset_name}/{display_name}", value, epoch)
 
 
 def print_val(dataset_name, result, spec):
@@ -1134,43 +1163,17 @@ def print_val(dataset_name, result, spec):
     ]
     suffix = " | " + " ".join(fields) if fields else ""
     print(f"VAL [{dataset_name}] | loss={loss:.4f}{suffix}")
+    print(f"  VAL LOSS [{dataset_name}] | {format_loss_components(result['losses'], spec)}")
 
 
-def iteration_loss_string(means, route):
-    base = (
-        f"loss={means['loss']:.6f} "
-        f"sem1={means['loss_semantic_t1']:.6f} "
-        f"sem2={means['loss_semantic_t2']:.6f}"
-    )
-    if route == "3d":
-        return (
-            base
-            + f" event1={means['loss_event_t1']:.6f}"
-            + f" event2={means['loss_event_t2']:.6f}"
-            + f" event={means['loss_event']:.6f}"
-        )
-    return (
-        base
-        + f" bce={means['loss_change_bce']:.6f}"
-        + f" dice={means['loss_change_dice']:.6f}"
-    )
+def iteration_loss_string(means, spec):
+    return format_loss_components(means, spec, precision=6)
 
 
 def window_loss_string(means):
-    fields = [
-        f"avg_loss={means['loss']:.4f}",
-        f"avg_sem1={means['loss_semantic_t1']:.4f}",
-        f"avg_sem2={means['loss_semantic_t2']:.4f}",
-    ]
-    # A mixed 2D/3D window has zeros for inactive branches. Showing both keeps
-    # the global window truthful without guessing which route dominated.
-    if "loss_change_bce" in means:
-        fields.append(f"avg_bce={means['loss_change_bce']:.4f}")
-    if "loss_change_dice" in means:
-        fields.append(f"avg_dice={means['loss_change_dice']:.4f}")
-    if "loss_event" in means:
-        fields.append(f"avg_event={means['loss_event']:.4f}")
-    return " ".join(fields)
+    # Mixed-dataset window is for a brief overview only. Component curves and
+    # detailed console output are always split by dataset and task route.
+    return f"avg_loss={means['loss']:.4f}"
 
 
 # =============================================================================
@@ -1424,7 +1427,7 @@ def main():
                             f"ITER E{epoch+1:03d} U{optimizer_step:06d} "
                             f"dataset={dataset_name} route={handle.config.route} "
                             f"update_in_epoch={update_idx+1} accu={accumulation_steps} "
-                            f"{iteration_loss_string(means, spec.route)} "
+                            f"{iteration_loss_string(means, spec)} "
                             f"grad={grad_norm:.6f} "
                             f"lr_main={lrs.get('main', 0.0):.8e} wd_main={wds.get('main', 0.0):.8e} "
                             f"lr_llm_lora={lrs.get('llm_lora', 0.0):.8e} wd_llm_lora={wds.get('llm_lora', 0.0):.8e} "
@@ -1484,7 +1487,14 @@ def main():
                                 key: value / count
                                 for key, value in log_window_dataset_sums.get(name, {}).items()
                             }
-                            log_tensorboard_train(writer, dataset_means, optimizer_step, name)
+                            dataset_spec = registry.handles[name].config.spec
+                            print(
+                                f"  TRAIN LOSS [{name}] U{optimizer_step:06d} | "
+                                f"{format_loss_components(dataset_means, dataset_spec)}"
+                            )
+                            log_tensorboard_train(
+                                writer, dataset_means, optimizer_step, name, dataset_spec
+                            )
                     log_window_dataset_counts.clear()
                     log_window_sums.clear()
                     log_window_count = 0
