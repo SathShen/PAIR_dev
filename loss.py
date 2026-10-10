@@ -89,9 +89,11 @@ class ChangeLossOutput:
     # normalization. Useful for debugging/logging.
     active_weight_sum: torch.Tensor
 
-    # Optional joint Qwen grounding supervision. None for Mask-only tasks.
-    # These are explicit fields rather than attributes added by train.py.
-    grounding_ce: Optional[torch.Tensor] = None
+    # Optional direct Box set-prediction supervision. None for Mask-only tasks.
+    box: Optional[torch.Tensor] = None
+    box_objectness: Optional[torch.Tensor] = None
+    box_l1: Optional[torch.Tensor] = None
+    box_giou: Optional[torch.Tensor] = None
     mask_total: Optional[torch.Tensor] = None
 
     def as_dict(self):
@@ -118,8 +120,11 @@ class ChangeLossOutput:
             "loss_event": self.event,
             "loss_active_weight_sum": self.active_weight_sum,
         }
-        if self.grounding_ce is not None:
-            results["loss_grounding_ce"] = self.grounding_ce
+        if self.box is not None:
+            results["loss_box"] = self.box
+            results["loss_box_objectness"] = self.box_objectness
+            results["loss_box_l1"] = self.box_l1
+            results["loss_box_giou"] = self.box_giou
             results["loss_mask_total"] = self.mask_total
         return results
 
@@ -1059,8 +1064,11 @@ class PAIRSemanticChangeLoss(nn.Module):
         class_names: Dict[int, str],
         dataset_name: Optional[str] = None,
         semantic_changed_only: bool = False,
-        grounding_ce: Optional[torch.Tensor] = None,
-        box_ce_weight: float = 0.3,
+        box_loss: Optional[torch.Tensor] = None,
+        box_objectness: Optional[torch.Tensor] = None,
+        box_l1: Optional[torch.Tensor] = None,
+        box_giou: Optional[torch.Tensor] = None,
+        box_loss_weight: float = 0.3,
     ):
         # Kept for API compatibility. The supervision actually present in the
         # batch determines which task groups are active.
@@ -1210,21 +1218,31 @@ class PAIRSemanticChangeLoss(nn.Module):
         # above keeps its original active-task normalization and SSC weight.
         # Grounding CE is a separate auxiliary loss, NOT an active-task group.
         mask_total = None
-        if grounding_ce is not None:
-            if not isinstance(grounding_ce, torch.Tensor):
-                raise TypeError("grounding_ce must be a scalar torch.Tensor")
-            if grounding_ce.ndim != 0 or not bool(torch.isfinite(grounding_ce).item()):
-                raise ValueError("grounding_ce must be a finite scalar")
-            if grounding_ce.device != total.device:
-                raise ValueError("grounding_ce and Mask Loss must be on the same device")
-            if not (0.0 <= float(box_ce_weight) <= 10.0):
-                raise ValueError("box_ce_weight must be in [0,10]")
+        if box_loss is not None:
+            components = {
+                "box_loss": box_loss,
+                "box_objectness": box_objectness,
+                "box_l1": box_l1,
+                "box_giou": box_giou,
+            }
+            for name, value in components.items():
+                if not isinstance(value, torch.Tensor) or value.ndim != 0:
+                    raise TypeError(f"{name} must be a scalar torch.Tensor")
+                if not bool(torch.isfinite(value).item()):
+                    raise ValueError(f"{name} must be finite")
+                if value.device != total.device:
+                    raise ValueError(f"{name} and Mask Loss must be on the same device")
+            if not (0.0 <= float(box_loss_weight) <= 10.0):
+                raise ValueError("box_loss_weight must be in [0,10]")
             mask_total = total
-            total = mask_total + float(box_ce_weight) * grounding_ce
+            total = mask_total + float(box_loss_weight) * box_loss
 
         return ChangeLossOutput(
             total=total,
-            grounding_ce=grounding_ce,
+            box=box_loss,
+            box_objectness=box_objectness,
+            box_l1=box_l1,
+            box_giou=box_giou,
             mask_total=mask_total,
             semantic_t1=sem1,
             semantic_t2=sem2,

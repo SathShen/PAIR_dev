@@ -4,7 +4,7 @@
 """
 PAIR multi-dataset training for native Qwen3-VL DeepStack + 2D/3D adapters.
 
-Box guidance supports JOINT teacher-forced Qwen grounding CE plus Mask Loss.
+Box guidance supports JOINT direct set-prediction Box loss plus Mask Loss.
 Weak boxes are derived from training masks/events for teacher forcing.
 At validation Qwen-generated boxes guide masks; held-out mask/event labels
 construct weak GT boxes only AFTER forward, solely for Box IoU evaluation.
@@ -68,7 +68,7 @@ from models.lora import (
     load_lora_state_dict,
 )
 from models.pair import PAIRModel
-from models.change_decoder import build_grounding_supervision
+from models.change_decoder import build_box_supervision, direct_box_set_loss
 
 
 # =============================================================================
@@ -117,6 +117,7 @@ def build_settings(experiment: ExperimentConfig, cli):
         change_threshold=float(v.get("change_threshold", 0.5)),
         val_every_epochs=int(v.get("every_epochs", 1)),
         val_max_samples=int(v.get("max_samples", 0)),
+        val_batch_size=int(v.get("per_gpu_batch_size", 1)),
         log_every=int(lg.get("log_every", 20)),
         save_every_epochs=int(lg.get("save_every_epochs", 1)),
         tensorboard=bool(lg.get("tensorboard", True)),
@@ -127,9 +128,12 @@ def build_settings(experiment: ExperimentConfig, cli):
         # Joint training defaults to generated Box validation, not box-free
         # inference. Explicit validation.box_mode still overrides the default.
         val_box_mode=str(v.get("box_mode", "generated" if str(t.get("box_mode", "none")).lower() == "joint" else "none")).strip().lower(),
-        box_ce_weight=float(t.get("box_ce_weight", 0.3)),
+        box_loss_weight=float(t.get("box_loss_weight", t.get("box_ce_weight", 0.3))),
         box_gt_max_boxes=int(t.get("box_gt_max_boxes", 16)),
-        box_dropout=float(t.get("box_dropout", 0.15)),
+        box_objectness_weight=float(t.get("box_objectness_weight", 1.0)),
+        box_l1_weight=float(t.get("box_l1_weight", 2.0)),
+        box_giou_weight=float(t.get("box_giou_weight", 1.0)),
+        box_no_object_weight=float(t.get("box_no_object_weight", 0.1)),
     )
 
 
@@ -290,12 +294,14 @@ def merge_targets(samples, route):
 def validate_box_modes(settings):
     if settings.train_box_mode not in {"none", "provided", "joint"}:
         raise ValueError("training.box_mode must be 'none', 'provided' or 'joint'")
-    if settings.box_ce_weight < 0 or settings.box_ce_weight > 10:
-        raise ValueError("box_ce_weight must be in [0,10]")
+    if settings.box_loss_weight < 0 or settings.box_loss_weight > 10:
+        raise ValueError("box_loss_weight must be in [0,10]")
     if settings.box_gt_max_boxes < 1 or settings.box_gt_max_boxes > 64:
         raise ValueError("box_gt_max_boxes must be in [1,64]")
-    if not 0 <= settings.box_dropout <= 1:
-        raise ValueError("box_dropout must be in [0,1]")
+    if min(settings.box_objectness_weight, settings.box_l1_weight, settings.box_giou_weight) < 0:
+        raise ValueError("direct Box component weights must be nonnegative")
+    if not 0 <= settings.box_no_object_weight <= 1:
+        raise ValueError("box_no_object_weight must be in [0,1]")
     if settings.val_box_mode not in {"none", "provided", "generated"}:
         raise ValueError("validation.box_mode must be 'none', 'provided' or 'generated'")
 
@@ -359,52 +365,70 @@ def collate_box_proposals(samples, route, *, device, max_proposals):
 # Forward / loss / validation
 # =============================================================================
 
-def forward_loss(model, criterion, samples, spec, *, box_mode="none",
-                 box_ce_weight=0.3, box_gt_max_boxes=16, box_dropout=0.15):
-    """One multimodal Qwen forward + mask decoder and joint objective.
+def forward_loss(
+    model,
+    criterion,
+    samples,
+    spec,
+    *,
+    box_mode="none",
+    box_loss_weight=0.3,
+    box_gt_max_boxes=16,
+    box_objectness_weight=1.0,
+    box_l1_weight=2.0,
+    box_giou_weight=1.0,
+    box_no_object_weight=0.1,
+):
+    """One PAIR forward with optional direct K-box set prediction.
 
-    For joint training, Qwen gets target boxes ONLY as causal assistant suffix.
-    The TASK and T_mm positions precede GT text so Mask branch cannot read it.
-    The mask decoder receives augmented GT regions as a teacher-guided spatial
-    prior. This is joint optimization, NOT differentiable box-coordinate decoding.
+    joint: the model predicts K boxes in parallel, uses those SAME predictions
+    for Box Guidance, and matches them against weak GT boxes for set loss.
+    generated: identical direct prediction path but without GT Box loss.
+    provided: use externally supplied proposals.
+    none: no Box Guidance.
     """
     if box_mode not in ("none", "provided", "generated", "joint"):
         raise ValueError(f"Invalid box_mode={box_mode!r}")
-    if box_mode in ("generated", "joint") and not model.training and box_mode == "joint":
-        raise RuntimeError("GT-derived Box supervision is TRAIN ONLY")
+    if box_mode == "joint" and not model.training:
+        raise RuntimeError("GT-derived direct Box supervision is TRAIN ONLY")
     if box_mode == "generated" and model.training:
-        raise RuntimeError("Box generation is evaluation-only")
+        raise RuntimeError("Use box_mode='joint' for direct Box prediction during training")
+
     base = unwrap(model)
     prompts = [sample["prompt"] for sample in samples]
+    box_targets = None
     if box_mode == "provided":
         boxes = collate_box_proposals(
-            samples, spec.route, device=next(base.parameters()).device,
+            samples,
+            spec.route,
+            device=next(base.parameters()).device,
             max_proposals=base.box_max_proposals,
         )
-        grounding_targets = None
     elif box_mode == "joint":
-        if box_gt_max_boxes > base.box_max_proposals:
-            raise ValueError("training.box_gt_max_boxes exceeds model.box_guidance.max_proposals")
-        guidance = build_grounding_supervision(
-            samples, spec.route, max_boxes=box_gt_max_boxes,
-            device=next(base.parameters()).device, box_dropout=box_dropout,
+        if box_gt_max_boxes > base.box_num_queries:
+            raise ValueError(
+                "training.box_gt_max_boxes cannot exceed model.box_proposal.num_queries"
+            )
+        box_targets = build_box_supervision(
+            samples,
+            spec.route,
+            max_boxes=box_gt_max_boxes,
+            device=next(base.parameters()).device,
         )
-        grounding_targets = guidance.pop("grounding_targets")
-        guidance.pop("num_boxes")
-        boxes = guidance
+        boxes = {}
     else:
         boxes = {}
-        grounding_targets = None
+
     common = {
-        "prompts": prompts, "class_names": spec.class_names,
-        "generate_boxes": box_mode == "generated",
-        "grounding_targets": grounding_targets,
+        "prompts": prompts,
+        "class_names": spec.class_names,
+        "generate_boxes": box_mode in ("generated", "joint"),
         **boxes,
     }
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
         prediction_mode = "bcd" if spec.label_mode == "binary" else "scd"
-        result = model(
+        prediction = model(
             images_t1=[sample["images_t1"] for sample in samples],
             images_t2=[sample["images_t2"] for sample in samples],
             output_sizes=output_sizes,
@@ -412,31 +436,42 @@ def forward_loss(model, criterion, samples, spec, *, box_mode="none",
             **common,
         )
     elif spec.route == "3d":
-        result = model(
+        prediction = model(
             point_dicts_t1=[sample["point_dict_t1"] for sample in samples],
             point_dicts_t2=[sample["point_dict_t2"] for sample in samples],
             **common,
         )
     else:
         raise NotImplementedError("PAIR 2D+3D requires calibrated image/point correspondence")
+
+    box_loss_output = None
     if box_mode == "joint":
-        if not isinstance(result, tuple) or len(result) != 2:
-            raise RuntimeError("Joint PAIRModel must return (PredictionLogits, grounding_ce)")
-        prediction, grounding_ce = result
-    else:
-        prediction = result
-        grounding_ce = None
+        gt_key = "boxes_2d" if spec.route == "2d" else "boxes_3d"
+        box_loss_output = direct_box_set_loss(
+            prediction,
+            gt_boxes=box_targets[gt_key],
+            gt_valid=box_targets["box_valid"],
+            route=spec.route,
+            objectness_weight=box_objectness_weight,
+            l1_weight=box_l1_weight,
+            giou_weight=box_giou_weight,
+            no_object_weight=box_no_object_weight,
+        )
+
     target = merge_targets(samples, spec.route)
     semantic_changed_only = spec.route == "2d" and spec.label_mode == "semantic_pair"
     loss_output = criterion(
-        prediction=prediction, target=target,
+        prediction=prediction,
+        target=target,
         class_names=spec.class_names,
         semantic_changed_only=semantic_changed_only,
-        grounding_ce=grounding_ce,
-        box_ce_weight=box_ce_weight,
+        box_loss=(box_loss_output.total if box_loss_output is not None else None),
+        box_objectness=(box_loss_output.objectness if box_loss_output is not None else None),
+        box_l1=(box_loss_output.l1 if box_loss_output is not None else None),
+        box_giou=(box_loss_output.giou if box_loss_output is not None else None),
+        box_loss_weight=box_loss_weight,
     )
     return prediction, loss_output, target
-
 
 def all_reduce_loss_sums(sums, count, device):
     keys = sorted(sums)
@@ -468,16 +503,16 @@ def box_iou_matrix(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Te
 
 
 def box_stats_for_batch(prediction, samples, spec, device, max_boxes):
-    """Score predicted Qwen boxes vs *weak GT boxes* from held-out labels.
+    """Score direct predicted boxes vs *weak GT boxes* from held-out labels.
 
     The GT is constructed only AFTER the model forward, solely for metrics.
     The decoder has already consumed predicted boxes, never these GT boxes.
     Returns [TP@.5, pred_count, gt_count, best_iou_sum, gt_with_best_iou, samples].
     """
     if prediction.box_predictions is None or prediction.box_prediction_valid is None:
-        raise RuntimeError("generated validation must expose predicted Qwen boxes")
-    weak_gt = build_grounding_supervision(
-        samples, spec.route, max_boxes=max_boxes, device=device, box_dropout=0.0,
+        raise RuntimeError("generated validation must expose direct predicted boxes")
+    weak_gt = build_box_supervision(
+        samples, spec.route, max_boxes=max_boxes, device=device,
     )
     gt_boxes = weak_gt["boxes_2d" if spec.route == "2d" else "boxes_3d"]
     gt_valid = weak_gt["box_valid"]
@@ -695,6 +730,8 @@ def _architecture_module_bucket(parameter_name: str) -> str:
         return "3D Semantic Head"
     if name.startswith("decoder.point_event_head.") or name.startswith("decoder.event_prototypes"):
         return "3D Event Head"
+    if name.startswith("decoder.box_proposal_head."):
+        return "Direct Box Proposal"
     if name.startswith("decoder.box_guidance."):
         return "Multi-box Guidance"
     if name.startswith("decoder."):
@@ -801,8 +838,8 @@ def print_trainable_parameter_report(model, optimizer):
 
     preferred_order = (
         "Qwen Vision", "Utonia", "PointAdapter", "Qwen LLM", "ImageAdapter",
-        "Class/Task Encoder", "Shared Query Decoder", "Temporal Fusion",
-        "Multi-box Guidance", "2D Semantic Head", "2D Change Head",
+        "Class/Task Encoder", "Shared Query Decoder", "Direct Box Proposal",
+        "Temporal Fusion", "Multi-box Guidance", "2D Semantic Head", "2D Change Head",
         "3D Semantic Head", "3D Event Head",
     )
     ordered_names = [name for name in preferred_order if name in modules]
@@ -894,8 +931,8 @@ def build_scheduler(optimizer, total_updates, warmup_ratio, kind):
 # Checkpoints
 # =============================================================================
 
-CHECKPOINT_FORMAT_VERSION = 3
-CHECKPOINT_ARCHITECTURE = "PAIR-Qwen3VL-native-DeepStack-query-multibox-v1"
+CHECKPOINT_FORMAT_VERSION = 4
+CHECKPOINT_ARCHITECTURE = "PAIR-Qwen3VL-native-DeepStack-directbox-v2"
 FOUNDATION_STATE_PREFIXES = (
     "backbone.qwen_backbone.model.",
     "backbone.point_encoder.model.",
@@ -1171,7 +1208,7 @@ _LOG_EVENT = (
 def loss_logging_keys(values, spec):
     """Return every applicable loss field exposed by ChangeLossOutput.as_dict()."""
     keys = ["loss"]
-    for name in ("loss_mask_total", "loss_grounding_ce"):
+    for name in ("loss_mask_total", "loss_box", "loss_box_objectness", "loss_box_l1", "loss_box_giou"):
         if name in values:
             keys.append(name)
 
@@ -1320,7 +1357,10 @@ def main():
 
         if any(experiment.datasets[n].spec.route == "2d3d" for n in experiment.selected_names):
             raise NotImplementedError("2D+3D joint training requires calibrated image/point geometry")
-        registry = DatasetRegistry(experiment, runtime, num_workers=settings.num_workers)
+        registry = DatasetRegistry(
+            experiment, runtime, num_workers=settings.num_workers,
+            validation_batch_size=settings.val_batch_size,
+        )
         dataset_scheduler = MultiDatasetScheduler(experiment, registry, settings.grad_accum)
         updates_per_epoch = dataset_scheduler.updates_per_epoch
         total_updates = updates_per_epoch * settings.epochs
@@ -1413,10 +1453,14 @@ def main():
                 print("NOTE: Box-guided Decoder weights receive no Box-specific "
                       "training signal without provided proposals.")
             if settings.train_box_mode == "joint":
-                print(f"JOINT Grounding CE + Mask Loss: weight={settings.box_ce_weight}, "
-                      f"max_boxes={settings.box_gt_max_boxes}, box_dropout={settings.box_dropout}")
-                print("NOTE: mask decoder uses teacher-guided regions during training; "
-                      "validation must use generated boxes or no boxes, never GT")
+                print(
+                    f"JOINT Direct Box Set Loss + Mask Loss: weight={settings.box_loss_weight}, "
+                    f"max_gt_boxes={settings.box_gt_max_boxes}, "
+                    f"obj={settings.box_objectness_weight}, l1={settings.box_l1_weight}, "
+                    f"giou={settings.box_giou_weight}, noobj={settings.box_no_object_weight}"
+                )
+                print("NOTE: training and validation both use model-predicted boxes for Decoder guidance; "
+                      "GT boxes are used only for the training set loss / held-out metrics")
             print("Datasets:", ", ".join(experiment.selected_names))
             print(
                 "Active model routes:",
@@ -1495,9 +1539,12 @@ def main():
                             _, loss_output, _ = forward_loss(
                                 model, criterion, samples, spec,
                                 box_mode=settings.train_box_mode,
-                                box_ce_weight=settings.box_ce_weight,
+                                box_loss_weight=settings.box_loss_weight,
                                 box_gt_max_boxes=settings.box_gt_max_boxes,
-                                box_dropout=settings.box_dropout,
+                                box_objectness_weight=settings.box_objectness_weight,
+                                box_l1_weight=settings.box_l1_weight,
+                                box_giou_weight=settings.box_giou_weight,
+                                box_no_object_weight=settings.box_no_object_weight,
                             )
                             loss = loss_output.total / accumulation_steps
                         loss.backward()
@@ -1593,7 +1640,8 @@ def main():
                             dataset_spec = registry.handles[name].config.spec
                             write_log_only(
                                 log_file,
-                                f"{name}: {format_loss_components(dataset_means, dataset_spec)}"
+                                f"  TRAIN LOSS [{name}] U{optimizer_step:06d} | "
+                                f"{format_loss_components(dataset_means, dataset_spec)}"
                             )
                             log_tensorboard_train(
                                 writer, dataset_means, optimizer_step, name, dataset_spec
@@ -1616,6 +1664,12 @@ def main():
             selection = {}
 
             if (epoch + 1) % settings.val_every_epochs == 0:
+                # The last train step's gradient buffers and LossOutput may still
+                # keep autograd activations alive; neither is needed for Val.
+                optimizer.zero_grad(set_to_none=True)
+                if "loss_output" in locals():
+                    del loss_output, loss, samples
+                torch.cuda.empty_cache()  # once at Train -> Val, not per batch
                 if runtime["distributed"]:
                     dist.barrier()
 

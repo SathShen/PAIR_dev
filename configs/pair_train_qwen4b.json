@@ -44,9 +44,9 @@
       "alpha": 16,
       "dropout": 0.05
     },
-    "box_generation": {
-      "max_boxes": 16,
-      "max_new_tokens": 256
+    "box_proposal": {
+      "num_queries": 16,
+      "score_threshold": 0.5
     }
   },
   "optimizer": {
@@ -65,7 +65,13 @@
   "training": {
     "grad_accum": 1,
     "num_workers": 4,
-    "box_mode": "joint"
+    "box_mode": "joint",
+    "box_loss_weight": 0.3,
+    "box_gt_max_boxes": 16,
+    "box_objectness_weight": 1.0,
+    "box_l1_weight": 2.0,
+    "box_giou_weight": 1.0,
+    "box_no_object_weight": 0.1
   },
   "validation": {
     "every_epochs": 1,

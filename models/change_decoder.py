@@ -26,7 +26,6 @@ Optional multi-box spatial guidance:
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import math
 from torch.utils.checkpoint import checkpoint
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -423,6 +422,16 @@ class PredictionLogits:
     updated_queries: Optional[torch.Tensor] = None
     box_guidance_applied: bool = False
 
+    # Direct set-prediction boxes. For 2D, box_predictions are normalized xyxy.
+    # For 3D, box_predictions are world xyzxyz while normalized coordinates are
+    # kept separately for assignment/loss. No autoregressive JSON is involved.
+    box_predictions: Optional[torch.Tensor] = None
+    box_predictions_normalized: Optional[torch.Tensor] = None
+    box_prediction_logits: Optional[torch.Tensor] = None
+    box_prediction_scores: Optional[torch.Tensor] = None
+    box_prediction_valid: Optional[torch.Tensor] = None
+    box_scene_bounds: Optional[torch.Tensor] = None
+
 
 class QueryConditionedClassHead(nn.Module):
     """One task query + C prototypes -> C spatial classifiers.
@@ -759,6 +768,162 @@ class MultiBoxGuidance(nn.Module):
         return output
 
 
+
+class DirectBoxProposalHead(nn.Module):
+    """Parallel K-box set predictor conditioned on Qwen TASK hidden + spatial memory.
+
+    This replaces autoregressive JSON Box generation. All K proposals are produced
+    in one forward pass. Coordinates are normalized to [0,1] for learning; 3D
+    proposals are converted back to world XYZ only when consumed by Box Guidance.
+    """
+
+    def __init__(
+        self,
+        *,
+        decoder_dim: int,
+        num_queries: int = 16,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        score_threshold: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if num_queries < 1:
+            raise ValueError('num_queries must be positive')
+        if decoder_dim % num_heads != 0:
+            raise ValueError('decoder_dim must be divisible by num_heads')
+        if not 0.0 < score_threshold < 1.0:
+            raise ValueError('score_threshold must be inside (0,1)')
+        self.num_queries = int(num_queries)
+        self.decoder_dim = int(decoder_dim)
+        self.score_threshold = float(score_threshold)
+
+        self.query_embed = nn.Parameter(torch.randn(num_queries, decoder_dim) * 0.02)
+        self.time_embedding = nn.Embedding(3, decoder_dim)
+        self.query_norm = nn.LayerNorm(decoder_dim)
+        self.memory_norm = nn.LayerNorm(decoder_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            decoder_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(decoder_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(decoder_dim, 2 * decoder_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * decoder_dim, decoder_dim),
+        )
+        self.final_norm = nn.LayerNorm(decoder_dim)
+        self.objectness = nn.Linear(decoder_dim, 1)
+        self.box_2d = nn.Linear(decoder_dim, 4)
+        self.box_3d = nn.Linear(decoder_dim, 6)
+        self._reset_prediction_heads()
+
+    def _reset_prediction_heads(self) -> None:
+        # Start from broad, valid boxes rather than degenerate equal endpoints.
+        nn.init.normal_(self.objectness.weight, std=0.01)
+        nn.init.constant_(self.objectness.bias, -2.0)
+        for head, axis in ((self.box_2d, 2), (self.box_3d, 3)):
+            nn.init.normal_(head.weight, std=0.01)
+            with torch.no_grad():
+                head.bias[:axis].fill_(-1.0)
+                head.bias[axis:].fill_(1.0)
+
+    @staticmethod
+    def _ordered_normalized_boxes(raw: torch.Tensor) -> torch.Tensor:
+        axis = raw.shape[-1] // 2
+        a = raw[..., :axis].sigmoid()
+        b = raw[..., axis:].sigmoid()
+        lo = torch.minimum(a, b)
+        hi = torch.maximum(a, b)
+        return torch.cat((lo, hi), dim=-1)
+
+    def forward(
+        self,
+        *,
+        global_query: torch.Tensor,
+        memory: torch.Tensor,
+        dimension: int,
+        memory_mask: Optional[torch.Tensor] = None,
+        memory_time_ids: Optional[torch.Tensor] = None,
+        scene_bounds: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if dimension not in (2, 3):
+            raise ValueError('dimension must be 2 or 3')
+        if global_query.ndim != 2 or global_query.shape != (memory.shape[0], self.decoder_dim):
+            raise ValueError(
+                f'global_query must be [B,{self.decoder_dim}] and match memory batch'
+            )
+        if memory.ndim != 3 or memory.shape[-1] != self.decoder_dim:
+            raise ValueError(f'memory must be [B,L,{self.decoder_dim}]')
+        b, length, _ = memory.shape
+
+        query = (
+            self.query_embed.unsqueeze(0).expand(b, -1, -1)
+            + global_query.to(dtype=self.query_embed.dtype).unsqueeze(1)
+        )
+
+        memory_for_box = memory
+        if memory_time_ids is not None:
+            if memory_time_ids.shape != (b, length):
+                raise ValueError('memory_time_ids must be [B,L]')
+            if memory_time_ids.device != memory.device:
+                raise ValueError('memory_time_ids must be on memory.device')
+            if not torch.all((memory_time_ids >= 0) & (memory_time_ids <= 2)):
+                raise ValueError('memory_time_ids must contain only 0/1/2')
+            time = self.time_embedding(memory_time_ids.long())
+            memory_for_box = memory_for_box.to(dtype=time.dtype) + time
+
+        q = self.query_norm(query)
+        m = self.memory_norm(memory_for_box.to(dtype=q.dtype))
+        key_padding_mask = None
+        if memory_mask is not None:
+            if memory_mask.shape != (b, length) or memory_mask.dtype != torch.bool:
+                raise ValueError('memory_mask must be bool [B,L]')
+            if not memory_mask.any(dim=1).all():
+                raise ValueError('every sample needs at least one valid memory token')
+            key_padding_mask = ~memory_mask
+        context, _ = self.cross_attention(
+            q, m, m, key_padding_mask=key_padding_mask, need_weights=False,
+        )
+        query = query + context
+        query = query + self.ffn(self.ffn_norm(query))
+        query = self.final_norm(query)
+
+        logits = self.objectness(query).squeeze(-1)
+        raw = self.box_2d(query) if dimension == 2 else self.box_3d(query)
+        normalized = self._ordered_normalized_boxes(raw)
+        scores = logits.sigmoid()
+
+        # During training all K soft proposals participate in Box Guidance, with
+        # their sigmoid score as strength. At evaluation, low-confidence slots are
+        # disabled so "no change" can yield zero valid proposals.
+        if self.training:
+            valid = torch.ones_like(scores, dtype=torch.bool)
+        else:
+            valid = scores >= self.score_threshold
+
+        if dimension == 2:
+            boxes = normalized
+        else:
+            if scene_bounds is None or scene_bounds.shape != (b, 2, 3):
+                raise ValueError('3D direct Box prediction requires scene_bounds [B,2,3]')
+            if scene_bounds.device != memory.device or not torch.isfinite(scene_bounds).all():
+                raise ValueError('scene_bounds must be finite and on memory.device')
+            span = scene_bounds[:, 1] - scene_bounds[:, 0]
+            if (span <= 0).any():
+                raise ValueError('scene_bounds must have strictly positive extent')
+            lo = scene_bounds[:, None, 0] + normalized[..., :3] * span[:, None]
+            hi = scene_bounds[:, None, 0] + normalized[..., 3:] * span[:, None]
+            boxes = torch.cat((lo, hi), dim=-1)
+
+        return {
+            'boxes': boxes,
+            'boxes_normalized': normalized,
+            'logits': logits,
+            'scores': scores,
+            'valid': valid,
+        }
+
+
 class PAIRChangeDecoder(nn.Module):
     """Shared Q decoder and complete modality-specific prediction heads.
 
@@ -800,6 +965,8 @@ class PAIRChangeDecoder(nn.Module):
         box_edge_softness: float = 0.08,
         box_chunk_size: int = 8,
         box_residual_init: float = 0.10,
+        box_num_queries: int = 16,
+        box_score_threshold: float = 0.5,
         temporal_channels: int = 64,
         temporal_cell_size: float = 0.5,
         event_hidden_dim: int = 64,
@@ -858,6 +1025,13 @@ class PAIRChangeDecoder(nn.Module):
             edge_softness=box_edge_softness,
             box_chunk_size=box_chunk_size,
             init_residual_strength=box_residual_init,
+        )
+        if box_num_queries > max_box_proposals:
+            raise ValueError('box_num_queries cannot exceed max_box_proposals')
+        self.box_proposal_head = DirectBoxProposalHead(
+            decoder_dim=decoder_dim,
+            num_queries=box_num_queries, num_heads=num_heads, dropout=dropout,
+            score_threshold=box_score_threshold,
         )
 
     def _fuse_temporal_features(self, features_t1: torch.Tensor,
@@ -1087,6 +1261,7 @@ class PAIRChangeDecoder(nn.Module):
         boxes_2d: Optional[torch.Tensor] = None,
         box_valid: Optional[torch.Tensor] = None,
         box_scores: Optional[torch.Tensor] = None,
+        predict_boxes: bool = False,
     ) -> PredictionLogits:
         """Return flat logits for loss.py, or dense logits if return_maps=True.
 
@@ -1129,6 +1304,18 @@ class PAIRChangeDecoder(nn.Module):
             is_3d=False,
             detach_qwen_class_encoder=detach_qwen_class_encoder,
         )
+        proposal = None
+        if predict_boxes:
+            if boxes_2d is not None:
+                raise ValueError('predict_boxes=True cannot be combined with explicit boxes_2d')
+            box_seed_query = queries[:, 2] if mode == 'scd' else queries[:, 0]
+            proposal = self.box_proposal_head(
+                global_query=box_seed_query, memory=memory, dimension=2,
+                memory_mask=memory_mask, memory_time_ids=memory_time_ids,
+            )
+            boxes_2d = proposal['boxes']
+            box_valid = proposal['valid']
+            box_scores = proposal['scores']
         boxes_2d, box_valid, box_scores = self.box_guidance.check_boxes(
             boxes_2d, box_valid, box_scores, batch_size=b,
             dimension=2, device=memory.device,
@@ -1207,6 +1394,11 @@ class PAIRChangeDecoder(nn.Module):
             class_names=encoded.class_names,
             updated_queries=queries,
             box_guidance_applied=use_boxes,
+            box_predictions=(proposal['boxes'] if proposal is not None else None),
+            box_predictions_normalized=(proposal['boxes_normalized'] if proposal is not None else None),
+            box_prediction_logits=(proposal['logits'] if proposal is not None else None),
+            box_prediction_scores=(proposal['scores'] if proposal is not None else None),
+            box_prediction_valid=(proposal['valid'] if proposal is not None else None),
         )
 
     @staticmethod
@@ -1291,6 +1483,7 @@ class PAIRChangeDecoder(nn.Module):
         boxes_3d: Optional[torch.Tensor] = None,
         box_valid: Optional[torch.Tensor] = None,
         box_scores: Optional[torch.Tensor] = None,
+        predict_boxes: bool = False,
         box_scene_bounds: Optional[torch.Tensor] = None,
         point_xyz_t1: Optional[torch.Tensor] = None,
         point_xyz_t2: Optional[torch.Tensor] = None,
@@ -1331,6 +1524,19 @@ class PAIRChangeDecoder(nn.Module):
             memory_time_ids=memory_time_ids, is_3d=True,
             detach_qwen_class_encoder=detach_qwen_class_encoder,
         )
+        proposal = None
+        if predict_boxes:
+            if boxes_3d is not None:
+                raise ValueError('predict_boxes=True cannot be combined with explicit boxes_3d')
+            box_seed_query = 0.5 * (queries[:, 2] + queries[:, 3])
+            proposal = self.box_proposal_head(
+                global_query=box_seed_query, memory=memory, dimension=3,
+                memory_mask=memory_mask, memory_time_ids=memory_time_ids,
+                scene_bounds=box_scene_bounds,
+            )
+            boxes_3d = proposal['boxes']
+            box_valid = proposal['valid']
+            box_scores = proposal['scores']
         boxes_3d, box_valid, box_scores = self.box_guidance.check_boxes(
             boxes_3d, box_valid, box_scores, batch_size=b,
             dimension=3, device=memory.device,
@@ -1418,14 +1624,21 @@ class PAIRChangeDecoder(nn.Module):
             class_names=encoded.class_names,
             updated_queries=queries,
             box_guidance_applied=use_boxes,
+            box_predictions=(proposal['boxes'] if proposal is not None else None),
+            box_predictions_normalized=(proposal['boxes_normalized'] if proposal is not None else None),
+            box_prediction_logits=(proposal['logits'] if proposal is not None else None),
+            box_prediction_scores=(proposal['scores'] if proposal is not None else None),
+            box_prediction_valid=(proposal['valid'] if proposal is not None else None),
+            box_scene_bounds=(box_scene_bounds if proposal is not None else None),
         )
 
 
 # =============================================================================
-# Weak Box supervision (joint grounding + mask training)
+# Weak Box supervision + direct set-prediction loss
 # =============================================================================
-# Training-only target preparation, colocated with Box-guided prediction.
-# It does not modify PAIRChangeDecoder.forward_2d/forward_3d or inference.
+# Weak target preparation, colocated with Box-guided prediction.
+# GT boxes supervise the set loss during training and are used only for held-out
+# Box metrics during validation; they are never fed to the direct predictor.
 
 def _xy_buckets(xy: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor, side: int):
     span = (upper - lower).clamp_min(1e-5)
@@ -1479,8 +1692,10 @@ def _make_3d(sample: Dict[str, Any], max_boxes: int, *, margin: float = 0.25) ->
     if changed.shape[0] == 0:
         return torch.empty(0, 6, dtype=torch.float32)
     all_xyz = torch.cat((cloud1, cloud2), dim=0)
-    xy_min = all_xyz[:, :2].amin(dim=0)
-    xy_max = all_xyz[:, :2].amax(dim=0)
+    scene_min = all_xyz.amin(dim=0)
+    scene_max = all_xyz.amax(dim=0)
+    xy_min = scene_min[:2]
+    xy_max = scene_max[:2]
     side = math.isqrt(max_boxes)
     if side < 1:
         raise ValueError("max_boxes must be at least 1")
@@ -1488,59 +1703,38 @@ def _make_3d(sample: Dict[str, Any], max_boxes: int, *, margin: float = 0.25) ->
     boxes = []
     for key in torch.unique(keys).tolist():
         group = changed[keys == key]
-        lo = group.amin(dim=0) - margin
-        hi = group.amax(dim=0) + margin
+        lo = torch.maximum(group.amin(dim=0) - margin, scene_min)
+        hi = torch.minimum(group.amax(dim=0) + margin, scene_max)
+        # Direct 3D proposals are constrained to scene bounds, so weak GT must
+        # live in the same representable domain.
         boxes.append(torch.cat((lo, hi), dim=0).tolist())
     return torch.tensor(boxes, dtype=torch.float32)
 
 
-def build_grounding_supervision(samples: Sequence[Dict[str, Any]], route: str, *,
-                                max_boxes: int = 16, device=None, box_dropout: float = 0.0):
-    """Return JSON teacher labels and padded guidance proposals.
+def build_box_supervision(
+    samples: Sequence[Dict[str, Any]],
+    route: str,
+    *,
+    max_boxes: int = 16,
+    device=None,
+):
+    """Build padded weak GT boxes from existing change/event labels.
 
-    `box_dropout` affects only the mask-guidance branch, never the Qwen targets.
-    The teacher CE sees ALL weak labels, even when guidance gets dropped.
+    These targets are used ONLY by the direct Box set loss / validation metric.
+    They are never appended to Qwen tokens and are never fed into the Decoder
+    when box_mode='joint'.
     """
-    if route not in ("2d", "3d"):
-        raise ValueError(f"Unsupported route {route}")
+    if route not in ('2d', '3d'):
+        raise ValueError(f'Unsupported route {route}')
     if max_boxes < 1 or max_boxes > 64:
-        raise ValueError("max_boxes must be between 1 and 64")
-    if not 0 <= box_dropout <= 1:
-        raise ValueError("box_dropout must be in [0,1]")
-    dims = 4 if route == "2d" else 6
-    tensors, json_targets = [], []
+        raise ValueError('max_boxes must be between 1 and 64')
+    dims = 4 if route == '2d' else 6
+    tensors = []
     for sample in samples:
-        boxes = _make_2d(sample, max_boxes) if route == "2d" else _make_3d(sample, max_boxes)
+        boxes = _make_2d(sample, max_boxes) if route == '2d' else _make_3d(sample, max_boxes)
         if boxes.shape[0] > max_boxes:
-            raise RuntimeError("More boxes than configured, despite spatial grouping")
+            raise RuntimeError('More boxes than configured, despite spatial grouping')
         tensors.append(boxes)
-        formatted = []
-        for box in boxes.tolist():
-            # Compact Qwen targets in [0,1000]; 3D decoder will recover world XYZ.
-            if route == "2d":
-                coords = [int(round(v * 1000)) for v in box]
-            else:
-                cloud1 = torch.as_tensor(sample["point_dict_t1"]["coord"],dtype=torch.float64)
-                cloud2 = torch.as_tensor(sample["point_dict_t2"]["coord"],dtype=torch.float64)
-                xyz = torch.cat((cloud1,cloud2),dim=0)
-                lo,hi = xyz.amin(dim=0),xyz.amax(dim=0)
-                span = (hi-lo).clamp_min(1e-3)
-                norm = (torch.tensor(box,dtype=torch.float64).view(2,3)-lo)/span * 1000.0
-                norm = norm.clamp(0,1000)
-                coords = [int(round(v)) for v in norm.reshape(-1).tolist()]
-                # Guarantee strictly positive box dimensions in Qwen training labels.
-                for axis in range(3):
-                    if coords[axis+3] <= coords[axis]:
-                        if coords[axis] < 1000:
-                            coords[axis+3] = coords[axis] + 1
-                        else:
-                            coords[axis] = 999
-                            coords[axis+3] = 1000
-            # Textual score carried no supervision signal: every GT score was
-            # exactly 1.0. Keep confidence as an internal decoder tensor, but
-            # train Qwen on the shortest unambiguous coordinate protocol.
-            formatted.append(coords)
-        json_targets.append(json.dumps(formatted, separators=(",", ":")))
     b = len(samples)
     k = max((box.shape[0] for box in tensors), default=0)
     padded = torch.zeros((b, k, dims), device=device, dtype=torch.float32)
@@ -1550,13 +1744,208 @@ def build_grounding_supervision(samples: Sequence[Dict[str, Any]], route: str, *
         n = boxes.shape[0]
         if n:
             padded[i, :n] = boxes.to(device)
-            keep = torch.rand(n, device=device) >= box_dropout if box_dropout else torch.ones(n, dtype=torch.bool, device=device)
-            valid[i, :n] = keep
-            scores[i, :n] = keep.float()
+            valid[i, :n] = True
+            scores[i, :n] = 1.0
     return {
-        "grounding_targets": json_targets,
-        "boxes_2d" if route == "2d" else "boxes_3d": padded,
-        "box_valid": valid,
-        "box_scores": scores,
-        "num_boxes": sum(len(v) for v in tensors),
+        'boxes_2d' if route == '2d' else 'boxes_3d': padded,
+        'box_valid': valid,
+        'box_scores': scores,
+        'num_boxes': sum(int(v.shape[0]) for v in tensors),
     }
+
+
+# Compatibility alias for older diagnostics; no text grounding targets are made.
+build_grounding_supervision = build_box_supervision
+
+
+@dataclass
+class BoxSetLossOutput:
+    total: torch.Tensor
+    objectness: torch.Tensor
+    l1: torch.Tensor
+    giou: torch.Tensor
+    matched: int
+
+
+def _pairwise_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise generalized IoU for normalized 2D xyxy or 3D xyzxyz boxes."""
+    if boxes1.ndim != 2 or boxes2.ndim != 2 or boxes1.shape[-1] != boxes2.shape[-1]:
+        raise ValueError('boxes1/boxes2 must be [N,D]/[M,D] with the same D')
+    d = boxes1.shape[-1]
+    if d not in (4, 6):
+        raise ValueError('box width must be 4 or 6')
+    axis = d // 2
+    if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+    lo1, hi1 = boxes1[:, :axis], boxes1[:, axis:]
+    lo2, hi2 = boxes2[:, :axis], boxes2[:, axis:]
+    inter_lo = torch.maximum(lo1[:, None], lo2[None])
+    inter_hi = torch.minimum(hi1[:, None], hi2[None])
+    inter = (inter_hi - inter_lo).clamp_min(0).prod(-1)
+    vol1 = (hi1 - lo1).clamp_min(0).prod(-1)
+    vol2 = (hi2 - lo2).clamp_min(0).prod(-1)
+    union = vol1[:, None] + vol2[None] - inter
+    iou = inter / union.clamp_min(1e-8)
+    enc_lo = torch.minimum(lo1[:, None], lo2[None])
+    enc_hi = torch.maximum(hi1[:, None], hi2[None])
+    enc = (enc_hi - enc_lo).clamp_min(0).prod(-1)
+    return iou - (enc - union) / enc.clamp_min(1e-8)
+
+
+def _hungarian_rows_to_cols(cost: torch.Tensor) -> torch.Tensor:
+    """Exact minimum-cost assignment for rows<=cols; returns one col per row.
+
+    Matching is discrete and intentionally detached; selected prediction tensors
+    remain differentiable when the actual L1/GIoU loss is evaluated afterwards.
+    """
+    if cost.ndim != 2:
+        raise ValueError('cost must be a matrix')
+    n, m = cost.shape
+    if n == 0:
+        return torch.empty(0, dtype=torch.long, device=cost.device)
+    if n > m:
+        raise ValueError('Hungarian helper requires rows <= columns')
+    a = cost.detach().float().cpu().tolist()
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    inf = float('inf')
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                cur = a[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    row_to_col = [-1] * n
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            row_to_col[p[j] - 1] = j - 1
+    if any(j < 0 for j in row_to_col):
+        raise RuntimeError('Hungarian assignment failed')
+    return torch.tensor(row_to_col, dtype=torch.long, device=cost.device)
+
+
+def direct_box_set_loss(
+    prediction: PredictionLogits,
+    *,
+    gt_boxes: torch.Tensor,
+    gt_valid: torch.Tensor,
+    route: str,
+    objectness_weight: float = 1.0,
+    l1_weight: float = 2.0,
+    giou_weight: float = 1.0,
+    no_object_weight: float = 0.1,
+) -> BoxSetLossOutput:
+    """DETR-style set loss between K direct proposals and weak GT regions."""
+    pred_norm = prediction.box_predictions_normalized
+    logits = prediction.box_prediction_logits
+    if pred_norm is None or logits is None:
+        raise ValueError('direct Box loss requires predicted boxes and objectness logits')
+    if route not in ('2d', '3d'):
+        raise ValueError('route must be 2d or 3d')
+    if not (0 <= no_object_weight <= 1):
+        raise ValueError('no_object_weight must be in [0,1]')
+    if min(objectness_weight, l1_weight, giou_weight) < 0:
+        raise ValueError('Box loss weights must be nonnegative')
+    if gt_boxes.ndim != 3 or gt_valid.shape != gt_boxes.shape[:2]:
+        raise ValueError('GT boxes must be [B,G,D] with gt_valid [B,G]')
+    if pred_norm.shape[0] != gt_boxes.shape[0] or logits.shape != pred_norm.shape[:2]:
+        raise ValueError('predicted and GT Box batch dimensions do not match')
+
+    gt_norm = gt_boxes.to(device=pred_norm.device, dtype=torch.float32)
+    if route == '3d':
+        bounds = prediction.box_scene_bounds
+        if bounds is None or bounds.shape != (pred_norm.shape[0], 2, 3):
+            raise ValueError('3D direct Box loss requires box_scene_bounds [B,2,3]')
+        span = (bounds[:, 1] - bounds[:, 0]).clamp_min(1e-6)
+        gt_norm = torch.cat((
+            (gt_norm[..., :3] - bounds[:, None, 0]) / span[:, None],
+            (gt_norm[..., 3:] - bounds[:, None, 0]) / span[:, None],
+        ), dim=-1).clamp(0, 1)
+    else:
+        gt_norm = gt_norm.clamp(0, 1)
+
+    obj_sum = logits.new_zeros(())
+    obj_denom = logits.new_zeros(())
+    l1_sum = logits.new_zeros(())
+    giou_sum = logits.new_zeros(())
+    matched_total = 0
+    d = pred_norm.shape[-1]
+
+    for b in range(pred_norm.shape[0]):
+        gt = gt_norm[b][gt_valid[b].to(device=pred_norm.device).bool()]
+        pred = pred_norm[b].float()
+        target_obj = torch.zeros_like(logits[b], dtype=torch.float32)
+        positive = torch.zeros_like(target_obj, dtype=torch.bool)
+        if gt.shape[0] > pred.shape[0]:
+            raise ValueError('GT Box count exceeds direct proposal query count')
+        if gt.shape[0] > 0:
+            l1_cost = torch.cdist(gt.float(), pred, p=1)  # [G,K]
+            giou_cost = 1.0 - _pairwise_giou(gt.float(), pred)
+            assignment = _hungarian_rows_to_cols(
+                l1_weight * l1_cost + giou_weight * giou_cost
+            )
+            gt_ids = torch.arange(gt.shape[0], device=pred.device)
+            matched_pred = pred.index_select(0, assignment)
+            matched_gt = gt.index_select(0, gt_ids)
+            target_obj[assignment] = 1.0
+            positive[assignment] = True
+            l1_sum = l1_sum + (matched_pred - matched_gt).abs().sum()
+            pair_giou = _pairwise_giou(matched_pred, matched_gt)
+            giou_sum = giou_sum + (1.0 - pair_giou.diag()).sum()
+            matched_total += int(gt.shape[0])
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits[b].float(), target_obj, reduction='none'
+        )
+        weights = torch.full_like(bce, float(no_object_weight))
+        weights[positive] = 1.0
+        obj_sum = obj_sum + (bce * weights).sum()
+        obj_denom = obj_denom + weights.sum()
+
+    objectness = obj_sum / obj_denom.clamp_min(1.0)
+    if matched_total:
+        l1 = l1_sum / float(matched_total * d)
+        giou = giou_sum / float(matched_total)
+    else:
+        l1 = logits.sum() * 0.0
+        giou = logits.sum() * 0.0
+    total = (
+        float(objectness_weight) * objectness
+        + float(l1_weight) * l1
+        + float(giou_weight) * giou
+    )
+    return BoxSetLossOutput(
+        total=total, objectness=objectness, l1=l1, giou=giou,
+        matched=matched_total,
+    )
