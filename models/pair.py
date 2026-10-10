@@ -381,6 +381,7 @@ class PAIRModel(nn.Module):
         generate_boxes: Optional[bool],
         images_t1=None, images_t2=None, point_tokens_t1=None,
         point_tokens_t2=None, scene_bounds=None,
+        return_qwen_features: bool = False,
     ) -> Dict[str, Any]:
         want_generate = self.box_generation if generate_boxes is None else bool(generate_boxes)
         if explicit_boxes is not None or not want_generate:
@@ -400,15 +401,29 @@ class PAIRModel(nn.Module):
             point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
             scene_bounds=scene_bounds, max_boxes=self.box_generation_max_boxes,
             max_new_tokens=self.box_max_new_tokens,
+            return_features=return_qwen_features,
         )
-        return {
+        result = {
             "boxes_2d" if dimension == 2 else "boxes_3d": generated[
                 "boxes_2d" if dimension == 2 else "boxes_3d"
             ],
             "box_valid": generated["box_valid"],
             "box_scores": generated["box_scores"],
             "box_parse_failures": int(generated["box_parse_failures"]),
+            "box_generated_tokens": int(generated.get("box_generated_tokens", 0)),
         }
+        if return_qwen_features:
+            result["_qwen_features"] = {
+                "task_hidden": generated["task_hidden"],
+                "llm_visual_t1": generated["llm_visual_t1"],
+                "llm_visual_t2": generated["llm_visual_t2"],
+                "llm_point_t1": generated["llm_point_t1"],
+                "llm_point_t2": generated["llm_point_t2"],
+                "premerge_t1": generated["premerge_t1"],
+                "premerge_t2": generated["premerge_t2"],
+                "grounding_loss": None,
+            }
+        return result
 
     def forward_2d(
         self, images_t1, images_t2, prompts, class_names,
@@ -438,21 +453,32 @@ class PAIRModel(nn.Module):
                                "train with supervised/provided Box proposals")
         images1 = [_image_to_pil(x) for x in first]
         images2 = [_image_to_pil(x) for x in second]
-        # EVAL generated Box first: do not keep Qwen/DeepStack + pixel features
-        # alive while autoregressive generation allocates its KV cache.
+        # Formal generated Val uses ONE Qwen multimodal prefill. generate()
+        # captures TASK/T_mm/DeepStack from its prompt prefill and reuses them
+        # for segmentation instead of immediately running Qwen a second time.
+        want_generated_features = (
+            not self.training
+            and grounding_targets is None
+            and boxes_2d is None
+            and (self.box_generation if generate_boxes is None else bool(generate_boxes))
+        )
         proposals = self._resolve_boxes(
             dimension=2, prompts=prompts,
             explicit_boxes=boxes_2d, box_valid=box_valid,
             box_scores=box_scores, generate_boxes=generate_boxes,
             images_t1=images1, images_t2=images2,
+            return_qwen_features=want_generated_features,
         )
         parse_failures = proposals.pop("box_parse_failures", None)
-        qwen_out = self.qwen_backbone(
-            prompt=prompts, images_t1=images1, images_t2=images2,
-            grounding_targets=grounding_targets,
-            grounding_kind="2d" if grounding_targets is not None else None,
-            grounding_max_boxes=self.box_generation_max_boxes,
-        )
+        generated_tokens = proposals.pop("box_generated_tokens", None)
+        qwen_out = proposals.pop("_qwen_features", None)
+        if qwen_out is None:
+            qwen_out = self.qwen_backbone(
+                prompt=prompts, images_t1=images1, images_t2=images2,
+                grounding_targets=grounding_targets,
+                grounding_kind="2d" if grounding_targets is not None else None,
+                grounding_max_boxes=self.box_generation_max_boxes,
+            )
         features = self.image_adapter(
             premerge_t1=qwen_out["premerge_t1"],
             premerge_t2=qwen_out["premerge_t2"],
@@ -487,6 +513,7 @@ class PAIRModel(nn.Module):
             prediction.box_prediction_valid = proposals["box_valid"]
             prediction.box_prediction_scores = proposals["box_scores"]
             prediction.box_parse_failures = int(parse_failures or 0)
+            prediction.box_generated_tokens = int(generated_tokens or 0)
 
         if grounding_targets is not None:
             box_loss = qwen_out.get("grounding_loss")
@@ -531,9 +558,15 @@ class PAIRModel(nn.Module):
             xyzb = torch.as_tensor(cloud2["coord"], device=device, dtype=torch.float32)
             joint = torch.cat((xyza, xyzb), dim=0)
             scene_bounds.append(torch.stack((joint.amin(0), joint.amax(0)), dim=0))
-        # Box generation still needs Utonia point tokens, but does NOT need
-        # Qwen feature-forward outputs or the large temporal fused features.
-        # Use the same full original-coordinate extent as fuse_temporal.
+        # Generated 3D Val also reuses generate()'s single Qwen prefill.
+        # Utonia must still run first because Box generation consumes its point
+        # tokens, but the second Qwen language-model pass is eliminated.
+        want_generated_features = (
+            not self.training
+            and grounding_targets is None
+            and boxes_3d is None
+            and (self.box_generation if generate_boxes is None else bool(generate_boxes))
+        )
         proposals = self._resolve_boxes(
             dimension=3, prompts=prompts,
             explicit_boxes=boxes_3d, box_valid=box_valid,
@@ -541,17 +574,21 @@ class PAIRModel(nn.Module):
             point_tokens_t1=t1.llm_point_tokens,
             point_tokens_t2=t2.llm_point_tokens,
             scene_bounds=scene_bounds,
+            return_qwen_features=want_generated_features,
         )
         parse_failures = proposals.pop("box_parse_failures", None)
-        qwen_out = self.qwen_backbone(
-            prompt=prompts,
-            point_tokens_t1=t1.llm_point_tokens,
-            point_tokens_t2=t2.llm_point_tokens,
-            grounding_targets=grounding_targets,
-            grounding_kind="3d" if grounding_targets is not None else None,
-            grounding_scene_bounds=scene_bounds if grounding_targets is not None else None,
-            grounding_max_boxes=self.box_generation_max_boxes,
-        )
+        generated_tokens = proposals.pop("box_generated_tokens", None)
+        qwen_out = proposals.pop("_qwen_features", None)
+        if qwen_out is None:
+            qwen_out = self.qwen_backbone(
+                prompt=prompts,
+                point_tokens_t1=t1.llm_point_tokens,
+                point_tokens_t2=t2.llm_point_tokens,
+                grounding_targets=grounding_targets,
+                grounding_kind="3d" if grounding_targets is not None else None,
+                grounding_scene_bounds=scene_bounds if grounding_targets is not None else None,
+                grounding_max_boxes=self.box_generation_max_boxes,
+            )
         features = self.point_adapter.fuse_temporal(
             t1, t2,
             llm_point_t1=qwen_out["llm_point_t1"],
@@ -577,6 +614,7 @@ class PAIRModel(nn.Module):
             prediction.box_prediction_valid = proposals["box_valid"]
             prediction.box_prediction_scores = proposals["box_scores"]
             prediction.box_parse_failures = int(parse_failures or 0)
+            prediction.box_generated_tokens = int(generated_tokens or 0)
 
         if grounding_targets is not None:
             box_loss = qwen_out.get("grounding_loss")
