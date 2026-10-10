@@ -39,9 +39,9 @@ Important topology guarantee
 ----------------------------
 Utonia sees one representative per occupied voxel, but PAIR needs dense
 per-point features for change decoding. This wrapper preserves the inverse
-voxel map and returns one feature for every original cropped input point:
+voxel map and returns sparse M-voxel features; only final logits expand to N:
 
-    output.features.shape[0] == input.coord.shape[0]
+    output.voxel_inverse.shape[0] == input.coord.shape[0]
 
 No labels are consumed here.
 """
@@ -75,21 +75,21 @@ class UtoniaPointEncoderConfig:
 @dataclass
 class PointEncoderOutput:
     """
-    Dense point representation consumed by PointAdapter / Unified Decoder.
+    Sparse Utonia voxel representation consumed by PointAdapter.
 
     features:
-        Utonia multi-scale feature for every original cropped input point,
-        [N, output_dim].
+        Utonia multi-scale feature for M sampled voxel representatives,
+        [M, output_dim].
 
     coord:
-        Original PAIR point coordinates, [N, 3]. These are NOT the scaled
-        coordinates used internally by Utonia.
+        Original-world coordinates of the M voxel representatives, [M,3],
+        NOT the scaled coordinates used internally by Utonia.
 
     batch:
-        Batch ID for every original point, [N].
+        Batch ID for every voxel representative, [M].
 
     offset:
-        Pointcept-style cumulative point counts, [B].
+        Pointcept-style cumulative voxel counts, [B].
     """
 
     features: torch.Tensor
@@ -101,6 +101,14 @@ class PointEncoderOutput:
     # it is carried unchanged to PointAdapter for PAIR-side fusion.
     intensity: Optional[torch.Tensor] = None
     intensity_mask: Optional[torch.Tensor] = None
+
+    # Sparse Utonia voxel topology. The inverse is the ONLY path back to
+    # original input-point count; decoder maps class/event LOGITS through it.
+    original_coord: Optional[torch.Tensor] = None
+    original_batch: Optional[torch.Tensor] = None
+    original_offset: Optional[torch.Tensor] = None
+    voxel_inverse: Optional[torch.Tensor] = None
+    representative_indices: Optional[torch.Tensor] = None
 
 
 def _load_checkpoint(path: Path):
@@ -1062,6 +1070,7 @@ class UtoniaPointEncoder(nn.Module):
             "num_sampled": (
                 num_voxels
             ),
+            "representative_indices": representative,
         }
 
     # ------------------------------------------------------------------
@@ -1282,14 +1291,6 @@ class UtoniaPointEncoder(nn.Module):
                     "the voxel-sampled topology"
                 )
 
-            dense_features = (
-                sampled_features[
-                    prepared[
-                        "voxel_inverse"
-                    ]
-                ]
-            )
-
         original_coord = prepared[
             "original_coord"
         ]
@@ -1302,25 +1303,17 @@ class UtoniaPointEncoder(nn.Module):
             "original_offset"
         ]
 
-        if (
-            dense_features.shape[0]
-            != original_coord.shape[0]
-        ):
-            raise RuntimeError(
-                "Utonia inverse mapping failed: "
-                f"dense N={dense_features.shape[0]} "
-                f"but input N={original_coord.shape[0]}"
-            )
-
-        if (
-            dense_features.shape[1]
-            != self.output_dim
-        ):
-            raise RuntimeError(
-                f"Expected dense Utonia dim "
-                f"{self.output_dim}, "
-                f"got {dense_features.shape[1]}"
-            )
+        # Keep the FIVE recovered Utonia scales at M occupied voxels.
+        # Expanding [M,1386] to [N,1386] here was a major memory regression.
+        if sampled_features.shape != (prepared["num_sampled"], self.output_dim):
+            raise RuntimeError("Utonia sampled feature dimension/count mismatch")
+        representative = prepared["representative_indices"]
+        voxel_inverse = prepared["voxel_inverse"]
+        sparse_coord = original_coord.index_select(0, representative)
+        sparse_batch = original_batch.index_select(0, representative)
+        sparse_offset = _offset_from_batch(sparse_batch)
+        if voxel_inverse.shape != (original_coord.shape[0],):
+            raise RuntimeError("voxel_inverse must provide one index per original point")
 
         intensity, intensity_mask = self._extract_optional_intensity(
             point_dict,
@@ -1329,10 +1322,15 @@ class UtoniaPointEncoder(nn.Module):
         )
 
         return PointEncoderOutput(
-            features=dense_features,
-            coord=original_coord,
-            batch=original_batch,
-            offset=original_offset,
-            intensity=intensity,
-            intensity_mask=intensity_mask,
+            features=sampled_features,
+            coord=sparse_coord,
+            batch=sparse_batch,
+            offset=sparse_offset,
+            intensity=None if intensity is None else intensity.index_select(0, representative),
+            intensity_mask=None if intensity_mask is None else intensity_mask.index_select(0, representative),
+            original_coord=original_coord,
+            original_batch=original_batch,
+            original_offset=original_offset,
+            voxel_inverse=voxel_inverse,
+            representative_indices=representative,
         )

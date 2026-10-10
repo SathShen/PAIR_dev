@@ -507,9 +507,15 @@ class QueryConditionedClassHead(nn.Module):
             raise ValueError('batch_ids must be [N] and match point count')
         weights = self.class_weights(query, prototypes)
         scale = self.logit_scale.float().clamp(max=math.log(50.0)).exp()
-        return scale * torch.einsum(
-            'nd,ncd->nc', self._features(features), weights.index_select(0, batch_ids)
-        )
+        # Contract is identical but avoid materializing [M,C,D] copies of
+        # classification weights. This remains differentiable in every branch.
+        projected = self._features(features)
+        logits = projected.new_empty((features.shape[0], weights.shape[1]))
+        for bid in range(weights.shape[0]):
+            selected = torch.nonzero(batch_ids == bid, as_tuple=False).flatten()
+            if selected.numel():
+                logits = logits.index_copy(0, selected, projected.index_select(0,selected) @ weights[bid].T)
+        return scale * logits
 
 
 class QueryConditionedBinaryHead(nn.Module):
@@ -1106,8 +1112,6 @@ class PAIRChangeDecoder(nn.Module):
                 for size in output_sizes
             ):
                 raise ValueError('output_sizes must contain B positive (H,W) pairs')
-            if return_maps and any(tuple(map(int,s)) != (h,w) for s in output_sizes):
-                raise ValueError('return_maps=True requires output_sizes to match feature size')
 
         change_features = self._fuse_temporal_features(pixel_features_t1, pixel_features_t2)
         descriptions = self.TASKS_2D_SCD if mode == 'scd' else self.TASKS_2D_BCD
@@ -1171,7 +1175,23 @@ class PAIRChangeDecoder(nn.Module):
             )
         change_query = queries[:, 2] if mode == 'scd' else queries[:, 0]
         change = self.image_change_head(change_features, change_query)
-        if not return_maps:
+        if return_maps:
+            # Return dense output maps at requested image resolution while
+            # keeping ALL high-dimensional computation at intermediate scale.
+            if output_sizes is not None:
+                unique_sizes = {tuple(map(int, size)) for size in output_sizes}
+                if len(unique_sizes) != 1:
+                    raise ValueError('return_maps=True requires uniform output_sizes')
+                target_hw = next(iter(unique_sizes))
+                if change.shape[-2:] != target_hw:
+                    if semantic_t1 is not None:
+                        semantic_t1 = F.interpolate(semantic_t1, size=target_hw,
+                                                    mode='bilinear', align_corners=False)
+                        semantic_t2 = F.interpolate(semantic_t2, size=target_hw,
+                                                    mode='bilinear', align_corners=False)
+                    change = F.interpolate(change[:,None], size=target_hw,
+                                           mode='bilinear', align_corners=False)[:,0]
+        else:
             semantic_t1, semantic_t2, change = self._flatten_2d(
                 semantic_t1, semantic_t2, change, output_sizes
             )
@@ -1270,8 +1290,10 @@ class PAIRChangeDecoder(nn.Module):
         box_scene_bounds: Optional[torch.Tensor] = None,
         point_xyz_t1: Optional[torch.Tensor] = None,
         point_xyz_t2: Optional[torch.Tensor] = None,
+        point_inverse_t1: Optional[torch.Tensor] = None,
+        point_inverse_t2: Optional[torch.Tensor] = None,
     ) -> PredictionLogits:
-        """3D per-point semantic and active-support event logits, ready for loss."""
+        """3D voxel-point predictions, restoring only final class/event logits to original points."""
         if not class_names:
             raise ValueError('3D semantic classes are required')
         b = memory.shape[0]
@@ -1372,6 +1394,19 @@ class PAIRChangeDecoder(nn.Module):
         )
         evt1 = self._mask_event_logits(evt1, phase=1)
         evt2 = self._mask_event_logits(evt2, phase=2)
+        # Final, low-channel inverse mapping. Indexing LOGITS (not class IDs or
+        # softmax probabilities) preserves the supervised loss interface [N,C],
+        # autograd, and illegal event class support. Never expand [M,256].
+        def restore(logits: torch.Tensor, inverse: Optional[torch.Tensor]) -> torch.Tensor:
+            if inverse is None:
+                return logits  # backwards compatible dense/custom encoders
+            if inverse.dtype != torch.long or inverse.ndim != 1 or inverse.device != logits.device:
+                raise ValueError('point_inverse must be long [N] on logits device')
+            if inverse.numel() and (inverse.min() < 0 or inverse.max() >= logits.shape[0]):
+                raise ValueError('point_inverse contains invalid voxel indices')
+            return logits.index_select(0, inverse)
+        sem1, evt1 = restore(sem1, point_inverse_t1), restore(evt1, point_inverse_t1)
+        sem2, evt2 = restore(sem2, point_inverse_t2), restore(evt2, point_inverse_t2)
         return PredictionLogits(
             semantic_logits_t1=sem1, semantic_logits_t2=sem2,
             event_logits_t1=evt1, event_logits_t2=evt2,

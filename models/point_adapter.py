@@ -4,13 +4,13 @@ The public terminology mirrors image_adapter.py:
   * LLM path: pretrained Utonia [N,utonia_dim] -> spatial sampling ->
     llm_point_tokens [K,qwen_dim], consumed by Qwen's <POINT> positions.
   * Spatial path: recovered Utonia stages [54,108,216,432,576] -> separate
-    learned level projections -> fused spatial features [N,D]. Native Qwen
+    learned level projections -> fused spatial features [M,D]. Native Qwen
     point-position hidden is then projected/aligned and fused into K/V memory.
-  * Dense path: fused spatial features -> original point detail MLP ->
-    point_features [N,D]. K/V is sampled BEFORE original point detail,
+  * Dense path: fused spatial features -> voxel-representative detail MLP ->
+    point_features [M,D]. K/V is sampled BEFORE detail,
     matching ImageAdapter's memory-then-high-resolution feature sequence.
   * Decoder handles all temporal matching and Event feature creation.
-    This adapter only returns memory, full-resolution point features, and XYZ.
+    This adapter only returns memory, sparse voxel-point features, and XYZ.
 
 PointSingleAdapterOutput is a SINGLE-cloud output. PointAdapterOutput matches
 ImageAdapterOutput's PAIR-level role: a two-epoch spatial adapter result with
@@ -78,8 +78,8 @@ class PointAdapterConfig:
     detail_residual_init: float = 0.10
     subvoxel_size: float = 0.5
 
-    # Spatial representatives are used only for Decoder Memory. Final
-    # logits still cover EVERY original input point.
+    # Decoder Memory uses a subset of Utonia's M voxel representatives.
+    # Final low-channel logits are expanded to every original point.
     memory_tokens_per_cloud: int = 1024
     memory_cell_size: float = 0.5
 
@@ -113,6 +113,8 @@ class PointSingleAdapterOutput:
     llm_pooled_voxel_count: Union[int, List[int]]
     llm_effective_voxel_size: Union[Optional[float], List[Optional[float]]]
     intensity_used: bool
+    voxel_inverse: Optional[torch.Tensor] = None  # [N_original] -> [M_sparse]
+    original_xyz: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -124,13 +126,15 @@ class PointAdapterOutput:
     """
     memory: torch.Tensor                 # [B,L,256], zero-padded
     memory_time_ids: torch.Tensor        # [B,L], 0=pad, 1=T1, 2=T2
-    point_features_t1: torch.Tensor      # [N1,256]
-    point_features_t2: torch.Tensor      # [N2,256]
-    point_batch_t1: torch.Tensor         # [N1]
-    point_batch_t2: torch.Tensor         # [N2]
-    point_xyz_t1: torch.Tensor           # [N1,3], original reference frame
-    point_xyz_t2: torch.Tensor           # [N2,3]
+    point_features_t1: torch.Tensor      # [M1,256] voxel representatives
+    point_features_t2: torch.Tensor      # [M2,256]
+    point_batch_t1: torch.Tensor         # [M1]
+    point_batch_t2: torch.Tensor         # [M2]
+    point_xyz_t1: torch.Tensor           # [M1,3], original world reference frame
+    point_xyz_t2: torch.Tensor           # [M2,3]
     box_scene_bounds: torch.Tensor       # [B,2,3], common T1/T2 bounds
+    point_inverse_t1: Optional[torch.Tensor] = None  # [N_original] -> [M_t1]
+    point_inverse_t2: Optional[torch.Tensor] = None  # [N_original] -> [M_t2]
 
     def decoder_inputs(self) -> Dict[str, torch.Tensor]:
         return {
@@ -143,6 +147,8 @@ class PointAdapterOutput:
             "point_xyz_t1": self.point_xyz_t1,
             "point_xyz_t2": self.point_xyz_t2,
             "box_scene_bounds": self.box_scene_bounds,
+            "point_inverse_t1": self.point_inverse_t1,
+            "point_inverse_t2": self.point_inverse_t2,
         }
 
 
@@ -255,7 +261,7 @@ class PointAdapter(nn.Module):
         # LLM point-token branch: RAW Utonia feature -> Qwen hidden space.
         #
         # REVISION:
-        #   LLM: [N,1386] -> voxel/FPS -> [K,1386] -> [K,qwen_dim].
+        #   LLM: [M,1386] -> voxel/FPS -> [K,1386] -> [K,qwen_dim].
         # ------------------------------------------------------------------
         self.llm_token_project = nn.Linear(cfg.utonia_dim, cfg.qwen_dim)
 
@@ -869,6 +875,31 @@ class PointAdapter(nn.Module):
         # Branch A: Utonia multi-scale fusion, before Qwen hidden / detail.
         # --------------------------------------------------------------
         memory_features = self._project_utonia_features(features)
+        # Raw point attributes are provided in original N-point order.
+        # Select the exact Utonia voxel representatives before detail fusion;
+        # never allocate a [N,256] or [N,1386] intermediate here.
+        getter = (point_encoded.get if isinstance(point_encoded, dict)
+                  else lambda k, default=None: getattr(point_encoded, k, default))
+        representative = getter('representative_indices')
+        inverse = getter('voxel_inverse')
+        original_xyz = getter('original_coord')
+        if representative is not None:
+            representative = representative.to(device=coord.device, dtype=torch.long)
+            if representative.shape != (features.shape[0],):
+                raise ValueError('representative_indices must be [M]')
+            if inverse is None or original_xyz is None:
+                raise ValueError('sparse Utonia output requires voxel_inverse and original_coord')
+            if inverse.ndim != 1 or int(inverse.numel()) != int(original_xyz.shape[0]):
+                raise ValueError('voxel_inverse must map N original points to M voxels')
+            if inverse.device != coord.device or inverse.min() < 0 or inverse.max() >= coord.shape[0]:
+                raise ValueError('voxel_inverse out of bounds or on wrong device')
+            if raw_point_dict is not None:
+                raw_point_dict = {
+                    name: (value.index_select(0, representative) if
+                           torch.is_tensor(value) and value.ndim >= 1 and
+                           value.shape[0] == original_xyz.shape[0] else value)
+                    for name, value in raw_point_dict.items()
+                }
         point_detail = self._prepare_point_detail(
             coord, batch, raw_point_dict, intensity, intensity_mask,
         )
@@ -975,10 +1006,13 @@ class PointAdapter(nn.Module):
             point_xyz=coord,
             point_batch=batch,
             point_offset=offset,
-            original_point_count=int(features.shape[0]),
+            original_point_count=int(original_xyz.shape[0]) if original_xyz is not None
+                                 else int(features.shape[0]),
             llm_pooled_voxel_count=pooled_counts_out,
             llm_effective_voxel_size=voxel_sizes_out,
             intensity_used=intensity_used,
+            voxel_inverse=inverse,
+            original_xyz=original_xyz,
         )
 
     # Spatial memory representative sampling (not temporal matching).
@@ -1035,8 +1069,20 @@ class PointAdapter(nn.Module):
             if ix1.numel() == 0 or ix2.numel() == 0:
                 raise ValueError('T1 and T2 must have points in every batch item')
             coords1, coords2 = xyz_t1[ix1], xyz_t2[ix2]
-            lower = torch.minimum(coords1.amin(0), coords2.amin(0))
-            upper = torch.maximum(coords1.amax(0), coords2.amax(0))
+            # Grounding uses the complete ORIGINAL world-coordinate extent,
+            # not the voxel representative extent (which can omit extrema).
+            if t1.original_xyz is not None and t2.original_xyz is not None:
+                if t1.voxel_inverse is None or t2.voxel_inverse is None:
+                    raise ValueError('original XYZ requires complete voxel inverse mapping')
+                # Original batch IDs follow original point -> voxel index ->
+                # sparse batch; avoids assuming samples have equal sizes.
+                orig1 = t1.original_xyz[batch_t1[t1.voxel_inverse] == bid]
+                orig2 = t2.original_xyz[batch_t2[t2.voxel_inverse] == bid]
+                lower = torch.minimum(orig1.amin(0), orig2.amin(0))
+                upper = torch.maximum(orig1.amax(0), orig2.amax(0))
+            else:
+                lower = torch.minimum(coords1.amin(0), coords2.amin(0))
+                upper = torch.maximum(coords1.amax(0), coords2.amax(0))
             bounds.append(torch.stack((lower, upper), dim=0))
             spatial_memories.append((
                 self._sample_spatial_memory(fused_t1[ix1], coords1),
@@ -1057,6 +1103,8 @@ class PointAdapter(nn.Module):
             point_batch_t1=batch_t1, point_batch_t2=batch_t2,
             point_xyz_t1=xyz_t1, point_xyz_t2=xyz_t2,
             box_scene_bounds=torch.stack(bounds, 0),
+            point_inverse_t1=t1.voxel_inverse,
+            point_inverse_t2=t2.voxel_inverse,
         )
 
     def forward(

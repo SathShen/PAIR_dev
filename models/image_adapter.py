@@ -2,7 +2,7 @@
 
 This file owns ONLY image features, from Qwen's spatial ViT intermediate maps
 and native LLM visual-position hidden states to decoder-ready spatial memory
-and full-resolution dense pixel features. It NEVER defines prediction heads,
+and intermediate-resolution dense pixel features. It NEVER defines prediction heads,
 box proposal modules, losses, or Qwen prompt/token injection.
 
 Input contracts (Qwen3VLBackbone/PAIRBackbone):
@@ -93,7 +93,7 @@ class ImageSingleAdapterOutput:
 
     One phase of the same encode_single/fuse_temporal pipeline as PointAdapter.
     memory_features: [B,D,Hv,Wv] at the Qwen visual grid.
-    pixel_features: [B,D,Hp,Wp] at the common RGB resolution.
+    pixel_features: [B,D,Hp,Wp] at the 4x ViT grid resolution.
     """
 
     memory_features: torch.Tensor
@@ -101,7 +101,7 @@ class ImageSingleAdapterOutput:
 
 @dataclass
 class ImageAdapterOutput:
-    """F_fuse sampled/flattened as memory and full-resolution F_pixel for both phases."""
+    """F_fuse sampled/flattened as memory and quarter-scale F_pixel for both phases."""
 
     memory: torch.Tensor
     memory_time_ids: torch.Tensor
@@ -292,7 +292,7 @@ class ImageAdapter(nn.Module):
 
         return resize_and_stack(imgs1), resize_and_stack(imgs2), target_sizes
 
-    # Single-temporal spatial memory and full-resolution features.
+    # Single-temporal spatial memory and intermediate-resolution features.
     def _encode_spatial_memory(
         self,
         premerge: Mapping[int, torch.Tensor],
@@ -327,9 +327,12 @@ class ImageAdapter(nn.Module):
         rgb: torch.Tensor,
     ) -> torch.Tensor:
         high = self.upsample2(self.upsample1(memory_map))
-        target_hw = tuple(rgb.shape[-2:])
-        if tuple(high.shape[-2:]) != target_hw:
-            high = F.interpolate(high, size=target_hw, mode='bilinear', align_corners=False)
+        # Keep 256-channel F_pixel on the x4 ViT grid (roughly quarter-scale).
+        # Align RGB detail DOWN to this grid; only decoder logits go back to
+        # original image resolution. No dense high-dimensional full-res maps.
+        target_hw = tuple(high.shape[-2:])
+        if tuple(rgb.shape[-2:]) != target_hw:
+            rgb = F.interpolate(rgb, size=target_hw, mode='bilinear', align_corners=False)
         detail = self.rgb_detail(self._cast_to_module(rgb, self.rgb_detail))
         return self.pixel_fuse(torch.cat((high,detail),dim=1))
 
@@ -372,7 +375,7 @@ class ImageAdapter(nn.Module):
         *,
         output_sizes: Sequence[Tuple[int, int]],
     ) -> ImageAdapterOutput:
-        """Combine two-temporal K/V Memory and full-resolution pixel features.
+        """Combine two-temporal K/V Memory and intermediate-resolution pixel features.
 
         Exactly the same public staged pipeline as PointAdapter.fuse_temporal.
         The Memory interface is shared, while the Dense feature names remain
@@ -385,7 +388,7 @@ class ImageAdapter(nn.Module):
         if channels != self.decoder_dim:
             raise ValueError('Image memory channel count differs from decoder_dim')
         if t1.pixel_features.shape != t2.pixel_features.shape:
-            raise ValueError('T1/T2 full-resolution image feature shapes must match')
+            raise ValueError('T1/T2 intermediate-resolution image feature shapes must match')
         if len(output_sizes) != b:
             raise ValueError('output_sizes must contain B entries')
         sizes = tuple((int(h), int(w)) for h, w in output_sizes)

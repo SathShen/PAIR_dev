@@ -200,8 +200,11 @@ class PAIRBackbone(nn.Module):
             raise RuntimeError("PAIR 3D route is not configured")
         encoded = self.point_encoder(point_dict)
         single = self.point_adapter.encode_single(encoded, raw_point_dict=point_dict)
-        if single.point_xyz.shape[0] != point_dict["coord"].shape[0]:
-            raise RuntimeError("Utonia inverse mapping changed original point topology")
+        if single.original_point_count != point_dict["coord"].shape[0]:
+            raise RuntimeError("Utonia inverse mapping lost original point topology")
+        if single.voxel_inverse is not None:
+            if single.voxel_inverse.shape[0] != single.original_point_count:
+                raise RuntimeError("Sparse Utonia voxel_inverse does not cover original points")
         return single
 
 
