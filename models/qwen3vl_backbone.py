@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import json
+import warnings
+import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
@@ -709,19 +711,111 @@ class Qwen3VLBackbone(nn.Module):
             "llm_point_t2": point2,
         }
 
+    def _append_grounding_answers(self, prepared, targets, *, max_target_tokens=768):
+        """Append supervised assistant answers to the SAME multimodal pass.
+
+        All old masks are remapped to the new left-padded positions. The task
+        hidden and T_mm readouts are strictly BEFORE the answer text.
+        `grounding_label_positions` identifies the hidden vectors predicting
+        each answer token (causal shift of one).
+        """
+        if len(targets) != prepared["batch_size"]:
+            raise ValueError("grounding_targets must contain one answer per sample")
+        inputs = prepared["inputs"]
+        ids = inputs["input_ids"]
+        attn = inputs.get("attention_mask", torch.ones_like(ids))
+        bsz = ids.shape[0]
+        mask_names = ("point_mask", "point_mask_t1", "point_mask_t2",
+                      "image_mask", "image_mask_t1", "image_mask_t2", "task_mask")
+        answers = []
+        for target in targets:
+            if not isinstance(target, str):
+                raise TypeError("Grounding targets must be preformatted JSON strings")
+            extra = self.tokenizer.encode(target, add_special_tokens=False)
+            if self.tokenizer.eos_token_id is not None:
+                extra.append(int(self.tokenizer.eos_token_id))
+            if not extra or len(extra) > max_target_tokens:
+                raise ValueError(f"Box target length {len(extra)} exceeds max_target_tokens={max_target_tokens}")
+            answers.append(extra)
+        rows = []
+        max_len = max(int(attn[b].sum()) + len(answers[b]) for b in range(bsz))
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            raise RuntimeError("Qwen tokenizer requires pad_token_id for supervised grounding")
+        new_ids = ids.new_full((bsz,max_len),int(pad_id))
+        new_attn = attn.new_zeros((bsz,max_len))
+        masks = {name: prepared[name].new_zeros((bsz,max_len)) for name in mask_names}
+        label_positions = []
+        label_targets = []
+        for b, answer in enumerate(answers):
+            original_positions = torch.nonzero(attn[b].bool(),as_tuple=False).flatten()
+            pre = int(original_positions.numel())
+            if pre < 1:
+                raise RuntimeError("Qwen grounding context is empty")
+            total = pre + len(answer)
+            offset = max_len-total
+            new_ids[b,offset:offset+pre] = ids[b,original_positions]
+            new_ids[b,offset+pre:offset+total] = torch.tensor(answer,device=ids.device,dtype=ids.dtype)
+            new_attn[b,offset:offset+total] = 1
+            for name in mask_names:
+                masks[name][b,offset:offset+pre] = prepared[name][b,original_positions]
+            for k,token in enumerate(answer):
+                label_positions.append((b,offset+pre-1+k))
+                label_targets.append(token)
+        inputs["input_ids"] = new_ids
+        inputs["attention_mask"] = new_attn
+        prepared.update(masks)
+        prepared["grounding_label_positions"] = torch.tensor(label_positions,dtype=torch.long)
+        prepared["grounding_label_targets"] = torch.tensor(label_targets,dtype=torch.long)
+        prepared["grounding_num_target_tokens"] = sum(map(len,answers))
+        return prepared
+
+    def _grounding_cross_entropy(self, hidden, prepared, *, chunk_size=64):
+        positions = prepared["grounding_label_positions"].to(hidden.device)
+        targets = prepared["grounding_label_targets"].to(hidden.device)
+        if positions.shape[0] == 0:
+            raise ValueError("No grounding tokens were supervised")
+        # Compute LM logits ONLY on supervised positions, in chunks. Avoid
+        # allocating [B,sequence_length,vocab] full vocabulary logits.
+        total = hidden.new_zeros((), dtype=torch.float32)
+        for start in range(0,positions.shape[0],chunk_size):
+            sub = positions[start:start+chunk_size]
+            selected = hidden[sub[:,0],sub[:,1]]
+            logits = self.model.lm_head(selected)
+            total = total + F.cross_entropy(
+                logits.float(), targets[start:start+chunk_size], reduction="sum"
+            )
+        return total / targets.numel()
+
     def forward(self, *, prompt: Union[str, Sequence[str]], images_t1: Any = None,
                 images_t2: Any = None, point_tokens_t1: Any = None,
                 point_tokens_t2: Any = None, return_logits: bool = False,
-                use_cache: bool = False, **qwen_kwargs) -> Dict[str, Any]:
+                use_cache: bool = False, grounding_targets: Optional[Sequence[str]] = None,
+                grounding_kind: Optional[str] = None,
+                grounding_scene_bounds=None, grounding_max_boxes: int = 16,
+                grounding_max_target_tokens: int = 768, **qwen_kwargs) -> Dict[str, Any]:
         """One Qwen forward; capture Q and T_mm without duplicating LM layers.
 
         Boxes are produced separately by generate_box_proposals(), not inferred
         from hidden values. point_tokens should come from PointAdapter.encode_single.
         """
+        prompts, _ = self._prompt_batch(prompt)
+        if grounding_targets is not None:
+            if grounding_kind not in ("2d", "3d"):
+                raise ValueError("grounding_kind must be '2d' or '3d' when targets are supplied")
+            prompts = self._grounding_prompts(
+                prompts, kind=grounding_kind,
+                scene_bounds=grounding_scene_bounds,
+                max_boxes=grounding_max_boxes,
+            )
         prepared = self.prepare_inputs(
-            prompt=prompt, images_t1=images_t1, images_t2=images_t2,
+            prompt=prompts, images_t1=images_t1, images_t2=images_t2,
             point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
         )
+        if grounding_targets is not None:
+            prepared = self._append_grounding_answers(
+                prepared, grounding_targets, max_target_tokens=grounding_max_target_tokens
+            )
         inputs = {
             k: value.to(self.model_device) if torch.is_tensor(value) else value
             for k, value in prepared["inputs"].items()
@@ -756,8 +850,13 @@ class Qwen3VLBackbone(nn.Module):
         images_present = len(prepared["image_records"]) > 0
         premerge = (self.get_temporal_vision_feature_maps(prepared)
                     if images_present else {"t1": {}, "t2": {}})
+        grounding_loss = (
+            self._grounding_cross_entropy(capture["last_hidden"], prepared)
+            if grounding_targets is not None else None
+        )
         return {
             **temporal,
+            "grounding_loss": grounding_loss,
             "premerge_t1": premerge["t1"],
             "premerge_t2": premerge["t2"],
             "prepared": prepared,
@@ -769,7 +868,8 @@ class Qwen3VLBackbone(nn.Module):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_box_json(text: str, *, kind: str, max_boxes: int) -> List[Dict[str, Any]]:
+    def _parse_box_json(text: str, *, kind: str, max_boxes: int,
+                        scene_bounds=None) -> List[Dict[str, Any]]:
         """Parse JSON proposal sequence. No implicit guessing of coordinate units."""
         # A Qwen response may contain a brief preamble or markdown JSON fence.
         start, stop = text.find("{"), text.rfind("}")
@@ -811,8 +911,52 @@ class Qwen3VLBackbone(nn.Module):
                 # Qwen grounding normally uses a 0..1000 box grid. The PAIR
                 # decoder consistently accepts normalized 0..1 xyxy.
                 vals = [v / 1000.0 for v in vals]
+            else:
+                if scene_bounds is None:
+                    raise ValueError("3D normalized Box decoding requires world scene_bounds")
+                if any(v < 0 or v > 1000 for v in vals):
+                    raise ValueError("Qwen 3D Box must use [0,1000] normalized coordinates")
+                bnd = torch.as_tensor(scene_bounds,device="cpu",dtype=torch.float64)
+                if bnd.shape != (2,3):
+                    raise ValueError("scene_bounds must be [2,3]")
+                # Convert Qwen 0..1000 box coordinates to original XYZ used by
+                # PointAdapter and the 3D Soft Spatial Gate.
+                lo,span = bnd[0],(bnd[1]-bnd[0]).clamp_min(1e-3)
+                norm = torch.tensor(vals,dtype=torch.float64).view(2,3)/1000.0
+                world = lo.unsqueeze(0)+norm*span.unsqueeze(0)
+                vals = world.reshape(-1).tolist()
             answer.append({"box": vals, "score": confidence})
         return answer
+
+    @staticmethod
+    def _grounding_prompts(prompts, *, kind, scene_bounds, max_boxes):
+        """One EXACT instruction template for teacher forcing and inference."""
+        if kind == "3d":
+            if scene_bounds is None or len(scene_bounds) != len(prompts):
+                raise ValueError("3D box generation requires scene_bounds [B,2,3]")
+            context = []
+            for b, bounds in enumerate(scene_bounds):
+                if torch.is_tensor(bounds):
+                    bounds = bounds.detach().cpu().tolist()
+                if len(bounds) != 2 or any(len(row) != 3 for row in bounds):
+                    raise ValueError("scene_bounds must contain [min_xyz,max_xyz] pairs")
+                context.append(
+                    "The point clouds share the world XYZ coordinate frame. "
+                    f"Bounds are {json.dumps(bounds)}. Propose axis-aligned regions "
+                    "as 6 integers [xmin,ymin,zmin,xmax,ymax,zmax] normalized to "
+                    "[0,1000] relative to those shared XYZ bounds (NOT raw world coordinates)."
+                )
+        else:
+            context = ["Give Qwen-style image coordinates [x1,y1,x2,y2] on a [0,1000] grid. For example, half-width is 500."]*len(prompts)
+        grounding_prompts = [
+            p.rstrip() + "\nFind up to " + str(max_boxes) + " candidate CHANGE REGIONS. "
+            + context[b]
+            + " Use regions, not one box per object. There may be zero changes. "
+              "Reply ONLY with strict JSON: {\"boxes\":[{\"box\":[...],\"score\":0.9},...]}. "
+              "Do not include markdown or other text."
+            for b,p in enumerate(prompts)
+        ]
+        return grounding_prompts
 
     def generate_box_proposals(
         self, *, prompt: Union[str, Sequence[str]], kind: str,
@@ -833,30 +977,9 @@ class Qwen3VLBackbone(nn.Module):
         if max_boxes < 0 or max_new_tokens <= 0:
             raise ValueError("max_boxes >= 0 and max_new_tokens > 0 required")
         prompts, _ = self._prompt_batch(prompt)
-        if kind == "3d":
-            if scene_bounds is None or len(scene_bounds) != len(prompts):
-                raise ValueError("3D box generation requires scene_bounds [B,2,3]")
-            context = []
-            for b, bounds in enumerate(scene_bounds):
-                if torch.is_tensor(bounds):
-                    bounds = bounds.detach().cpu().tolist()
-                if len(bounds) != 2 or any(len(row) != 3 for row in bounds):
-                    raise ValueError("scene_bounds must contain [min_xyz,max_xyz] pairs")
-                context.append(
-                    "The point clouds share the world XYZ coordinate frame. "
-                    f"Bounds are {json.dumps(bounds)}. Propose axis-aligned regions "
-                    "in this SAME world frame, as [xmin,ymin,zmin,xmax,ymax,zmax]."
-                )
-        else:
-            context = ["Give Qwen-style image coordinates [x1,y1,x2,y2] on a [0,1000] grid. For example, half-width is 500."]*len(prompts)
-        grounding_prompts = [
-            p.rstrip() + "\nFind up to " + str(max_boxes) + " candidate CHANGE REGIONS. "
-            + context[b]
-            + " Use regions, not one box per object. There may be zero changes. "
-              "Reply ONLY with strict JSON: {\"boxes\":[{\"box\":[...],\"score\":0.9},...]}. "
-              "Do not include markdown or other text."
-            for b,p in enumerate(prompts)
-        ]
+        grounding_prompts = self._grounding_prompts(
+            prompts, kind=kind, scene_bounds=scene_bounds, max_boxes=max_boxes
+        )
         prepared = self.prepare_inputs(
             prompt=grounding_prompts, images_t1=images_t1, images_t2=images_t2,
             point_tokens_t1=point_tokens_t1, point_tokens_t2=point_tokens_t2,
@@ -887,7 +1010,22 @@ class Qwen3VLBackbone(nn.Module):
             raise RuntimeError("Qwen generation must return one sequence per batch item")
         generated_only = sequences[:, inputs["input_ids"].shape[1]:]
         texts = self.tokenizer.batch_decode(generated_only, skip_special_tokens=True)
-        proposals = [self._parse_box_json(t, kind=kind, max_boxes=max_boxes) for t in texts]
+        # Box is SOFT guidance. An invalid generated JSON/coordinate response
+        # must not prevent a valid full-scene mask prediction or validation.
+        proposals = []
+        parse_failures = 0
+        for b, answer_text in enumerate(texts):
+            try:
+                items = self._parse_box_json(
+                    answer_text, kind=kind, max_boxes=max_boxes,
+                    scene_bounds=scene_bounds[b] if kind == "3d" else None
+                )
+            except ValueError as exc:
+                parse_failures += 1
+                warnings.warn(f"Qwen box response for sample {b} rejected ({exc}); "
+                              "falling back to full-scene prediction without Boxes")
+                items = []
+            proposals.append(items)
         dim = 4 if kind == "2d" else 6
         boxes = torch.zeros(len(proposals), max_boxes, dim, device=self.model_device)
         scores = torch.zeros(len(proposals), max_boxes, device=self.model_device)
@@ -902,6 +1040,7 @@ class Qwen3VLBackbone(nn.Module):
             "box_scores": scores,
             "box_valid": valid,
             "box_texts": texts,
+            "box_parse_failures": parse_failures,
         }
 
 

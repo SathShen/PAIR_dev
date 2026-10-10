@@ -91,7 +91,7 @@ class ChangeLossOutput:
 
     def as_dict(self):
         # Preserve all legacy keys while exposing the new components.
-        return {
+        results = {
             "loss": self.total,
             "loss_semantic_t1": self.semantic_t1,
             "loss_semantic_t2": self.semantic_t2,
@@ -113,6 +113,10 @@ class ChangeLossOutput:
             "loss_event": self.event,
             "loss_active_weight_sum": self.active_weight_sum,
         }
+        if hasattr(self, "grounding_ce"):
+            results["loss_grounding_ce"] = self.grounding_ce
+            results["loss_mask_total"] = self.mask_total
+        return results
 
 
 class PAIRSemanticChangeLoss(nn.Module):

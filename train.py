@@ -4,9 +4,8 @@
 """
 PAIR multi-dataset training for native Qwen3-VL DeepStack + 2D/3D adapters.
 
-Box guidance uses explicitly supplied proposals, or an explicitly enabled
-evaluation-only Qwen generator. This file does NOT train the autoregressive
-box generator. It never constructs evaluation boxes from ground-truth masks.
+Box guidance supports JOINT teacher-forced Qwen grounding CE plus Mask Loss.
+Weak training boxes come only from training masks/events; evaluation NEVER uses GT boxes.
 
 Model construction lives in models/pair.py. This file owns only:
     config/runtime
@@ -67,6 +66,7 @@ from models.lora import (
     load_lora_state_dict,
 )
 from models.pair import PAIRModel
+from models.change_decoder import build_grounding_supervision
 
 
 # =============================================================================
@@ -123,6 +123,9 @@ def build_settings(experiment: ExperimentConfig, cli):
         seed=int(experiment.experiment.get("seed", 42)),
         train_box_mode=str(t.get("box_mode", "none")).strip().lower(),
         val_box_mode=str(v.get("box_mode", "none")).strip().lower(),
+        box_ce_weight=float(t.get("box_ce_weight", 0.3)),
+        box_gt_max_boxes=int(t.get("box_gt_max_boxes", 16)),
+        box_dropout=float(t.get("box_dropout", 0.15)),
     )
 
 
@@ -281,9 +284,14 @@ def merge_targets(samples, route):
 # =============================================================================
 
 def validate_box_modes(settings):
-    if settings.train_box_mode not in {"none", "provided"}:
-        raise ValueError("training.box_mode must be 'none' or 'provided'; "
-                         "autoregressive Qwen boxes are not trained by Mask Loss")
+    if settings.train_box_mode not in {"none", "provided", "joint"}:
+        raise ValueError("training.box_mode must be 'none', 'provided' or 'joint'")
+    if settings.box_ce_weight < 0 or settings.box_ce_weight > 10:
+        raise ValueError("box_ce_weight must be in [0,10]")
+    if settings.box_gt_max_boxes < 1 or settings.box_gt_max_boxes > 64:
+        raise ValueError("box_gt_max_boxes must be in [1,64]")
+    if not 0 <= settings.box_dropout <= 1:
+        raise ValueError("box_dropout must be in [0,1]")
     if settings.val_box_mode not in {"none", "provided", "generated"}:
         raise ValueError("validation.box_mode must be 'none', 'provided' or 'generated'")
 
@@ -347,31 +355,52 @@ def collate_box_proposals(samples, route, *, device, max_proposals):
 # Forward / loss / validation
 # =============================================================================
 
-def forward_loss(model, criterion, samples, spec, *, box_mode="none"):
-    """Forward the new PAIRModel and supervise its flat logits.
+def forward_loss(model, criterion, samples, spec, *, box_mode="none",
+                 box_ce_weight=0.3, box_gt_max_boxes=16, box_dropout=0.15):
+    """One multimodal Qwen forward + mask decoder and joint objective.
 
-    box_mode='provided': use dataset-provided proposals; these are not treated
-    as grounding labels, and Mask Loss alone cannot train Qwen's box generator.
-    box_mode='generated': validation ONLY; never train with autoregressive boxes.
+    For joint training, Qwen gets target boxes ONLY as causal assistant suffix.
+    The TASK and T_mm positions precede GT text so Mask branch cannot read it.
+    The mask decoder receives augmented GT regions as a teacher-guided spatial
+    prior. This is joint optimization, NOT differentiable box-coordinate decoding.
     """
-    if box_mode not in ("none", "provided", "generated"):
+    if box_mode not in ("none", "provided", "generated", "joint"):
         raise ValueError(f"Invalid box_mode={box_mode!r}")
+    if box_mode in ("generated", "joint") and not model.training and box_mode == "joint":
+        raise RuntimeError("GT-derived Box supervision is TRAIN ONLY")
     if box_mode == "generated" and model.training:
         raise RuntimeError("Box generation is evaluation-only")
     base = unwrap(model)
     prompts = [sample["prompt"] for sample in samples]
     if box_mode == "provided":
-        boxes = collate_box_proposals(samples, spec.route,
-                                     device=next(base.parameters()).device,
-                                     max_proposals=base.box_max_proposals)
+        boxes = collate_box_proposals(
+            samples, spec.route, device=next(base.parameters()).device,
+            max_proposals=base.box_max_proposals,
+        )
+        grounding_targets = None
+    elif box_mode == "joint":
+        if box_gt_max_boxes > base.box_max_proposals:
+            raise ValueError("training.box_gt_max_boxes exceeds model.box_guidance.max_proposals")
+        guidance = build_grounding_supervision(
+            samples, spec.route, max_boxes=box_gt_max_boxes,
+            device=next(base.parameters()).device, box_dropout=box_dropout,
+        )
+        grounding_targets = guidance.pop("grounding_targets")
+        guidance.pop("num_boxes")
+        boxes = guidance
     else:
         boxes = {}
-    common = {"prompts": prompts, "class_names": spec.class_names,
-              "generate_boxes": box_mode == "generated", **boxes}
+        grounding_targets = None
+    common = {
+        "prompts": prompts, "class_names": spec.class_names,
+        "generate_boxes": box_mode == "generated",
+        "grounding_targets": grounding_targets,
+        **boxes,
+    }
     if spec.route == "2d":
         output_sizes = [tuple(sample["target"]["change"].shape[-2:]) for sample in samples]
         prediction_mode = "bcd" if spec.label_mode == "binary" else "scd"
-        prediction = model(
+        result = model(
             images_t1=[sample["images_t1"] for sample in samples],
             images_t2=[sample["images_t2"] for sample in samples],
             output_sizes=output_sizes,
@@ -379,21 +408,33 @@ def forward_loss(model, criterion, samples, spec, *, box_mode="none"):
             **common,
         )
     elif spec.route == "3d":
-        prediction = model(
+        result = model(
             point_dicts_t1=[sample["point_dict_t1"] for sample in samples],
             point_dicts_t2=[sample["point_dict_t2"] for sample in samples],
             **common,
         )
     else:
-        raise NotImplementedError("PAIR 2D+3D training requires calibrated image/point correspondence")
+        raise NotImplementedError("PAIR 2D+3D requires calibrated image/point correspondence")
+    if box_mode == "joint":
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("Joint PAIRModel must return (PredictionLogits, grounding_ce)")
+        prediction, grounding_ce = result
+        if grounding_ce.ndim != 0 or not torch.isfinite(grounding_ce):
+            raise ValueError("Grounding CE must be a finite scalar")
+    else:
+        prediction = result
+        grounding_ce = None
     target = merge_targets(samples, spec.route)
     semantic_changed_only = spec.route == "2d" and spec.label_mode == "semantic_pair"
     loss_output = criterion(
-        prediction=prediction,
-        target=target,
+        prediction=prediction, target=target,
         class_names=spec.class_names,
         semantic_changed_only=semantic_changed_only,
     )
+    if grounding_ce is not None:
+        loss_output.grounding_ce = grounding_ce
+        loss_output.mask_total = loss_output.total
+        loss_output.total = loss_output.total + box_ce_weight * grounding_ce
     return prediction, loss_output, target
 
 
@@ -1214,6 +1255,11 @@ def main():
         dataset_best_epochs = {name: 0 for name in experiment.selected_names}
 
         if settings.resume is not None:
+            old_cfg = torch.load(settings.resume, map_location="cpu", weights_only=False).get("config", {})
+            old_mode = str(old_cfg.get("training", {}).get("box_mode", "none")).lower()
+            if (old_mode == "joint") != (settings.train_box_mode == "joint"):
+                raise RuntimeError("Refusing resume across joint/non-joint Box training objectives; "
+                                   "start a new run or explicitly migrate optimizer state")
             (
                 start_epoch,
                 start_update_in_epoch,
@@ -1264,8 +1310,11 @@ def main():
             if settings.train_box_mode == "none":
                 print("NOTE: Box-guided Decoder weights receive no Box-specific "
                       "training signal without provided proposals.")
-            print("NOTE: Qwen autoregressive Box grounding is NOT trained by this "
-                  "Mask Loss training loop; it needs a separate grounding objective.")
+            if settings.train_box_mode == "joint":
+                print(f"JOINT Grounding CE + Mask Loss: weight={settings.box_ce_weight}, "
+                      f"max_boxes={settings.box_gt_max_boxes}, box_dropout={settings.box_dropout}")
+                print("NOTE: mask decoder uses teacher-guided regions during training; "
+                      "validation must use generated boxes or no boxes, never GT")
             print("Datasets:", ", ".join(experiment.selected_names))
             print(
                 "Active model routes:",
@@ -1341,7 +1390,13 @@ def main():
                         sync_context = model.no_sync()
                     with sync_context:
                         with torch.autocast("cuda", dtype=torch.bfloat16):
-                            _, loss_output, _ = forward_loss(model, criterion, samples, spec, box_mode=settings.train_box_mode)
+                            _, loss_output, _ = forward_loss(
+                                model, criterion, samples, spec,
+                                box_mode=settings.train_box_mode,
+                                box_ce_weight=settings.box_ce_weight,
+                                box_gt_max_boxes=settings.box_gt_max_boxes,
+                                box_dropout=settings.box_dropout,
+                            )
                             loss = loss_output.total / accumulation_steps
                         loss.backward()
                     for key, value in loss_output.as_dict().items():

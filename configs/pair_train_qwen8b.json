@@ -60,7 +60,8 @@
   },
   "training": {
     "grad_accum": 2,
-    "num_workers": 4
+    "num_workers": 4,
+    "box_mode": "joint"
   },
   "validation": {
     "every_epochs": 1,

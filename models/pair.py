@@ -411,6 +411,7 @@ class PAIRModel(nn.Module):
         generate_boxes: Optional[bool] = None,
         return_maps: bool = False,
         detach_qwen_class_encoder: bool = True,
+        grounding_targets: Optional[Sequence[str]] = None,
     ):
         if not self.enable_2d or self.image_adapter is None:
             raise RuntimeError("2D route not configured")
@@ -431,6 +432,9 @@ class PAIRModel(nn.Module):
         images2 = [_image_to_pil(x) for x in second]
         qwen_out = self.qwen_backbone(
             prompt=prompts, images_t1=images1, images_t2=images2,
+            grounding_targets=grounding_targets,
+            grounding_kind="2d" if grounding_targets is not None else None,
+            grounding_max_boxes=self.box_max_proposals,
         )
         features = self.image_adapter(
             premerge_t1=qwen_out["premerge_t1"],
@@ -446,7 +450,7 @@ class PAIRModel(nn.Module):
             box_scores=box_scores, generate_boxes=generate_boxes,
             images_t1=images1, images_t2=images2,
         )
-        return self.decoder.forward_2d(
+        prediction = self.decoder.forward_2d(
             qwen_backbone=self.qwen_backbone,
             task_hidden=qwen_out["task_hidden"],
             prediction_mode=mode,
@@ -457,6 +461,13 @@ class PAIRModel(nn.Module):
             **proposals,
         )
 
+        if grounding_targets is not None:
+            box_loss = qwen_out.get("grounding_loss")
+            if box_loss is None:
+                raise RuntimeError("Qwen did not return box grounding CE during supervised training")
+            return prediction, box_loss
+        return prediction
+
     def forward_3d(
         self, point_dicts_t1, point_dicts_t2, prompts, class_names, *,
         boxes_3d: Optional[torch.Tensor] = None,
@@ -464,6 +475,7 @@ class PAIRModel(nn.Module):
         box_scores: Optional[torch.Tensor] = None,
         generate_boxes: Optional[bool] = None,
         detach_qwen_class_encoder: bool = True,
+        grounding_targets: Optional[Sequence[str]] = None,
     ):
         if not self.enable_3d or self.point_adapter is None:
             raise RuntimeError("3D route not configured")
@@ -484,10 +496,22 @@ class PAIRModel(nn.Module):
         t2 = self.backbone.encode_points(batch2)
         # This forward MUST retain gradients through LLM input point tokens,
         # even when the pretrained Qwen parameters themselves are frozen.
+        # Box teacher forcing needs the same per-sample world XYZ bounds used
+        # by autoregressive 3D generation. It must NOT use event labels here.
+        scene_bounds = []
+        for cloud1, cloud2 in zip(first, second):
+            xyza = torch.as_tensor(cloud1["coord"], device=device, dtype=torch.float32)
+            xyzb = torch.as_tensor(cloud2["coord"], device=device, dtype=torch.float32)
+            joint = torch.cat((xyza, xyzb), dim=0)
+            scene_bounds.append(torch.stack((joint.amin(0), joint.amax(0)), dim=0))
         qwen_out = self.qwen_backbone(
             prompt=prompts,
             point_tokens_t1=t1.llm_point_tokens,
             point_tokens_t2=t2.llm_point_tokens,
+            grounding_targets=grounding_targets,
+            grounding_kind="3d" if grounding_targets is not None else None,
+            grounding_scene_bounds=scene_bounds if grounding_targets is not None else None,
+            grounding_max_boxes=self.box_max_proposals,
         )
         features = self.point_adapter.fuse_temporal(
             t1, t2,
@@ -502,7 +526,7 @@ class PAIRModel(nn.Module):
             point_tokens_t2=t2.llm_point_tokens,
             scene_bounds=features.box_scene_bounds.detach(),
         )
-        return self.decoder.forward_3d(
+        prediction = self.decoder.forward_3d(
             qwen_backbone=self.qwen_backbone,
             task_hidden=qwen_out["task_hidden"],
             class_names=class_names,
@@ -510,6 +534,13 @@ class PAIRModel(nn.Module):
             **features.decoder_inputs(),
             **proposals,
         )
+
+        if grounding_targets is not None:
+            box_loss = qwen_out.get("grounding_loss")
+            if box_loss is None:
+                raise RuntimeError("Qwen did not return box grounding CE during supervised training")
+            return prediction, box_loss
+        return prediction
 
     def forward_2d3d(self, **kwargs):
         raise NotImplementedError(

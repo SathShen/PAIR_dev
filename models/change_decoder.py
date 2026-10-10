@@ -20,15 +20,16 @@ Optional multi-box spatial guidance:
       optional box_scene_bounds [B,2,3] normalizes 3D box query positions.
   K may be zero. Region queries read the same time-compatible memory, and
   soft gates yield residual FEATURE correction only (never crop or hard mask).
-  Box proposal generation/supervision is upstream, NOT implemented here.
+  Box supervision: weak 2D/3D multi-region targets generated from labels during TRAIN only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 from torch.utils.checkpoint import checkpoint
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -1379,3 +1380,141 @@ class PAIRChangeDecoder(nn.Module):
             updated_queries=queries,
             box_guidance_applied=use_boxes,
         )
+
+
+# =============================================================================
+# Weak Box supervision (joint grounding + mask training)
+# =============================================================================
+# Training-only target preparation, colocated with Box-guided prediction.
+# It does not modify PAIRChangeDecoder.forward_2d/forward_3d or inference.
+
+def _xy_buckets(xy: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor, side: int):
+    span = (upper - lower).clamp_min(1e-5)
+    cell = ((xy.float() - lower) / span * side).floor().long().clamp(0, side - 1)
+    return cell[:, 0] * side + cell[:, 1]
+
+
+def _make_2d(sample: Dict[str, Any], max_boxes: int) -> torch.Tensor:
+    target = sample["target"]
+    changed = torch.as_tensor(target["change"])
+    if changed.ndim == 3 and changed.shape[0] == 1:
+        changed = changed[0]
+    if changed.ndim != 2:
+        raise ValueError(f"2D change target must be [H,W], got {changed.shape}")
+    valid = torch.as_tensor(target.get("change_valid", torch.ones_like(changed, dtype=torch.bool)))
+    valid = valid.reshape(changed.shape).bool()
+    locations = torch.nonzero((changed != 0) & valid, as_tuple=False)
+    if not locations.numel():
+        return torch.empty(0, 4, dtype=torch.float32)
+    h, w = changed.shape
+    side = math.isqrt(max_boxes)
+    if side < 1:
+        raise ValueError("max_boxes must be at least 1")
+    yy, xx = locations[:, 0], locations[:, 1]
+    keys = (yy * side // h) * side + (xx * side // w)
+    results = []
+    for key in torch.unique(keys).tolist():
+        v = locations[keys == key]
+        # Small nonzero expansion ensures 1-pixel changes still become boxes.
+        x1, x2 = int(v[:, 1].min()), int(v[:, 1].max()) + 1
+        y1, y2 = int(v[:, 0].min()), int(v[:, 0].max()) + 1
+        margin_x = max(1, round(w * 0.005))
+        margin_y = max(1, round(h * 0.005))
+        box = [max(0, x1-margin_x)/w, max(0, y1-margin_y)/h,
+               min(w, x2+margin_x)/w, min(h, y2+margin_y)/h]
+        results.append(box)
+    return torch.tensor(results, dtype=torch.float32)
+
+
+def _make_3d(sample: Dict[str, Any], max_boxes: int, *, margin: float = 0.25) -> torch.Tensor:
+    t = sample["target"]
+    cloud1 = torch.as_tensor(sample["point_dict_t1"]["coord"], dtype=torch.float32)
+    cloud2 = torch.as_tensor(sample["point_dict_t2"]["coord"], dtype=torch.float32)
+    # The PAIR 3D event protocol is not a generic binary-change mask.
+    # T1 valid REMOVED=1; T2 valid ADDED=2.
+    r1 = (torch.as_tensor(t["event_t1"]) == 1) & torch.as_tensor(t["event_valid_t1"]).bool()
+    r2 = (torch.as_tensor(t["event_t2"]) == 2) & torch.as_tensor(t["event_valid_t2"]).bool()
+    if r1.numel() != cloud1.shape[0] or r2.numel() != cloud2.shape[0]:
+        raise ValueError("3D event labels and point XYZ are misaligned")
+    changed = torch.cat((cloud1[r1], cloud2[r2]), dim=0)
+    if changed.shape[0] == 0:
+        return torch.empty(0, 6, dtype=torch.float32)
+    all_xyz = torch.cat((cloud1, cloud2), dim=0)
+    xy_min = all_xyz[:, :2].amin(dim=0)
+    xy_max = all_xyz[:, :2].amax(dim=0)
+    side = math.isqrt(max_boxes)
+    if side < 1:
+        raise ValueError("max_boxes must be at least 1")
+    keys = _xy_buckets(changed[:, :2], xy_min, xy_max, side)
+    boxes = []
+    for key in torch.unique(keys).tolist():
+        group = changed[keys == key]
+        lo = group.amin(dim=0) - margin
+        hi = group.amax(dim=0) + margin
+        boxes.append(torch.cat((lo, hi), dim=0).tolist())
+    return torch.tensor(boxes, dtype=torch.float32)
+
+
+def build_grounding_supervision(samples: Sequence[Dict[str, Any]], route: str, *,
+                                max_boxes: int = 16, device=None, box_dropout: float = 0.0):
+    """Return JSON teacher labels and padded guidance proposals.
+
+    `box_dropout` affects only the mask-guidance branch, never the Qwen targets.
+    The teacher CE sees ALL weak labels, even when guidance gets dropped.
+    """
+    if route not in ("2d", "3d"):
+        raise ValueError(f"Unsupported route {route}")
+    if max_boxes < 1 or max_boxes > 64:
+        raise ValueError("max_boxes must be between 1 and 64")
+    if not 0 <= box_dropout <= 1:
+        raise ValueError("box_dropout must be in [0,1]")
+    dims = 4 if route == "2d" else 6
+    tensors, json_targets = [], []
+    for sample in samples:
+        boxes = _make_2d(sample, max_boxes) if route == "2d" else _make_3d(sample, max_boxes)
+        if boxes.shape[0] > max_boxes:
+            raise RuntimeError("More boxes than configured, despite spatial grouping")
+        tensors.append(boxes)
+        formatted = []
+        for box in boxes.tolist():
+            # Compact Qwen targets in [0,1000]; 3D decoder will recover world XYZ.
+            if route == "2d":
+                coords = [int(round(v * 1000)) for v in box]
+            else:
+                cloud1 = torch.as_tensor(sample["point_dict_t1"]["coord"],dtype=torch.float64)
+                cloud2 = torch.as_tensor(sample["point_dict_t2"]["coord"],dtype=torch.float64)
+                xyz = torch.cat((cloud1,cloud2),dim=0)
+                lo,hi = xyz.amin(dim=0),xyz.amax(dim=0)
+                span = (hi-lo).clamp_min(1e-3)
+                norm = (torch.tensor(box,dtype=torch.float64).view(2,3)-lo)/span * 1000.0
+                norm = norm.clamp(0,1000)
+                coords = [int(round(v)) for v in norm.reshape(-1).tolist()]
+                # Guarantee strictly positive box dimensions in Qwen training labels.
+                for axis in range(3):
+                    if coords[axis+3] <= coords[axis]:
+                        if coords[axis] < 1000:
+                            coords[axis+3] = coords[axis] + 1
+                        else:
+                            coords[axis] = 999
+                            coords[axis+3] = 1000
+            formatted.append({"box": coords, "score": 1.0})
+        json_targets.append(json.dumps({"boxes": formatted}, separators=(",", ":")))
+    b = len(samples)
+    k = max((box.shape[0] for box in tensors), default=0)
+    padded = torch.zeros((b, k, dims), device=device, dtype=torch.float32)
+    valid = torch.zeros((b, k), device=device, dtype=torch.bool)
+    scores = torch.zeros((b, k), device=device, dtype=torch.float32)
+    for i, boxes in enumerate(tensors):
+        n = boxes.shape[0]
+        if n:
+            padded[i, :n] = boxes.to(device)
+            keep = torch.rand(n, device=device) >= box_dropout if box_dropout else torch.ones(n, dtype=torch.bool, device=device)
+            valid[i, :n] = keep
+            scores[i, :n] = keep.float()
+    return {
+        "grounding_targets": json_targets,
+        "boxes_2d" if route == "2d" else "boxes_3d": padded,
+        "box_valid": valid,
+        "box_scores": scores,
+        "num_boxes": sum(len(v) for v in tensors),
+    }
