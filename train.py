@@ -1591,9 +1591,9 @@ def main():
                                 for key, value in log_window_dataset_sums.get(name, {}).items()
                             }
                             dataset_spec = registry.handles[name].config.spec
-                            print(
-                                f"  TRAIN LOSS [{name}] U{optimizer_step:06d} | "
-                                f"{format_loss_components(dataset_means, dataset_spec)}"
+                            write_log_only(
+                                log_file,
+                                f"{name}: {format_loss_components(dataset_means, dataset_spec)}"
                             )
                             log_tensorboard_train(
                                 writer, dataset_means, optimizer_step, name, dataset_spec
