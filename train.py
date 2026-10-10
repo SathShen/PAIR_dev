@@ -1592,6 +1592,7 @@ def main():
                             }
                             dataset_spec = registry.handles[name].config.spec
                             write_log_only(
+                                log_file,
                                 f"[{name}]: "
                                 f"{format_loss_components(dataset_means, dataset_spec)}"
                             )
